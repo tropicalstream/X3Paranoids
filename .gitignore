@@ -9,3 +9,6 @@ local.properties
 .kotlin/
 tools/.venv/
 __pycache__/
+tools/fish.config
+*.key
+fish_key.txt

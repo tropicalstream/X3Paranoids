@@ -123,7 +123,7 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
 
         statFrames++; statT += dt
         if (statT >= 2f) {
-            android.util.Log.i("X3Paranoids", "fps=%.1f world=%d infill=%d fill=%d hud=%d".format(statFrames / statT, lines.count, mesh.count, tris.count, hud.count))
+            android.util.Log.i("X3Paranoids", "fps=%.1f world=%d infill=%d fill=%d occl=%d hud=%d depth=%d".format(statFrames / statT, lines.count, mesh.count, tris.count, occl.count, hud.count, depthBits))
             statFrames = 0; statT = 0f
         }
 
@@ -452,7 +452,15 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         for (x in xs) for (z in zs) wline(px(x, z), ys[0], pz(x, z), px(x, z), ys[1], pz(x, z), r, g, b, a)
     }
 
-    /** The Recognizer: cross-bar, raised cab with a red eye, two hanging legs with flared feet. */
+    /**
+     * The Recognizer: cross-bar, raised cab with a red eye, two hanging legs with flared feet.
+     *
+     * Its width comes from [Recognizer]'s own constants, not from numbers typed here, because the
+     * engine moves it on a circle derived from those same constants. When the two were written out
+     * separately they disagreed — a bar drawn 1.65 out either side, a collider of 1.2 — and every
+     * Recognizer that hugged a wall put 45 cm of cross-bar inside it. Change the silhouette and the
+     * collider follows; there is no longer a way to change one alone.
+     */
     private fun buildRecognizer(x: Float, y: Float, z: Float, yaw: Float, sc: Float, alert: Float, flash: Float) {
         var r = 0.25f + 0.75f * alert; var g = 1f - 0.75f * alert; var b = 0.45f - 0.25f * alert
         r += (1f - r) * flash; g += (1f - g) * flash; b += (1f - b) * flash
@@ -461,7 +469,7 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         fun lx(ox: Float, oz: Float) = x + (ox * c + oz * s) * sc
         fun lz(ox: Float, oz: Float) = z + (-ox * s + oz * c) * sc
         // bar
-        wireBox(x, y + 2.0f * sc, z, 1.65f * sc, 0.3f * sc, 0.5f * sc, yaw, r, g, b, a)
+        wireBox(x, y + 2.0f * sc, z, Recognizer.BAR_HW * sc, 0.3f * sc, Recognizer.HALF_D * sc, yaw, r, g, b, a)
         // ribs on the bar
         for (i in -1..1) wline(lx(i * 0.8f, -0.5f), y + 1.7f * sc, lz(i * 0.8f, -0.5f), lx(i * 0.8f, -0.5f), y + 2.3f * sc, lz(i * 0.8f, -0.5f), r, g, b, 0.6f)
         // cab
@@ -471,15 +479,18 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         wline(lx(-0.3f, -0.46f), y + 2.66f * sc, lz(-0.3f, -0.46f), lx(0.3f, -0.46f), y + 2.66f * sc, lz(0.3f, -0.46f), 1f, 0.25f + 0.2f * (1f - alert), 0.2f, ea)
         pts.v(lx(0f, -0.48f), y + 2.66f * sc, lz(0f, -0.48f), 1f, 0.3f, 0.25f, ea * fog(x, y, z))
         // legs
-        wireBox(lx(-1.35f, 0f), y + 0.85f * sc, lz(-1.35f, 0f), 0.3f * sc, 0.85f * sc, 0.42f * sc, yaw, r, g, b, a)
-        wireBox(lx(1.35f, 0f), y + 0.85f * sc, lz(1.35f, 0f), 0.3f * sc, 0.85f * sc, 0.42f * sc, yaw, r, g, b, a)
-        // feet flare
+        val lg = Recognizer.LEG_X
+        wireBox(lx(-lg, 0f), y + 0.85f * sc, lz(-lg, 0f), 0.3f * sc, 0.85f * sc, 0.42f * sc, yaw, r, g, b, a)
+        wireBox(lx(lg, 0f), y + 0.85f * sc, lz(lg, 0f), 0.3f * sc, 0.85f * sc, 0.42f * sc, yaw, r, g, b, a)
+        // feet flare — the outboard corner of a foot is the furthest point on the whole machine from
+        // its axle, and therefore the point Recognizer.RADIUS is sized to contain.
+        val fl = Recognizer.FOOT_FLARE; val fd = Recognizer.HALF_D
         for (side in intArrayOf(-1, 1)) {
-            val ox = side * 1.35f
-            wline(lx(ox - 0.3f, -0.42f), y, lz(ox - 0.3f, -0.42f), lx(ox - 0.5f, -0.5f), y - 0.28f * sc, lz(ox - 0.5f, -0.5f), r, g, b, a)
-            wline(lx(ox + 0.3f, -0.42f), y, lz(ox + 0.3f, -0.42f), lx(ox + 0.5f, -0.5f), y - 0.28f * sc, lz(ox + 0.5f, -0.5f), r, g, b, a)
-            wline(lx(ox - 0.5f, -0.5f), y - 0.28f * sc, lz(ox - 0.5f, -0.5f), lx(ox + 0.5f, -0.5f), y - 0.28f * sc, lz(ox + 0.5f, -0.5f), r, g, b, a)
-            wline(lx(ox - 0.5f, 0.5f), y - 0.28f * sc, lz(ox - 0.5f, 0.5f), lx(ox + 0.5f, 0.5f), y - 0.28f * sc, lz(ox + 0.5f, 0.5f), r, g, b, a)
+            val ox = side * lg
+            wline(lx(ox - 0.3f, -0.42f), y, lz(ox - 0.3f, -0.42f), lx(ox - fl, -fd), y - 0.28f * sc, lz(ox - fl, -fd), r, g, b, a)
+            wline(lx(ox + 0.3f, -0.42f), y, lz(ox + 0.3f, -0.42f), lx(ox + fl, -fd), y - 0.28f * sc, lz(ox + fl, -fd), r, g, b, a)
+            wline(lx(ox - fl, -fd), y - 0.28f * sc, lz(ox - fl, -fd), lx(ox + fl, -fd), y - 0.28f * sc, lz(ox + fl, -fd), r, g, b, a)
+            wline(lx(ox - fl, fd), y - 0.28f * sc, lz(ox - fl, fd), lx(ox + fl, fd), y - 0.28f * sc, lz(ox + fl, fd), r, g, b, a)
         }
     }
 
