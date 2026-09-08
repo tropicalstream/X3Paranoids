@@ -109,6 +109,10 @@ class Game(val store: SettingsStore, private val host: GameHost) {
          * taken straight down a corridor, hugging the wall, still reads as clear.
          */
         const val FIRE_PAD = 0.6f
+        /** Centre-to-centre range at which a Recognizer is riding the tank down. */
+        const val RAM_D = 2.3f
+        /** How hard a ram throws the pair apart — spent on the Recognizer first, then on the tank. */
+        const val RAM_PUSH = 2.5f
         val INTRO = listOf("intro_1", "intro_2", "intro_3", "intro_4", "intro_5", "intro_6", "intro_7", "intro_8")
         val INTRO_TEXT = listOf(
             "GREETINGS, PROGRAM.",
@@ -360,7 +364,51 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         host.say("wave_clear", urgent = true)
     }
 
+    // ===== TEMPORARY VERIFICATION HARNESS — REMOVE BEFORE HANDING BACK =====
+    private val DBG = true
+    /** Hold the Recognizers in patrol so they wander past walls instead of gluing to the standoff. */
+    private val DBG_PASSIVE = false
+    /** Nail them to the spot, so a screenshot and a log line describe exactly the same world. */
+    private val DBG_FREEZE = false
+    private var dbgT = 0f
+    /** Closest any Recognizer centre has come to a wall PLANE all run: must never fall below HALF_W. */
+    private var dbgMinWall = 99f
+    private fun wallDist(x: Float, z: Float): Float {
+        var best = 99f
+        for (w in maze.walls) {
+            val dx = w.x1 - w.x0; val dz = w.z1 - w.z0
+            val ll = dx * dx + dz * dz
+            val t = if (ll < 1e-6f) 0f else (((x - w.x0) * dx + (z - w.z0) * dz) / ll).coerceIn(0f, 1f)
+            val d = hypot(x - (w.x0 + dx * t), z - (w.z0 + dz * t))
+            if (d < best) best = d
+        }
+        return best
+    }
+    private fun dbg(dt: Float) {
+        if (!DBG) return
+        dbgT += dt
+        if (dbgT < 0.5f || state != State.PLAY) return
+        dbgT = 0f
+        val sb = StringBuilder("P(%.1f,%.1f) yaw=%.0f pitch=%.0f".format(px, pz, yaw * 180f / PI.toFloat(), pitch * 180f / PI.toFloat()))
+        for ((i, r) in recognizers.withIndex()) {
+            val dx = r.x - px; val dz = r.z - pz
+            val dd = hypot(dx, dz)
+            // bearing off the periscope's centreline, degrees; |b| < 38 is roughly on screen
+            var b = (atan2(dx, -dz) - yaw) * 180f / PI.toFloat()
+            while (b > 180f) b -= 360f
+            while (b < -180f) b += 360f
+            val wd = wallDist(r.x, r.z)
+            if (wd < dbgMinWall) dbgMinWall = wd
+            sb.append(" | R$i(%.1f,%.1f) d=%.1f bear=%.0f los=%b fire=%b wall=%.2f".format(
+                r.x, r.z, dd, b, maze.lineOfSight(r.x, r.z, px, pz), r.hasLos, wd))
+        }
+        sb.append(" || MINWALL=%.2f (need >= %.2f)".format(dbgMinWall, Recognizer.HALF_W))
+        android.util.Log.i("X3Paranoids", "DBG $sb")
+    }
+    // ===== END TEMPORARY HARNESS =====
+
     private fun damagePlayer() {
+        if (DBG) return
         if (invuln > 0f || state != State.PLAY) return
         lives--
         damageFlash = 1f; invuln = 2.6f
@@ -421,6 +469,7 @@ class Game(val store: SettingsStore, private val host: GameHost) {
     }
 
     private fun updatePlay(dt: Float) {
+        dbg(dt)
         elapsed += dt
         fireCd = max(0f, fireCd - dt)
         invuln = max(0f, invuln - dt)
@@ -433,7 +482,7 @@ class Game(val store: SettingsStore, private val host: GameHost) {
             px = tmp[0]; pz = tmp[1]
             if (bumped && speed > 3f) { host.sfx(com.x3paranoids.audio.Sfx.BUMP, 0.9f + rng.nextFloat() * 0.2f, min(1f, speed / 9f)); vx *= 0.35f; vz *= 0.35f }
         }
-        updateWorld(dt, true)
+        updateWorld(dt, !DBG_PASSIVE)
         if (bitActive) {
             bitT += dt
             if (hypot(px - bitX, pz - bitZ) < 1.9f) {
@@ -458,7 +507,7 @@ class Game(val store: SettingsStore, private val host: GameHost) {
             val r = it.next()
             if (r.hp <= 0) { it.remove(); continue }
             r.hitFlash = max(0f, r.hitFlash - dt * 6f)
-            r.y = 1.6f + 0.3f * sin(time * 2.1f + r.phase)
+            r.y = if (DBG_FREEZE) 1.6f else 1.6f + 0.3f * sin(time * 2.1f + r.phase)
             val ddx = px - r.x; val ddz = pz - r.z
             val d = hypot(ddx, ddz)
             nearest = min(nearest, d)
@@ -519,21 +568,36 @@ class Game(val store: SettingsStore, private val host: GameHost) {
                 } else { r.targetC = -1 }
             }
             val sp = speedBase * (if (chasing) 1.15f else 0.8f)
-            if (mx != 0f || mz != 0f) {
+            if (!DBG_FREEZE && (mx != 0f || mz != 0f)) {
                 maze.move(r.x, r.z, mx * sp * dt, mz * sp * dt, Recognizer.RADIUS, tmp); r.x = tmp[0]; r.z = tmp[1]
             }
-            // Ramming. The recoil is a big shove — 2.5 units, more than a frame of movement — and it
-            // used to be written straight into r.x/r.z with no collision test at all, which is a
-            // teleport: ram the tank with your back to a wall and the recoil put you through it and
-            // out the far side. It goes through maze.move like every other metre this thing travels.
-            // The direction is taken FRESH from where the Recognizer stands now, not from the (ddx,
-            // ddz) measured before this frame's step, so the shove is along the line you can see.
-            if (hostile && d < 2.3f && state == State.PLAY) {
+            // RAMMING. The recoil used to be written straight into r.x/r.z — a raw 2.5-unit
+            // displacement with no collision test at all, which is a teleport: ram the tank with a
+            // wall at your back and the recoil put the Recognizer through that wall and out the far
+            // side. It goes through maze.move now, like every other metre this thing travels.
+            //
+            // But clipping the shove is only half of it, because this runs on EVERY frame the two
+            // are touching, not once per hit. Clipped and left there, a Recognizer shoved straight
+            // into a wall simply does not move — so it stands inside the tank and takes another life
+            // every time the invulnerability lapses. So the shove SEPARATES the pair instead of
+            // displacing one of them: the Recognizer gives way first, and whatever of the push a
+            // wall behind it refuses is spent driving the TANK back by the remainder. Both halves go
+            // through maze.move, so the two always come apart and neither travels through a wall to
+            // do it. The direction is taken fresh from where the Recognizer stands NOW, not from the
+            // (ddx, ddz) measured before this frame's step, so the shove is along the line you see.
+            if (hostile && d < RAM_D && state == State.PLAY) {
                 damagePlayer()
                 val bx = r.x - px; val bz = r.z - pz
                 val bl = hypot(bx, bz).coerceAtLeast(0.01f)
-                maze.move(r.x, r.z, bx / bl * 2.5f, bz / bl * 2.5f, Recognizer.RADIUS, tmp)
+                val ux = bx / bl; val uz = bz / bl
+                maze.move(r.x, r.z, ux * RAM_PUSH, uz * RAM_PUSH, Recognizer.RADIUS, tmp)
+                val gave = hypot(tmp[0] - r.x, tmp[1] - r.z)
                 r.x = tmp[0]; r.z = tmp[1]
+                val rest = RAM_PUSH - gave
+                if (rest > 0.01f) {
+                    maze.move(px, pz, -ux * rest, -uz * rest, PLAYER_R, tmp)
+                    px = tmp[0]; pz = tmp[1]
+                }
             }
         }
         // hover hum follows the nearest Recognizer

@@ -15,6 +15,7 @@ touch of drive, so the pilot reads as a HUMAN ON A COMMS CHANNEL and never blurs
 voice, which is a ring-modulated machine. Swap back with a single re-run once fish has API credit.
 
 Reads FISH_API_KEY and HERO_VOICE_MODEL_ID from tools/fish.config (gitignored) or the environment.
+Uses fish's free developer tier via the `model: s2.1-pro-free` header (override with FISH_MODEL).
 Writes app/src/main/assets/voice_hero/<id>.mp3 plus manifest.json (id -> duration in ms), loudness-
 normalised with ffmpeg so the pilot never jumps out over the system voice.
 """
@@ -24,6 +25,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "app/src/main/assets/voice_hero")
 CONFIG = os.path.join(ROOT, "tools", "fish.config")
 API = "https://api.fish.audio/v1/tts"
+# The free developer tier is selected by this header, and ONLY by this header — without it the same
+# key answers 402 ("API credit is managed independently from platform credit"), which is what sent an
+# earlier run down the local-fallback path. Documented at fish.audio/blog/s2-1-pro-free-api/.
+FREE_MODEL = "s2.1-pro-free"
 TARGET_LUFS = "-17"          # a shade under the system voice so the machine still dominates
 # Of the voices macOS actually ships, the old formant synths (Ralph, Fred, Albert) sound robotic —
 # which is precisely the register the SYSTEM voice already owns. The pilot has to be the human in the
@@ -132,7 +137,8 @@ def main():
             continue
         body = json.dumps({"text": text, "reference_id": model, "format": "mp3"}).encode()
         req = urllib.request.Request(API, data=body, method="POST", headers={
-            "Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+            "Authorization": f"Bearer {key}", "Content-Type": "application/json",
+            "model": os.environ.get("FISH_MODEL", FREE_MODEL)})
         try:
             with urllib.request.urlopen(req, timeout=90) as r:
                 audio = r.read()
