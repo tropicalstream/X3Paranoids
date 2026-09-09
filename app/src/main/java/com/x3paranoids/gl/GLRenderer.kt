@@ -2754,7 +2754,13 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
             color(if (sel) 1f else 0.8f, if (sel) 0.92f else 0.95f, if (sel) 0.45f else 0.8f, if (sel) 1f else 0.6f)
             if (v.isNotEmpty()) textR(v, 470f, y, if (v.length > 12) 1.6f else 2.2f)
         }
-        color(0.7f, 0.95f, 0.8f, 0.55f); textC("DOUBLE-TAP CLOSES   UP/DOWN MOVE   TAP ADJUSTS", 320f, 428f, 1.5f)
+        // HOW TO GET OUT, INSIDE THE FRAME. All three hints used to share one line under the panel
+        // at scale 1.5, and at 46 characters that line is already as wide as the panel is — it
+        // could not be enlarged without overflowing, so the one thing a player actually needs to
+        // be told sat outside the border in the smallest type on the plate. The way out is now a
+        // menu-sized line in the panel; the two hints you can discover by fiddling stay a footnote.
+        color(0.8f, 1f, 0.85f, 0.85f); textC("DOUBLE-TAP TO CLOSE", 320f, 390f, 2f)
+        color(0.7f, 0.95f, 0.8f, 0.55f); textC("UP/DOWN MOVE   TAP ADJUSTS", 320f, 428f, 1.5f)
     }
 
     // ------------------------------------------------------------------ GL plumbing

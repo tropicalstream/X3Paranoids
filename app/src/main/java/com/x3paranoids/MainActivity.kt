@@ -86,6 +86,20 @@ class MainActivity : Activity(), GameHost {
     private val ui = Handler(Looper.getMainLooper())
     private var lastTapMs = 0L
     private var backPendingMs = 0L
+    /** When the pad last delivered a CLASSIFIED gesture (a tap or a double-tap) as a key. */
+    private var lastKeyGestureMs = -10_000L
+    /**
+     * Latched the first time the pad hands us a gesture it has ALREADY classified into a key. It
+     * never unlatches, because hardware does not change its mind halfway through a session.
+     *
+     * A time window is not enough on its own. The pad cannot know a double-tap is a double-tap
+     * until the second tap lands, so the FIRST touch of one arrives before the BACK does: no BACK
+     * is pending yet and the last key is ancient, so a purely time-based guard waves that touch
+     * through and it actions the highlighted menu row. That is the "it just switches the menu
+     * item" the owner saw. Once we know the pad classifies, the raw touch stream underneath is
+     * only ever an echo and must never become a tap.
+     */
+    private var padClassifies = false
     private var pendingDouble: Runnable? = null
     private var downX = 0f; private var downY = 0f; private var downT = 0L
     /** 0 = not yet classified, [AXIS_UP] = settle it on finger-up as before, [AXIS_DRIVE] = driving. */
@@ -195,21 +209,37 @@ class MainActivity : Activity(), GameHost {
 
     // --------------------------------------------------------------- input
 
-    private fun onTap() {
+    /**
+     * [fromKey] is the whole point of this signature. The temple pad reports one physical gesture
+     * TWICE: once already classified as a key (a single tap is KEYCODE_BUTTON_A, a double-tap is a
+     * single KEYCODE_BACK) and again as the raw touch stream underneath it. A physical double-tap
+     * therefore arrives as one BACK plus TWO short touches, and when those touches were allowed to
+     * become taps the gesture destroyed itself: the first tap actioned the selected menu row, and
+     * the second — landing inside the BACK's 350 ms window — was mistaken for the third tap of a
+     * triple-tap and cancelled the pending menu toggle. The menu changed a value and refused to
+     * close, which is exactly what the owner reported.
+     *
+     * So the pad's own classifier is authoritative and only a KEY tap may promote to a triple-tap.
+     */
+    private fun onTap(fromKey: Boolean) {
         val now = SystemClock.uptimeMillis()
         if (now - lastTapMs < 60) return   // KEY + touch echo of one physical press
-        lastTapMs = now
-        // a tap right after a BACK = the third tap of a triple-tap
+        // a tap right after a BACK = the third tap of a triple-tap — but ONLY if the pad said so.
+        // A touch here is the second half of the double-tap that produced the BACK.
         if (backPendingMs != 0L && now - backPendingMs < 350) {
+            if (!fromKey) return
             pendingDouble?.let { ui.removeCallbacks(it) }; pendingDouble = null; backPendingMs = 0L
+            lastTapMs = now
             glView.queueEvent { game.tripleTap() }
             return
         }
+        lastTapMs = now
         glView.queueEvent { game.tap() }
     }
 
     private fun onBack() {
         val now = SystemClock.uptimeMillis()
+        lastKeyGestureMs = now
         if (backPendingMs != 0L && now - backPendingMs < 350) return
         backPendingMs = now
         val r = Runnable { backPendingMs = 0L; pendingDouble = null; glView.queueEvent { game.doubleTap() } }
@@ -243,10 +273,13 @@ class MainActivity : Activity(), GameHost {
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         when (event.keyCode) {
             KeyEvent.KEYCODE_BUTTON_A, KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_SPACE -> {
-                if (event.action == KeyEvent.ACTION_UP && !event.isCanceled && event.eventTime - event.downTime < 450) onTap()
+                if (event.action == KeyEvent.ACTION_UP && !event.isCanceled && event.eventTime - event.downTime < 450) {
+                    padClassifies = true
+                    lastKeyGestureMs = SystemClock.uptimeMillis(); onTap(true)
+                }
                 return true
             }
-            KeyEvent.KEYCODE_BACK -> { if (event.action == KeyEvent.ACTION_UP) onBack(); return true }
+            KeyEvent.KEYCODE_BACK -> { padClassifies = true; if (event.action == KeyEvent.ACTION_UP) onBack(); return true }
             // The D-pad path is the same two gears as the pad: a key held down drives, a key tapped
             // is a dash and nothing else, because a drive that starts and ends inside one short
             // press has only ever applied [Game.IMPULSE]. Off the arena it stays a single discrete
@@ -321,7 +354,12 @@ class MainActivity : Activity(), GameHost {
                 if (dist >= thresh) {
                     if (abs(dx) >= abs(dy)) onSwipe(turnDir(if (dx < 0) -1 else 1))
                     else onSwipe(if (dy < 0) Swipe.UP else Swipe.DOWN)
-                } else if (SystemClock.uptimeMillis() - downT < 400) onTap()
+                } else if (SystemClock.uptimeMillis() - downT < 400) {
+                    // Only when the pad is NOT classifying for us. On these glasses it always is,
+                    // so this is a fallback for hardware that reports touch and nothing else — it
+                    // must never fire alongside the key path or it re-creates the echo above.
+                    if (!padClassifies && SystemClock.uptimeMillis() - lastKeyGestureMs > 600) onTap(false)
+                }
             }
         }
         return true
