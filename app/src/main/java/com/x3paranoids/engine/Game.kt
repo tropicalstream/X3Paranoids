@@ -116,6 +116,49 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         const val PLAYER_R = 0.9f
         const val IMPULSE = 7.5f
         const val MAX_SPEED = 9f
+
+        // ------------------------------------------------------------------ [DRIVING: DASH AND CRUISE]
+        /**
+         * THE HULL HAS TWO GEARS AND THEY ARE THE SAME GESTURE HELD FOR DIFFERENT LENGTHS OF TIME.
+         *
+         * A FLICK IS A DASH. Cross the swipe threshold and lift: [IMPULSE] goes into the velocity in
+         * one go and [DRIVE_DAMP] takes it back out again, which carries the tank IMPULSE × DAMP =
+         * about 4.1 units — under half a [Maze.CELL]. That is a nudge for lining up a shot, and it is
+         * exactly what this game did before hold-to-drive existed; it is unchanged on purpose,
+         * because it is the gesture the arena's fine positioning is built out of.
+         *
+         * A HOLD IS A CRUISE. Keep the finger down after the threshold and thrust is applied EVERY
+         * FRAME until it lifts. Crossing this arena is 72 units; at 4.1 units a flick that was
+         * eighteen flicks of the pad, which is the complaint this exists to answer.
+         *
+         * The thrust is sized off the damping rather than picked: against an e-folding of
+         * [DRIVE_DAMP] a constant acceleration `a` settles at `a · DRIVE_DAMP`, so [DRIVE_ACCEL] is
+         * defined as the acceleration whose terminal speed is exactly [MAX_SPEED]. The tank
+         * ASYMPTOTES to its own speed limit instead of slamming into a clamp, which is the
+         * difference between a cruise and a governor.
+         *
+         * [DRIVE_FLOOR] IS WHY A HOLD DOES NOT SAG. The dash lands first, at 7.5 — five sixths of
+         * the cruise speed — so a ramp that started from zero thrust would let the damping eat the
+         * dash for a fifth of a second before the engine caught it, and that dip is felt as mush at
+         * exactly the moment the player is deciding whether the hold worked. So the ramp starts at
+         * IMPULSE / MAX_SPEED of full thrust — the acceleration that exactly HOLDS the dash's speed
+         * — and climbs from there to full over [DRIVE_RAMP]. Speed therefore never falls during a
+         * hold: it leaves the dash at 7.5 and eases up to 9 over about half a second. Ramping at all
+         * is a head-worn-display concession; a step change in acceleration is felt in the inner ear.
+         */
+        const val DRIVE_DAMP = 0.55f
+        /** The acceleration whose terminal speed under [DRIVE_DAMP] is exactly [MAX_SPEED]. */
+        const val DRIVE_ACCEL = MAX_SPEED / DRIVE_DAMP
+        /** Fraction of [DRIVE_ACCEL] the sustained thrust starts at: the accel that holds a dash. */
+        const val DRIVE_FLOOR = IMPULSE / MAX_SPEED
+        /** Seconds for the sustained thrust to climb from [DRIVE_FLOOR] to full. */
+        const val DRIVE_RAMP = 0.5f
+        /**
+         * Seconds between wall thuds. A held drive into a wall re-presses on EVERY frame, and
+         * without this the bump sound fires sixty times a second — which is the difference between
+         * a tank leaning on a wall and a road drill.
+         */
+        const val BUMP_CD = 0.35f
         const val SHELL_SPEED = 46f
         const val BOLT_SPEED = 21f
         const val FIRE_CD = 0.28f
@@ -273,10 +316,12 @@ class Game(val store: SettingsStore, private val host: GameHost) {
     }
 
     // ------------------------------------------------------------------ state
-    var state = State.TITLE; private set
+    // VOLATILE because the input thread reads them through [holdDriveArmed] to decide whether a
+    // gesture that is still in progress may drive. Nothing else crosses threads here.
+    @Volatile var state = State.TITLE; private set
     var time = 0f; private set
     var stateT = 0f; private set
-    var menuOpen = false; private set
+    @Volatile var menuOpen = false; private set
     var maze = Maze(8, 8, 1L); private set
     private var mazeSeed = 1L
 
@@ -289,6 +334,20 @@ class Game(val store: SettingsStore, private val host: GameHost) {
     private var hullTarget = 0f
     /** 0..1 while a quarter turn is in flight — the HUD leans its brackets into the turn. */
     var turnBlend = 0f; private set
+    /** +1 while the pad is HELD forward, -1 held back, 0 coasting. See [driveStart]. */
+    var driveDir = 0; private set
+    /** Seconds the current sustained drive has run — drives the thrust ramp and the HUD ladder. */
+    private var driveT = 0f
+    private var driveLogT = 0f
+    private var bumpCd = 0f
+    /** 0…1 of [DRIVE_RAMP]: how far the throttle has come up. The HUD's only reason to exist. */
+    val driveThrottle get() = if (driveDir == 0) 0f else min(1f, driveT / DRIVE_RAMP)
+    /**
+     * May a gesture that is STILL DOWN drive the tank? Read from the input thread, and the reason
+     * the settings menu stays strictly one-swipe-one-step: off the arena, a held pad is classified
+     * the old way — once, on finger-up — so a hold cannot walk the menu.
+     */
+    val holdDriveArmed: Boolean get() = state == State.PLAY && !menuOpen
     var lives = 3; private set
     var score = 0; private set
     var wave = 0; private set
@@ -542,7 +601,7 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         val p1 = fire + 1.55f                          // PILOT: I remember every corner of this maze
         val bit = p1 + 0.90f
         t[6] = p1 + h(PILOT_KILL) + 0.50f              // FIND THE BIT. SURVIVE THE WAVES.
-        val settle = t[6] + d(6) + 0.40f               // the title comes back; TAP TO PLAY
+        val settle = t[6] + d(6) + 0.40f               // the title comes back; INSERT COIN
         t[7] = settle + 0.55f                          // END OF LINE.
         val end = t[7] + d(7) + 4.60f                  // and hold, so the invitation can be read
         loreT = t
@@ -630,6 +689,41 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         }
     }
 
+    /**
+     * THE PAD CROSSED THE THRESHOLD VERTICALLY AND IS STILL DOWN — start driving and keep driving.
+     *
+     * The DASH goes in here, immediately, exactly as [swipe] would have applied it on finger-up:
+     * a gesture that lifts a moment later has therefore had precisely today's behaviour and nothing
+     * else, which is the whole trick that lets one gesture be two. Everything the HOLD adds is
+     * applied per-frame in [updatePlay].
+     *
+     * Called again with the other direction when the finger drags back past the hysteresis, and
+     * that is a plain re-dash: the new impulse is one [IMPULSE] against a hull doing at most
+     * [MAX_SPEED], so the instantaneous change is exactly the size of a dash from standstill — the
+     * comfort budget this game already spends — and the sustained thrust turns the tank round
+     * inside about a sixth of a second rather than the two directions fighting.
+     */
+    fun driveStart(forward: Boolean, source: String) {
+        if (!holdDriveArmed) return
+        val sign = if (forward) 1 else -1
+        if (driveDir == sign) return
+        val flip = driveDir != 0
+        driveDir = sign; driveT = 0f; driveLogT = 0f
+        val fx = sin(yaw); val fz = -cos(yaw)
+        impulse(fx * sign, fz * sign)
+        android.util.Log.i("X3Paranoids", "DRIVE %s dir=%s src=%s p=(%.2f,%.2f) yaw=%.0f v=%.2f".format(
+            if (flip) "flip" else "start", if (forward) "FWD" else "REV", source, px, pz,
+            yaw * 57.2958f, hypot(vx, vz)))
+    }
+
+    /** The finger lifted (or the gesture was cancelled). The existing damping does the stopping. */
+    fun driveEnd(source: String) {
+        if (driveDir == 0) return
+        android.util.Log.i("X3Paranoids", "DRIVE end dir=%s src=%s held=%.2fs p=(%.2f,%.2f) v=%.2f".format(
+            if (driveDir > 0) "FWD" else "REV", source, driveT, px, pz, hypot(vx, vz)))
+        driveDir = 0; driveT = 0f
+    }
+
     /** Quarter-turn the hull. Queues, so two fast swipes turn 180 degrees. */
     private fun turn(sign: Int) {
         hullTarget += sign * (PI.toFloat() / 2f)
@@ -703,6 +797,7 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         mazeSeed = System.nanoTime(); maze = Maze(8, 8, mazeSeed)
         lives = 3; score = 0; wave = 0; elapsed = 0f; kills = 0; invuln = 0f; damageFlash = 0f
         vx = 0f; vz = 0f; hullYaw = 0f; hullTarget = 0f; turnBlend = 0f; newHigh = false
+        driveDir = 0; driveT = 0f; driveLogT = 0f; bumpCd = 0f
         derezzes.clear(); deathSink = 0f
         pilotLast.clear(); pilotOnce.clear(); pilotLastAny = -99f; pilotStreak = 0; pilotKillIdx = 0
         lastKillT = -99f; lastKillSay = -99f
@@ -919,7 +1014,12 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         turnBlend = (abs(hullTarget - hullYaw) / (PI.toFloat() / 2f)).coerceIn(0f, 1f)
         yaw = if (headOn) headYaw + hullYaw else hullYaw
         pitch = if (headOn) headPitch else 0f
-        if (menuOpen) return
+        // A drive belongs to a LIVE ARENA. The menu freezing the world, the hull derezzing, a wave
+        // ending — all of them drop the throttle, and a finger still on the pad has to be lifted
+        // and put back to take it again. (The pad's own classifier stands down with it: see
+        // [holdDriveArmed].)
+        if (menuOpen) { driveEnd("menu"); return }
+        if (state != State.PLAY) driveEnd("state")
         stateT += dt
         muzzle = max(0f, muzzle - dt * 9f)
         damageFlash = max(0f, damageFlash - dt * 1.6f)
@@ -968,14 +1068,51 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         elapsed += dt
         fireCd = max(0f, fireCd - dt)
         invuln = max(0f, invuln - dt)
+        bumpCd = max(0f, bumpCd - dt)
+        // THE HELD PAD, ONE FRAME'S WORTH. Along [yaw] — head plus hull — because that is the one
+        // true heading in this game: where a dash drives, where the cannon points and where you are
+        // looking are the same ray, and a cruise that ran down a second, different forward would be
+        // a lie the minimap could not draw. Look off-axis while cruising and you lean on the
+        // corridor wall, which the slide below turns into a graze rather than a stop.
+        if (driveDir != 0) {
+            driveT += dt
+            val a = DRIVE_ACCEL * (DRIVE_FLOOR + (1f - DRIVE_FLOOR) * min(1f, driveT / DRIVE_RAMP)) * driveDir
+            vx += sin(yaw) * a * dt; vz += -cos(yaw) * a * dt
+            driveLogT += dt
+            if (driveLogT >= 0.25f) {
+                driveLogT = 0f
+                android.util.Log.i("X3Paranoids", "DRIVE hold dir=%s t=%.2f p=(%.2f,%.2f) v=%.2f".format(
+                    if (driveDir > 0) "FWD" else "REV", driveT, px, pz, hypot(vx, vz)))
+            }
+        }
         // hull physics: impulses decay, the maze walls slide
-        val damp = exp(-dt / 0.55f)
+        val damp = exp(-dt / DRIVE_DAMP)
         vx *= damp; vz *= damp
-        val speed = hypot(vx, vz)
+        var speed = hypot(vx, vz)
+        // The clamp used to live only in [impulse]; sustained thrust needs it every frame. It never
+        // actually bites during a cruise — DRIVE_ACCEL asymptotes to MAX_SPEED from below — so it
+        // is the ram shove and the dash-onto-a-cruise that it is here for.
+        if (speed > MAX_SPEED) { vx *= MAX_SPEED / speed; vz *= MAX_SPEED / speed; speed = MAX_SPEED }
         if (speed > 0.02f) {
-            val bumped = maze.move(px, pz, vx * dt, vz * dt, PLAYER_R, tmp)
+            val wantX = vx * dt; val wantZ = vz * dt
+            val bumped = maze.move(px, pz, wantX, wantZ, PLAYER_R, tmp)
+            val gotX = tmp[0] - px; val gotZ = tmp[1] - pz
             px = tmp[0]; pz = tmp[1]
-            if (bumped && speed > 3f) { host.sfx(com.x3paranoids.audio.Sfx.BUMP, 0.9f + rng.nextFloat() * 0.2f, min(1f, speed / 9f)); vx *= 0.35f; vz *= 0.35f }
+            if (bumped) {
+                // PRESS AND SLIDE. [Maze.move] resolves x and z separately, so the axis that was
+                // stopped is the one whose travel came up short; kill only THAT one and the
+                // component running along the wall survives. The old blanket 0.35 scrub took the
+                // sliding component with it, which was survivable when a bump could only ever
+                // happen once per gesture and is not now: a held drive re-presses every frame, so
+                // scrubbing both axes turned leaning on a wall into a stutter that also refused to
+                // let you slide off it.
+                if (abs(gotX) < abs(wantX) - 1e-4f) vx = 0f
+                if (abs(gotZ) < abs(wantZ) - 1e-4f) vz = 0f
+                if (speed > 3f && bumpCd <= 0f) {
+                    bumpCd = BUMP_CD
+                    host.sfx(com.x3paranoids.audio.Sfx.BUMP, 0.9f + rng.nextFloat() * 0.2f, min(1f, speed / 9f))
+                }
+            }
         }
         updateWorld(dt, true)
         updatePool(dt)

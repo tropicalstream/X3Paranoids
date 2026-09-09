@@ -1162,11 +1162,11 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
      *     a shell goes down the corridor, and a Recognizer derezzes. Then the sight fades out again.
      *     It is the one thing the old title screen could not do and the best thirty frames the game
      *     owns.
-     *  5. THE INVITATION. The title re-lights (a second, smaller bloom), TAP TO PLAY takes the
+     *  5. THE INVITATION. The title re-lights (a second, smaller bloom), INSERT COIN takes the
      *     middle of the frame, the controls are stated once, and the records sit where they always
      *     sit. Then the whole thing dips to black and goes round again.
      *
-     * A SMALL TAP TO PLAY IS ON SCREEN FROM THE MOMENT THE TITLE LANDS, dim, up under the marquee.
+     * A SMALL INSERT COIN IS ON SCREEN FROM THE MOMENT THE TITLE LANDS, dim, up under the marquee.
      * Somebody who has seen this film must never have to sit through it to find out they can skip
      * it — and a tap at any point in any beat starts a game from where they are looking.
      */
@@ -1236,7 +1236,12 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
             if (t < p.fire) { color(1f, 0.35f, 0.25f, blink * 0.95f * sightA); textC("WARNING", 320f, 100f, 2.2f) }
         }
 
-        // ---- TAP TO PLAY: a whisper under the marquee all the way through, the invitation at the end
+        // ---- INSERT COIN TO PLAY: a whisper under the marquee all the way through, the invitation
+        // at the end. THE STRING IS THE CABINET'S, not the glasses': nineteen characters against the
+        // old eleven, which is why both scales came down. Big: 19 × 5 × 2.9 = 275 px, so 182…458 —
+        // inside the sight's 120…520 with room either side, and still narrower than the 384 px
+        // title above it, which has to keep winning. Small: 19 × 5 × 1.6 = 152 px at y=68, clear of
+        // the marquee at 46 and of the top-centre sight tick that runs 70…96.
         val bigTap = ((t - p.settle) / 0.7f).coerceIn(0f, 1f)
         // It stands down while the sight is up: the kill beat already stacks a marquee, a WARNING
         // and a pair of brackets across the top of the frame, and the invitation is the one thing
@@ -1244,13 +1249,13 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         val smallTap = ((t - traceEnd - 0.4f) / 0.8f).coerceIn(0f, 1f) * (1f - bigTap) * (1f - sightA)
         if (smallTap > 0.01f) {
             color(1f, 0.9f, 0.4f, (0.50f + 0.18f * sin(t * 2.2f)) * smallTap)
-            textC("TAP TO PLAY", 320f, 68f, 1.7f)
+            textC("INSERT COIN TO PLAY", 320f, 68f, 1.6f)
         }
         if (bigTap > 0.01f) {
             color(1f, 0.9f, 0.4f, (0.6f + 0.4f * abs(sin(t * 3f))) * bigTap)
-            textC("TAP TO PLAY", 320f, 300f, 3.2f)
+            textC("INSERT COIN TO PLAY", 320f, 300f, 2.9f)
             color(0.55f, 0.75f, 0.7f, 0.55f * bigTap)
-            textC("HEAD LOOKS   SWIPE UP/DOWN DRIVES", 320f, 338f, 1.6f)
+            textC("HEAD LOOKS   SWIPE OR HOLD TO DRIVE", 320f, 338f, 1.6f)
             textC("LEFT/RIGHT TURNS 90   TAP FIRES", 320f, 356f, 1.6f)
         }
 
@@ -1259,6 +1264,13 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         color(0.7f, 0.95f, 0.8f, 0.55f * rec)
         text("HIGH ${store.highScore}", 56f, 464f, 2.0f)
         textR("BEST WAVE ${store.bestWave}", 584f, 464f, 2.0f)
+        // ---- and the credit counter between them, dimmest thing on the screen.
+        // A machine that asks for a coin and has no meter is half the joke: this is what makes
+        // INSERT COIN resolve into a game when the player taps rather than being a line of set
+        // dressing. It fits the empty gutter the two records leave — they end at x≈156 and start
+        // again at x≈464 — and it never moves, because on this cabinet the credit is always in.
+        color(0.7f, 0.95f, 0.8f, 0.32f * rec)
+        textC("CREDIT 01", 320f, 464f, 1.8f)
 
         // ---- the beam itself, drawn last and unclipped: it is what is doing the revealing
         revealY = OFF
@@ -1318,6 +1330,7 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
             color(GREEN[0], GREEN[1], GREEN[2], if (on) 0.95f else 0.22f); hl(x, 465f, x + 6f, 465f)
         }
         if (lock) { color(1f, 0.35f, 0.25f, blink); textC("WARNING", 320f, 68f, 1.8f) }
+        buildThrottle()
         buildShieldHud()
         // damage: red frame
         if (game.damageFlash > 0f) {
@@ -1339,6 +1352,44 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
             State.DYING -> { color(1f, 0.3f, 0.25f, 0.6f + 0.4f * abs(sin(t * 12f))); textC("DEREZZED", 320f, 215f, 5f) }
             else -> {}
         }
+    }
+
+    // ------------------------------------------------------------------ [UNDER POWER]
+    /**
+     * THE THROTTLE LADDER — the only thing on the glass that says the pad is still being read.
+     *
+     * A held drive has almost no other evidence. Down a straight corridor with the far wall thirty
+     * units off, the strokes barely change; the tank is doing nine units a second and the frame
+     * looks like a photograph. And the failure this most needs to make visible is the one the
+     * gesture introduces: a FINGER THAT SLIPPED OFF THE PAD. Before hold-to-drive, input was
+     * discrete and either happened or did not. Now there is a state to be in, and being in it
+     * without knowing is how a player drives into a Recognizer's fire lane thinking they had
+     * already stopped.
+     *
+     * So: five rungs climbing out of the sight's own left mid tick, up for forward and DOWN FOR
+     * REVERSE — reversing is otherwise the hardest thing in this game to read, because the world
+     * receding looks a great deal like the world approaching at this stroke density. They fill as
+     * [Game.driveThrottle] comes up, so the ramp is legible as the engine catching rather than as a
+     * lag. One rung is lit the instant you engage, because "under power at all" is the question.
+     *
+     * It sits at x=134: inside the left bracket at 120, clear of the inner chevrons which start at
+     * 205, and on the opposite side of the frame from the minimap. It draws ONLY while driving —
+     * an empty gauge would be four fifths of a permanent decoration for a state that is usually off.
+     */
+    private fun buildThrottle() {
+        val d = game.driveDir
+        if (d == 0) return
+        val lit = 1 + (game.driveThrottle * 4f).toInt()
+        val x = 134f
+        for (i in 0 until 5) {
+            val y = 240f - d * (11f + i * 13f)
+            val w = 8f - i * 0.8f
+            val on = i < lit
+            color(GREEN[0], GREEN[1], GREEN[2], if (on) 0.85f else 0.16f)
+            hl(x - w, y, x + w, y)
+        }
+        // the tick the ladder grows out of, brightened so the gauge reads as one object
+        color(GREEN[0], GREEN[1], GREEN[2], 0.5f); hl(120f, 240f, 152f, 240f)
     }
 
     // ------------------------------------------------------------------ [THE SHELL, ON THE GLASS]
@@ -1569,7 +1620,11 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         if (game.isNewHigh) { color(1f, 0.9f, 0.4f, 0.6f + 0.4f * abs(sin(t * 6f))); textC("NEW HIGH SCORE", 320f, 266f, 2.6f) }
         else { color(0.7f, 0.95f, 0.8f, 0.8f); textC("HIGH SCORE ${store.highScore}", 320f, 266f, 2.6f) }
         color(0.7f, 0.95f, 0.8f, 0.8f); textC("WAVE ${game.wave}   ${game.timerText()}", 320f, 300f, 2.2f)
-        if (t > 1.2f) { color(1f, 0.9f, 0.4f, 0.5f + 0.5f * abs(sin(t * 3f))); textC("TAP TO CONTINUE", 320f, 350f, 2.6f) }
+        // 23 characters where there were 15, so the scale drops from 2.6 to 2.4: 23 × 5 × 2.4 = 276
+        // px, spanning 182…458. That clears the sight's bottom brackets (which run 120…195 and
+        // 445…520, and at y=410 in any case) and leaves the play HUD underneath it — the objective
+        // band at 449 and the score and lives at 455 — untouched.
+        if (t > 1.2f) { color(1f, 0.9f, 0.4f, 0.5f + 0.5f * abs(sin(t * 3f))); textC("INSERT COIN TO CONTINUE", 320f, 350f, 2.4f) }
     }
 
     private fun buildMenu() {

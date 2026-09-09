@@ -33,7 +33,7 @@ class AttractPlan(
     val fire: Float,
     /** The Bit rises into view. */
     val bit: Float,
-    /** The flight is over: the title comes back and TAP TO PLAY takes the frame. */
+    /** The flight is over: the title comes back and INSERT COIN takes the frame. */
     val settle: Float,
     /** The loop fades to black and starts again. */
     val end: Float,
@@ -732,7 +732,7 @@ class Attract(seed: Long, val plan: AttractPlan) {
             if (t < plan.bit) return
             val ex = ptX.last(); val ez = ptZ.last()
             // OFF THE CENTRELINE, by about a quarter of the corridor. Dead ahead it lands under the
-            // title and behind TAP TO PLAY, and the last beat of the loop is the one composition
+            // title and behind INSERT COIN, and the last beat of the loop is the one composition
             // that has to be clean; a couple of units to the side puts it in the room instead of in
             // the type. The offset is dropped rather than forced if the corridor is too tight.
             val rx = -endHz; val rz = endHx
