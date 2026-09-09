@@ -111,7 +111,8 @@ class MainActivity : Activity(), GameHost {
         game = Game(store, this)
         voice.onLineStart = { id -> refreshDuck(); glView.queueEvent { game.onVoiceLineStart(id) } }
         voice.onLineEnd = { id -> refreshDuck(); glView.queueEvent { game.onVoiceLineEnd(id) } }
-        hero.onLineStart = { refreshDuck() }
+        // The pilot's caption is raised on the beat its clip actually starts — see Game.onHeroLineStart.
+        hero.onLineStart = { id -> refreshDuck(); glView.queueEvent { game.onHeroLineStart(id) } }
         hero.onLineEnd = { refreshDuck() }
         renderer = GLRenderer(game, head, store).also { it.sbs = store.sbs }
         glView = object : GLSurfaceView(this) {}.apply {

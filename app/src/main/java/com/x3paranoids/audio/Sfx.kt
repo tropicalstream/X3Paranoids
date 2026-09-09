@@ -61,7 +61,10 @@ class Sfx(private val context: Context) {
         const val CRUSH_SLAM = 32   // it comes down and the legs close: the landing beat
         const val CRUSH_GRIND = 33  // the clamp straining on the hull
         const val CRUSH_OPEN = 34   // the legs let go and it lifts off
-        private const val COUNT = 35
+        const val TRACKING = 35     // a Recognizer has the line and is bringing its cab round — MOVE
+        const val DISC_CUT = 36     // a player shell meets a disc in the air and takes it apart
+        const val SCATTER = 37      // the arena falls back after a death: the machines reel off
+        private const val COUNT = 38
         private const val RATE = 22050
     }
 
@@ -179,6 +182,45 @@ class Sfx(private val context: Context) {
                     }
                 })
                 ids[HIT] = load(dir, "hit", buf(420) { t -> (noise() * 0.5f + sq(110f, t) * 0.4f) * exp(-t * 6f) })
+                // ---------------------------------------------------- the beat you can still act on
+                // TRACKING. A quiet servo whine RISING through a fifth — the cab coming round onto
+                // you — under a thin bearing hiss, gated at 9 Hz so it reads as a mechanism turning
+                // rather than a tone. Deliberately dull and deliberately soft: it is not a warning,
+                // it is the sound of one being prepared, and it has to be unmistakably a smaller
+                // thing than the LOCK sting that follows it 0.62 s later. The caller pitches it by
+                // how far round the cab still has to come, so the swing is audible as a swing.
+                ids[TRACKING] = load(dir, "tracking", buf(340) { t ->
+                    val u = (t / 0.34f).coerceIn(0f, 1f)
+                    val f = 300f + 150f * u
+                    var v = saw(f, t) * 0.22f + sine(f * 1.5f, t) * 0.14f + sine(f * 0.5f, t) * 0.10f
+                    v *= 0.68f + 0.32f * sine(9f, t)
+                    v += noise() * 0.07f
+                    v * sin(3.1416f * u) * 0.9f
+                })
+                // A DISC CUT OUT OF THE AIR. Two things ringing struck together: a hard bright
+                // transient, then a shattered metallic chord (three inharmonic partials well above
+                // anything else in the mix) falling away fast. It has to be instantly separable
+                // from DISC_HIT — that one is a thud with a ring on it, this is all ring and no
+                // thud, because nothing hit the tank. That distinction IS the feedback.
+                ids[DISC_CUT] = load(dir, "disccut", buf(420) { t ->
+                    var v = noise() * 0.85f * exp(-t * 55f)
+                    v += (sine(2400f, t) * 0.30f + sine(3350f, t) * 0.20f + sine(4720f, t) * 0.12f) * exp(-t * 9f)
+                    v += sine(1180f - 400f * t, t) * 0.22f * exp(-t * 12f)
+                    v *= 0.75f + 0.25f * sine(70f, t)
+                    v * (1f - exp(-t * 600f))
+                })
+                // THE ARENA FALLS BACK. A wide descending sweep — the machines' own hover pitch
+                // dropping away — with a soft pressure release under it. It is the sound of space
+                // opening up, and it is the only cue that tells the player the window after a death
+                // is REAL. Long enough (0.9 s) to cover the beat, quiet enough to sit under the
+                // system's TANK HIT.
+                ids[SCATTER] = load(dir, "scatter", buf(900) { t ->
+                    val f = 460f * exp(-t * 2.6f) + 55f
+                    var v = saw(f, t) * 0.26f + sine(f * 0.5f, t) * 0.22f + sq(f * 2f, t) * 0.08f
+                    v *= 0.65f + 0.35f * sine(17f - 11f * t, t)
+                    v += noise() * 0.22f * exp(-t * 3.2f)
+                    v * (1f - exp(-t * 40f)) * exp(-t * 1.9f)
+                })
                 // The player's own derez: the same collapse an octave down and four times as long,
                 // with a wobble that widens as cohesion goes, and 250 ms of silence on the end.
                 ids[DIE] = load(dir, "die", buf(2400) { t ->

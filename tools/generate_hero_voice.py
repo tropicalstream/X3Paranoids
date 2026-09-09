@@ -63,6 +63,17 @@ LINES = [
     ("hero_derez",       "No. Not like this."),
     ("hero_game_over",   "They can steal the game. They can't steal the code."),
     ("hero_high_score",  "A new record."),
+    # THE THREE NEW BEATS. Each one exists because a SYSTEM now does something the player has to
+    # learn, and the pilot is how this game teaches: it names the thing once, and never again.
+    #   scatter   — the arena falls back after a life is lost. The window is real; this is what
+    #               says so, and it is the difference between running and sitting through a flash.
+    #   disc_cut  — a shell has met a disc in the air. Occasional and dry: it is a reflex, not a
+    #               triumph, and a pilot who crowed about it every time would be unbearable.
+    #   protocol  — the answer to the Protocol's third line, and the only time the pilot ever
+    #               acknowledges the thing that owns the maze while inside it.
+    ("hero_scatter",     "They're falling back. Move."),
+    ("hero_disc_cut",    "Not today."),
+    ("hero_protocol",    "It knows we're here."),
 ]
 
 

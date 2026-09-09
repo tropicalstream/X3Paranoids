@@ -468,6 +468,27 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
 
     private fun nearGain(d: Float) = 1f + NEAR_GAIN * (1f - d / NEAR_GAIN_D).coerceIn(0f, 1f)
 
+    /**
+     * THE NEAR LIFT RAISES BRIGHTNESS WITHOUT DRAGGING HUE.
+     *
+     * [nearGain] pushes a near stroke's alpha above 1 and the shader emits rgb·a, so the phosphor
+     * goes past its own colour — which is exactly what a vector monitor does when the beam dwells,
+     * and it is the strongest "this wall is close" cue available on a see-through waveguide. But it
+     * blew out toward WHITE rather than toward bright green, and it did it hardest exactly where
+     * the fantasy most needs to hold: measured across bright strokes, wave 1 in an open corridor
+     * averaged RGB (58,178,94) with 0.7% whiteish pixels, while wave 6 in tight quarters averaged
+     * (112,141,127) with 22% — the closer and more intense the fight, the less this looked like a
+     * green phosphor cabinet.
+     *
+     * The cause is that all three channels are multiplied by the same gain, so the two small
+     * channels catch up with the big one. So the RED AND BLUE CHANNELS ARE PULLED BACK as the gain
+     * rises, by gain^[NEAR_HUE] — green untouched, which is where a green stroke keeps essentially
+     * all of its perceived brightness. What lands on the glass is the same stroke, the same
+     * solidity, the same beam-dwell blow-out, in the wall's own colour rather than in white.
+     */
+    private val NEAR_HUE = 0.55f
+    private fun nearHue(gain: Float) = if (gain <= 1.001f) 1f else 1f / Math.pow(gain.toDouble(), NEAR_HUE.toDouble()).toFloat()
+
     private fun rungFade(k: Int, d: Float): Float {
         val on = RUNG_ON[k]
         return ((on - d) / (on * (1f - RUNG_FULL))).coerceIn(0f, 1f)
@@ -486,14 +507,18 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
 
     /** A wall stroke: per-vertex fog and per-vertex beam gain, with its own alpha at each end. */
     private fun sline(x0: Float, y0: Float, z0: Float, x1: Float, y1: Float, z1: Float, t: FloatArray, a0: Float, a1: Float) {
-        lines.v(x0, y0, z0, t[0], t[1], t[2], a0 * fog(x0, y0, z0) * nearGain(hdist(x0, z0)))
-        lines.v(x1, y1, z1, t[0], t[1], t[2], a1 * fog(x1, y1, z1) * nearGain(hdist(x1, z1)))
+        val g0 = nearGain(hdist(x0, z0)); val k0 = nearHue(g0)
+        val g1 = nearGain(hdist(x1, z1)); val k1 = nearHue(g1)
+        lines.v(x0, y0, z0, t[0] * k0, t[1], t[2] * k0, a0 * fog(x0, y0, z0) * g0)
+        lines.v(x1, y1, z1, t[0] * k1, t[1], t[2] * k1, a1 * fog(x1, y1, z1) * g1)
     }
 
     /** The same, into the un-glowed infill batch. */
     private fun rline(x0: Float, y0: Float, z0: Float, x1: Float, y1: Float, z1: Float, t: FloatArray, a0: Float, a1: Float) {
-        mesh.v(x0, y0, z0, t[0], t[1], t[2], a0 * fog(x0, y0, z0) * nearGain(hdist(x0, z0)))
-        mesh.v(x1, y1, z1, t[0], t[1], t[2], a1 * fog(x1, y1, z1) * nearGain(hdist(x1, z1)))
+        val g0 = nearGain(hdist(x0, z0)); val k0 = nearHue(g0)
+        val g1 = nearGain(hdist(x1, z1)); val k1 = nearHue(g1)
+        mesh.v(x0, y0, z0, t[0] * k0, t[1], t[2] * k0, a0 * fog(x0, y0, z0) * g0)
+        mesh.v(x1, y1, z1, t[0] * k1, t[1], t[2] * k1, a1 * fog(x1, y1, z1) * g1)
     }
 
     /** The panel's body: two triangles, floor-bright and fading up, in the wall's own hue pushed dark and saturated. */
@@ -1225,7 +1250,12 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
             // The demo behind it keeps running as the backdrop; only its lettering stands down.
             State.TITLE -> if (att != null && !game.menuOpen) buildTitleHud(att)
             State.PLAY, State.WAVE_CLEAR, State.DYING -> { buildPlayHud(); buildMinimap() }
-            State.GAME_OVER -> { buildPlayHud(); buildGameOver() }
+            // THE RESULTS CARD STANDS DOWN FOR THE PANEL, exactly as the title's poster already
+            // does. Opening settings from the game-over screen drew the red GAME OVER / SCORE /
+            // HIGH SCORE / WAVE / INSERT COIN card straight through SETTINGS: the selected row
+            // "> MUSIC" was completely buried under the word OVER, and every row below it was
+            // crossed by score text. The panel is the thing being read; the card can wait.
+            State.GAME_OVER -> if (!game.menuOpen) { buildPlayHud(); buildGameOver() }
         }
         revealY = OFF; traceLimit = -1f; hudGain = 1f
         if (game.menuOpen) buildMenu()
@@ -1391,7 +1421,12 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         val rec = ((t - 1.5f) / 0.8f).coerceIn(0f, 1f)
         color(0.7f, 0.95f, 0.8f, 0.55f * rec)
         text("HIGH ${store.highScore}", 56f, 464f, 2.0f)
-        textR("BEST WAVE ${store.bestWave}", 584f, 464f, 2.0f)
+        // BEST WAVE IS THE WAVE REACHED, which is what those two words mean to anyone reading
+        // them. The record used to be the highest wave CLEARED, and that made the number ambiguous
+        // in the one direction that matters: "BEST WAVE 1" reads as "nobody has ever beaten wave
+        // one" and actually meant "wave one fell and wave two did not". Both numbers are kept
+        // (SettingsStore.bestWave / bestWaveReached); this is the one a player is asking for.
+        textR("BEST WAVE ${max(store.bestWaveReached, store.bestWave)}", 584f, 464f, 2.0f)
         // ---- and the credit counter between them, dimmest thing on the screen.
         // A machine that asks for a coin and has no meter is half the joke: this is what makes
         // INSERT COIN resolve into a game when the player taps rather than being a line of set
@@ -1469,7 +1504,12 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         textC(game.timerText(), 320f, 48f, 3.6f)
         text("SCORE ${game.score}", 52f, 455f, 2.4f)
         textR("LIVES ${game.lives}", 588f, 455f, 2.4f)
+        // THE OBJECTIVE BAND. It states the wave's own clear condition (see Game.objectiveText) and
+        // is handed to the Bit, in the Bit's cyan, only for the seconds the Bit has announced
+        // itself — so the colour change alone says "this line is about something else now".
+        if (game.objectiveIsBit()) color(0.45f, 0.9f, 1f, 0.95f) else color(GREEN[0], GREEN[1], GREEN[2], 0.95f)
         textC(game.objectiveText(), 320f, 449f, 2.4f)
+        color(GREEN[0], GREEN[1], GREEN[2], 0.95f)
         // wave progress: dotted bar
         val prog = game.waveProgress()
         for (i in 0 until 14) {
@@ -1486,6 +1526,7 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
             lock -> { color(1f, 0.35f, 0.25f, blink); textC("WARNING", 320f, 68f, 1.8f) }
             game.tracking -> { color(1f, 0.72f, 0.3f, 0.45f + 0.2f * blink); textC("TRACKING", 320f, 68f, 1.6f) }
         }
+        buildThreatBearings()
         buildThrottle()
         buildShieldHud()
         // damage: red frame
@@ -1500,15 +1541,234 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
             color(0.5f, 0.95f, 1f, game.shieldFlash * 0.7f)
             rect(20f, 20f, 620f, 460f)
         }
-        when (game.state) {
-            State.WAVE_CLEAR -> {
-                color(GREEN[0], GREEN[1], GREEN[2], 0.95f); textC("WAVE ${game.wave} CLEARED", 320f, 205f, 4f)
-                color(1f, 0.9f, 0.4f, 0.9f); textC(game.bonusText, 320f, 245f, 2.6f)
+        // THE ARENA FELL BACK — see [Game.scatter]. A frame in the shell's own cyan-white, drawn
+        // OPENING OUTWARD rather than as a border: three rectangles growing away from the sight, so
+        // it reads as pressure being released rather than as another thing hitting you. It is the
+        // only visual that says the window after a death is real, and it is deliberately unlike the
+        // red damage frame it always follows by a fraction of a second.
+        if (game.scatterFlash > 0f) {
+            val u = 1f - game.scatterFlash
+            // three frames opening outward across the whole grace, so the player can SEE the window
+            // running down rather than being told once that it opened
+            for (i in 0 until 3) {
+                val k = u + i * 0.16f
+                if (k > 1f) continue
+                color(0.65f, 1f, 0.95f, game.scatterFlash * (0.75f - i * 0.20f))
+                val gx = 120f + k * 200f; val gy = 90f + k * 150f
+                rect(320f - gx, 240f - gy, 320f + gx, 240f + gy)
             }
-            State.DYING -> { color(1f, 0.3f, 0.25f, 0.6f + 0.4f * abs(sin(t * 12f))); textC("DEREZZED", 320f, 215f, 5f) }
-            else -> {}
+            // and the word for what just happened, fading with it — three syllables, the machines'
+            // own status rather than an instruction, in the shell's colour so it is unmistakably
+            // not another hit
+            color(0.65f, 1f, 0.95f, game.scatterFlash * 0.9f)
+            textC("SCATTERED", 320f, 300f, 2.2f)
+        }
+        // EVERYTHING THAT LIVES IN THE MIDDLE OF THE GLASS STANDS DOWN FOR THE SETTINGS PANEL.
+        //
+        // The panel occupies 150…490 × 86…404, and the banners, the control card and the captions
+        // are drawn straight through it — WAVE CLEARED across the rows, DEREZZED in red at 5.0
+        // scale over SETTINGS itself. It cannot be fixed with a black backing rectangle: the whole
+        // renderer blends additively (GL_SRC_ALPHA, GL_ONE), so black adds nothing and occludes
+        // nothing. The only way to have something behind a panel on an additive display is not to
+        // draw it, so that is what this does. The readouts, the sight and the plate stay — pausing
+        // mid-game to change a setting should not hide the state you paused to look at.
+        if (!game.menuOpen) {
+            buildPilotCaption()
+            buildControlCard()
+            when (game.state) {
+                State.WAVE_CLEAR -> {
+                    color(GREEN[0], GREEN[1], GREEN[2], 0.95f); textC("WAVE ${game.wave} CLEARED", 320f, 205f, 4f)
+                    color(1f, 0.9f, 0.4f, 0.9f); textC(game.bonusText, 320f, 245f, 2.6f)
+                }
+                State.DYING -> { color(1f, 0.3f, 0.25f, 0.6f + 0.4f * abs(sin(t * 12f))); textC("DEREZZED", 320f, 215f, 5f) }
+                else -> {}
+            }
         }
     }
+
+    // ------------------------------------------------------------------ [THE VOICES, IN PLAY]
+    /**
+     * THE PILOT IS CAPTIONED IN THE ARENA NOW, AND SO IS THE PROTOCOL.
+     *
+     * The intro captioned its voices and the game did not caption its own: twenty-one fish.audio
+     * lines delivered as audio only, under a music track, over three dozen synthesised cues, out of
+     * open-ear waveguide speakers in whatever room the player is in. Fixing how much of the pilot a
+     * player REACHES (the difficulty pass) is worthless if the pilot is not LEGIBLE when reached —
+     * they are two separate gates and this is the second one.
+     *
+     * WHERE, AND WHY NOT IN THE MIDDLE. Bottom-left, under the pilot's own tag, at 1.6 scale: below
+     * the sight's lower brackets, above the score row, and out of the centre of the glass where the
+     * fight is. It never blinks and never moves; it fades in over a fifth of a second, holds for
+     * exactly as long as the clip runs, and fades out. The Protocol's three lines take the SAME
+     * band in the system's colder colour, because the whole point of the pair is that they answer
+     * each other and a reader has to be able to see that happen.
+     *
+     * THE SYSTEM'S ORDINARY LINES STAY UNCAPTIONED, deliberately. It is a machine reciting status —
+     * TANK HIT, WAVE THREE, RECOGNIZER DESTROYED — and every one of those facts is already printed
+     * somewhere on the sight. Captioning them would double the HUD to say nothing new. The pilot is
+     * the only voice in here that says something the glass does not.
+     */
+    private fun buildPilotCaption() {
+        val pt = game.protocolText
+        if (pt.isNotEmpty()) {
+            val fade = window(game.protocolAge, 0f, 0.25f, game.protocolHold, 0.6f)
+            if (fade > 0.01f) {
+                // the Protocol speaks in the wave's own colour — the thing that owns the arena
+                val tint = game.wallTint()
+                color(tint[0], tint[1], tint[2], 0.55f * fade); text("PROTOCOL", 52f, 390f, 1.3f)
+                color(tint[0], tint[1], tint[2], 0.95f * fade); text(pt, 52f, 410f, 1.75f)
+            }
+        }
+        val s = game.pilotText
+        if (s.isEmpty()) return
+        val fade = window(game.pilotAge, 0f, 0.2f, game.pilotHold, 0.5f)
+        if (fade <= 0.01f) return
+        val cut = s.indexOf('|')
+        color(1f, 0.6f, 0.25f, 0.55f * fade); text("PILOT", 52f, 390f, 1.3f)
+        color(1f, 0.78f, 0.35f, 0.95f * fade)
+        if (cut >= 0) { text(s.substring(0, cut), 52f, 404f, 1.55f); text(s.substring(cut + 1), 52f, 422f, 1.55f) }
+        else text(s, 52f, 410f, 1.75f)
+    }
+
+    /**
+     * THE INSTRUCTION CARD. A 1982 cabinet had one bolted to the glass and a control panel you could
+     * look down at; this has a waveguide and a touchpad, and the only statement of the verbs lived
+     * at the very end of an attract loop most players skip past in the first two seconds. So the
+     * first [Game.CARD_T] seconds of a played game state them once, low on the sight, and fade.
+     *
+     * It is not a tutorial and it does not stop anything: the game is live behind it, the machines
+     * are already walking, and a player who knows the controls simply drives through it. Two lines,
+     * dim, in the bezel's colour so they read as printed on the instrument rather than as HUD.
+     */
+    private fun buildControlCard() {
+        val c = game.cardT
+        if (c <= 0f) return
+        val fade = ((c / 2.2f).coerceIn(0f, 1f)) * ((Game.CARD_T - c) / 0.6f).coerceIn(0f, 1f)
+        color(0.6f, 0.85f, 0.75f, 0.62f * fade)
+        textC("HEAD AIMS   TAP FIRES", 320f, 340f, 1.7f)
+        textC("SWIPE UP TO DRIVE   HOLD TO CRUISE", 320f, 360f, 1.7f)
+        textC("SWIPE LEFT OR RIGHT TURNS 90", 320f, 380f, 1.7f)
+    }
+
+    // ------------------------------------------------------------------ [WHICH WAY TO LOOK]
+    /**
+     * THE SIGHT POINTS AT THE THREAT — the fix for the two most expensive gaps in this game.
+     *
+     * THE FIRST is the crush. The five-beat capture is the most elaborately authored moment here,
+     * and it routinely played where the player could not see it: captured with coordinates, the
+     * crusher 2.3 units due east while the periscope faced north, CAPTURED in the top band, LIVES
+     * ticking 3 → 2, and no machine anywhere in view. [Game.caught] freezes the hull, so the player
+     * has a second and a half with nothing to do but look — and nothing ever told them where.
+     *
+     * THE SECOND is the disc. WARNING turning the whole sight red is unmissable and says nothing
+     * about direction; the only bearing in the game was a three-pixel spur on a 110 px plate in the
+     * top-right corner, to be found and parsed inside the lock dwell.
+     *
+     * THE ANSWER IS THE ONE A TANK SIGHT WOULD ACTUALLY GIVE, and one a 1982 vector cabinet could
+     * draw: a CHEVRON ON THE SIGHT RIM on the bearing to the machine, pointing outward at it, with
+     * a range tick beside it. The camera never moves — that would be nauseating, and the code is
+     * right to refuse it. The machine's own eye is projected; when it is on the glass the chevron
+     * rides just inside the sight frame nearest to it, and when it is behind you the bearing is
+     * taken in the horizontal plane and pinned to the rim, so a threat directly astern draws at the
+     * bottom of the sight rather than vanishing.
+     *
+     * PRIORITY AND WEIGHT. The crusher is drawn hard red, big, and pulsing, because it is a set
+     * piece with a fixed running time and the player has nothing else to do. A machine that can
+     * throw NOW is red and steady; one that is still bringing its cab round is amber and half the
+     * weight — the same three-tier grammar as the CAPTURED / WARNING / TRACKING word in the top
+     * band, so the rim and the band always agree. At most three are drawn: a rim full of arrows is
+     * a decoration, and the two that can kill you in the next second are the ones that matter.
+     */
+    private val bearPt = FloatArray(2)
+
+    private fun buildThreatBearings() {
+        if (game.state != State.PLAY && game.state != State.DYING) return
+        val crusher = game.crusher
+        var drawn = 0
+        if (crusher != null) { threatChevron(crusher, 2); drawn++ }
+        for (r in game.recognizers) {
+            if (drawn >= 3) break
+            if (r.hp <= 0 || r === crusher || !r.hasLos) continue
+            if (r.facing) { threatChevron(r, 1); drawn++ }
+        }
+        for (r in game.recognizers) {
+            if (drawn >= 3) break
+            if (r.hp <= 0 || r === crusher || !r.hasLos || r.facing) continue
+            threatChevron(r, 0); drawn++
+        }
+    }
+
+    /** [level]: 0 tracking (amber, light), 1 can throw now (red), 2 has you (red, heavy, pulsing). */
+    private fun threatChevron(r: com.x3paranoids.engine.Recognizer, level: Int) {
+        // The eye is the thing the player has to find — it is where the disc comes from and the one
+        // part of the machine that lights up — so the bearing is taken to it, not to the axle.
+        r.eye(bearEye)
+        val onGlass = project(bearEye[0], bearEye[1], bearEye[2], bearPt)
+        // The sight's own rectangle, a few pixels in from the brackets so the chevron reads as part
+        // of the instrument rather than as something stuck to the bezel.
+        val x0 = 138f; val x1 = 502f; val y0 = 88f; val y1 = 392f
+        val cxm = (x0 + x1) * 0.5f; val cym = (y0 + y1) * 0.5f
+        var sx: Float; var sy: Float
+        if (onGlass) { sx = bearPt[0]; sy = bearPt[1] }
+        else {
+            // BEHIND THE EYE. Project the bearing in the horizontal plane instead: the angle
+            // between where the periscope is looking and where the machine is, mapped onto the rim.
+            val dx = r.x - game.px; val dz = r.z - game.pz
+            var a = kotlin.math.atan2(dx, -dz) - game.yaw
+            while (a > 3.14159f) a -= 6.28318f
+            while (a < -3.14159f) a += 6.28318f
+            // sin/cos of the relative bearing put a threat dead astern at the bottom of the sight,
+            // one to the left on the left rim, and so on — a compass, drawn on the glass.
+            sx = cxm + sin(a) * 400f
+            sy = cym + (if (abs(a) > 1.5708f) 260f else 0f) - cos(a) * 40f
+        }
+        // clamp to the rim and work out the outward direction from the sight's centre
+        val ex = sx.coerceIn(x0, x1); val ey = sy.coerceIn(y0, y1)
+        var ox = ex - cxm; var oy = ey - cym
+        val ol = hypot(ox, oy)
+        if (ol < 1f) { ox = 0f; oy = -1f } else { ox /= ol; oy /= ol }
+        val nx = -oy; val ny = ox
+        val blink = 0.5f + 0.5f * sin(game.time * (if (level == 2) 11f else 7f))
+        // THE CRUSHER'S IS TWICE THE SIZE OF ANYTHING ELSE ON THE RIM. Verified on the glasses: at
+        // the same weight as a firing machine's it sat in the bottom band and read as one more
+        // marker, on the one beat in this game where the player is frozen, has nothing to do but
+        // look, and has 1.5 seconds to find the best-authored thing here. It gets a second outer
+        // chevron behind it (below) for the same reason.
+        val sc = when (level) { 2 -> 2.0f; 1 -> 1f; else -> 0.72f }
+        when (level) {
+            2 -> color(1f, 0.28f, 0.2f, 0.85f + 0.4f * blink)
+            1 -> color(1f, 0.34f, 0.24f, 0.9f)
+            else -> color(1f, 0.72f, 0.32f, 0.45f + 0.15f * blink)
+        }
+        // the chevron: a filled-looking arrowhead of three strokes, pointing OUT at the machine
+        val tipX = ex + ox * 9f * sc; val tipY = ey + oy * 9f * sc
+        val aX = ex - ox * 5f * sc + nx * 8f * sc; val aY = ey - oy * 5f * sc + ny * 8f * sc
+        val bX = ex - ox * 5f * sc - nx * 8f * sc; val bY = ey - oy * 5f * sc - ny * 8f * sc
+        hl(tipX, tipY, aX, aY); hl(tipX, tipY, bX, bY); hl(aX, aY, bX, bY)
+        if (level > 0) {
+            val mX = ex - ox * 1.5f * sc; val mY = ey - oy * 1.5f * sc
+            hl(tipX, tipY, mX, mY)
+        }
+        if (level == 2) {
+            // the outer chevron: a second, wider arrowhead standing off behind the first, so the
+            // crusher's marker is a SHAPE at a glance rather than a bigger version of the others
+            val t2X = ex + ox * 20f; val t2Y = ey + oy * 20f
+            val c2X = ex - ox * 4f + nx * 21f; val c2Y = ey - oy * 4f + ny * 21f
+            val d2X = ex - ox * 4f - nx * 21f; val d2Y = ey - oy * 4f - ny * 21f
+            hl(t2X, t2Y, c2X, c2Y); hl(t2X, t2Y, d2X, d2Y)
+        }
+        // and the range tick: one short bar per four units out, inboard of the head, so the player
+        // can tell "on top of me" from "across the arena" without leaving the chevron
+        val d = hypot(r.x - game.px, r.z - game.pz)
+        val ticks = (4 - (d / 6f).toInt()).coerceIn(1, 4)
+        for (i in 0 until ticks) {
+            val t0 = 9f + i * 4.5f
+            hl(ex - ox * t0 + nx * 4.5f * sc, ey - oy * t0 + ny * 4.5f * sc,
+               ex - ox * t0 - nx * 4.5f * sc, ey - oy * t0 - ny * 4.5f * sc)
+        }
+    }
+
+    private val bearEye = FloatArray(3)
 
     // ------------------------------------------------------------------ [ON THE GLASS]
     /**

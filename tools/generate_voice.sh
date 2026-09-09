@@ -37,6 +37,19 @@ render bit "Bit acquired. Extra life." 160
 # pool. One clause each; the echo between the two voices is the point.
 render energy "Energy drawn." 160
 render shield_down "Shield collapsed." 165
+# The pool standing up in the back half of wave one — the reveal of the energy economy, stated
+# flatly by the machine that owns the energy. One clause, like every other status line.
+render energy_pool "Energy pool online." 160
+# ------------------------------------------------------------------ THE PROTOCOL NOTICES YOU
+# Three lines, on waves 3, 5 and 7 — the same waves the arena's colour measurably shifts (see
+# Game.wallTint / maybeProtocol). This is the MONOPOLY CONTROL PROTOCOL as a PRESENCE rather than a
+# name in the intro crawl: the villain does not appear, it does not stop the game, it simply starts
+# keeping score of you out loud, in three words, in the same flat voice that has been narrating
+# since GREETINGS PROGRAM. A cabinet of 1982 that comments on your progress in three words is
+# period-exact, and it gives the world's most visible change — the grid going cold — a cause.
+render protocol_1 "Protocol attention rising." 160
+render protocol_2 "Your signature is logged." 160
+render protocol_3 "Protocol override. All units." 158
 render hit "Tank hit." 175
 # A Recognizer has closed on the tank (Game.beginCrush). One word, flat: the machine stating a
 # capture the way it states everything, while the legs come down.
