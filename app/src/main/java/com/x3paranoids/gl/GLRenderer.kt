@@ -1197,12 +1197,31 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
     private val PL_X1 = MAP_X + MAP_S + 5f
     private val PL_Y0 = MAP_Y - 12f
     private val PL_Y1 = MAP_Y + MAP_S + 5f
-    /** A patrolling Recognizer nearer than this (about two cells) shows on the plate; further, it does not. */
+    /** A patrolling Recognizer nearer than this (about two cells) is RESOLVED on the plate — drawn at
+     *  its true live position. Further out it is a ghost instead; it is never simply absent. */
     private val MAP_NEAR = 18f
     /** Inside this the Bit's true position appears; outside, only its bearing. */
     private val MAP_BIT_NEAR = 20f
     /** The bearing caret rides this far inside the plate's rim, so it never lands on the frame. */
     private val MAP_INSET = 7f
+    /** Seconds between sweeps: how often an unresolved contact's ghost takes a new return. */
+    private val MAP_SWEEP = 2.0f
+    /** The instrument label under the plate, on one baseline: a small caption and a bigger value. */
+    private val LBL_Y = 143f
+    private val LBL_CAP_S = 1.1f
+    private val LBL_VAL_S = 1.7f
+    /** "CONTACTS " at [LBL_CAP_S] is 49.5 px and "n/m" at [LBL_VAL_S] is 25.5 — 75 px, the plate's own width. */
+    private val LBL_VAL_X = PL_X0 + StrokeFont.ADVANCE * LBL_CAP_S * 9f
+    /**
+     * The cells that already carry a ghost this frame. ONE BRACKET PER CELL, because the renderer
+     * blends additively: two machines in one room drew their brackets on top of each other and the
+     * cell came out at twice the alpha — brighter than the boundary wall, which is the loudest thing
+     * on the plate and exactly what a stale, coarse, unresolved mark must never outshine. Deduping
+     * is also the truer reading. A bracket is a PLACE, not a tally: it says "contact in this room",
+     * and the count of machines is the label's job, which is where a player should be reading it.
+     */
+    private val ghostCells = IntArray(16)
+    private var ghostCellN = 0
     private var mapDrawn = false
 
     /**
@@ -1212,13 +1231,20 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
      * HUD pass, scissor the plate's rectangle back to black. It costs no light and adds no fill:
      * black is the one value a waveguide renders as "not there", so the plate reads as a small
      * quiet window in the sight rather than a bright panel pasted over it.
+     *
+     * THE CLEARED RECTANGLE RUNS PAST THE PLATE'S FRAME to take the CONTACTS label with it, down to
+     * [LBL_Y] plus a pixel of air. The label is the smallest type on the glass and it is the one
+     * readout whose whole job is to be believed; a wall-top stroke running through "0/3" turns it
+     * into "8/3", which is worse than not printing it. The extra bite is 75 x 16 px of sky a hundred
+     * pixels above the horizon — the same argument that put the plate up here in the first place.
      */
     private fun clearPlate(eye: Int, vw: Int) {
         if (!mapDrawn) return
         val sx = vw / 640f; val sy = height / 480f
+        val y1 = LBL_Y + 1f
         GLES30.glEnable(GLES30.GL_SCISSOR_TEST)
-        GLES30.glScissor((eye * vw + PL_X0 * sx).toInt(), (height - PL_Y1 * sy).toInt(),
-            ((PL_X1 - PL_X0) * sx).toInt() + 1, ((PL_Y1 - PL_Y0) * sy).toInt() + 1)
+        GLES30.glScissor((eye * vw + PL_X0 * sx).toInt(), (height - y1 * sy).toInt(),
+            ((PL_X1 - PL_X0) * sx).toInt() + 1, ((y1 - PL_Y0) * sy).toInt() + 1)
         GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
         GLES30.glDisable(GLES30.GL_SCISSOR_TEST)
     }
@@ -1970,13 +1996,45 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
      * something: a Recognizer walked. Map-up is the bearing you spawn on and the one a triple-tap
      * re-centre returns you to; the N above the top edge names it outright.
      *
-     * It is a THREAT display, not a map of everything. Walls and the tank always; a Recognizer only
-     * once it is hunting you (it has line of sight, so it can already shoot you — you have earned
-     * the right to know where from) or once it strays within [MAP_NEAR], about two cells, which is
-     * "something is around the corner" and lets you get the drop on it. Sleeping patrols across the
-     * maze stay off the plate, so the sweep, and the dread of it, survive intact. The Bit is a
-     * BEARING only — an arrow on the rim — until you are within [MAP_BIT_NEAR]; a bearing through a
-     * maze of right angles is a problem, not an answer, so FIND THE BIT still means find it.
+     * It is a THREAT display, not a map of everything. Walls and the tank always; a Recognizer is
+     * RESOLVED — drawn as a bright square at its true live position — only once it is hunting you
+     * (it has line of sight, so it can already shoot you — you have earned the right to know where
+     * from) or once it strays within [MAP_NEAR], about two cells, which is "something is around the
+     * corner" and lets you get the drop on it. The Bit is a BEARING only — an arrow on the rim —
+     * until you are within [MAP_BIT_NEAR]; a bearing through a maze of right angles is a problem,
+     * not an answer, so FIND THE BIT still means find it.
+     *
+     * GHOSTS: THE CONTACTS IT HAS NOT RESOLVED.
+     *
+     * The rule above used to CONTINUE past an unresolved machine and draw nothing at all, which is
+     * the one thing a threat display may not do — the readout said RECOGNIZERS 3 and the plate was
+     * empty, and the owner who commissioned the rule read his own plate as broken. A display that
+     * withholds has to say that it is withholding, or it is just wrong.
+     *
+     * So an unresolved machine now draws as a GHOST: an open corner bracket, one maze cell across,
+     * dimmer than the interior walls it sits between. Three things keep it from handing back the
+     * omniscience the rule exists to refuse.
+     *
+     *  - COARSE. The bracket is not at the machine; it is on the CENTRE OF THE CELL the machine was
+     *    in, and it is drawn the size of that cell. You learn the neighbourhood, never the position
+     *    — and a cell is exactly the grain at which this maze is navigated anyway, so it is the
+     *    honest unit: "it is in that room", not "it is 1.7 units left of the doorway".
+     *  - LATE. It refreshes on a [MAP_SWEEP] beat and holds still in between, so it is a LAST-KNOWN
+     *    return, not a tracker. A hunter crosses most of a cell in two seconds, so a ghost is
+     *    routinely a cell out — enough to walk toward, never enough to shoot at. The sweep is
+     *    shared, so every ghost steps at the same instant: a periodic sample reads as a sample. A
+     *    ghost that slid smoothly would be a tracker with the brightness turned down, which is the
+     *    one outcome worth nothing.
+     *  - QUIET, AND A DIFFERENT SHAPE. Live marks are closed squares, bright, and pulse while
+     *    hunting; they carry the LOS spur and the capture ring. A ghost is four open corner ticks,
+     *    dimmer than an interior wall, and it never pulses, never draws a spur and never draws a
+     *    ring, because it has no live bearing to draw one from. Closed and moving means a machine;
+     *    open and still means a place. Corner marks are the plate's own mount idiom, which already
+     *    means "a region, not a thing".
+     *
+     * And the dread survives, because the ghost is what dread needs and the empty plate never gave
+     * it: three brackets standing around the maze while the sight stays clear is the sweep made
+     * visible. What you cannot get from it is a firing solution.
      */
     private fun buildMinimap() {
         if (!store.minimap) return
@@ -2017,10 +2075,55 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
 
         // Recognizers: squares, so they never read as the Bit's diamond at this size. Colour runs the
         // same patrol-green→hunting-red lerp as the world models, so the plate and the view agree.
+        // The sweep index every ghost samples on — shared, so the whole plate steps together.
+        val sweep = (game.time / MAP_SWEEP).toInt()
+        var resolved = 0
+        ghostCellN = 0
         for (r in game.recognizers) {
             if (r.hp <= 0) continue
+            // The return is taken for EVERY live machine, resolved or not, so a contact that drops
+            // out of resolution leaves behind a return no older than the sweep that just passed —
+            // "where it was when I last had it", which is what a last-known mark is supposed to mean.
+            if (r.ghostSweep != sweep) {
+                r.ghostSweep = sweep
+                r.ghostC = m.colOf(r.x); r.ghostR = m.rowOf(r.z)
+                r.ghostX = m.cellX(r.ghostC); r.ghostZ = m.cellZ(r.ghostR)
+            }
             val threat = r.hunting || r.alert > 0.15f
-            if (!threat && hypot(game.px - r.x, game.pz - r.z) > MAP_NEAR) continue
+            if (!threat && hypot(game.px - r.x, game.pz - r.z) > MAP_NEAR) {
+                // UNRESOLVED — four corner ticks marking the remembered CELL, drawn once per cell
+                // however many contacts are in it (see [ghostCells]).
+                //
+                // THE TICKS RUN ON THE DIAGONAL, which is the whole reason this shape and not the
+                // obvious one. The first version was an axis-aligned corner bracket sitting on the
+                // cell's own edges, and on the glasses it kept disappearing: a maze wall lies on a
+                // cell edge, so wherever the machine happened to be next to one — and 28 of this
+                // arena's 64 cells touch the boundary alone — half the bracket printed on top of a
+                // wall and the mark stopped reading at all. The plate is built entirely of
+                // horizontals and verticals, so a diagonal is the one stroke on it that nothing else
+                // can swallow, and four of them pointing inward from the corners still say "this
+                // square of the maze" rather than "this point". They stop short at both ends: clear
+                // of the corner, where the walls cross, and clear of the centre, so the mark stays
+                // four separate ticks and never closes into the Bit's diamond.
+                val cell = r.ghostC * m.rows + r.ghostR
+                var seen = false
+                for (i in 0 until ghostCellN) if (ghostCells[i] == cell) { seen = true; break }
+                if (seen) continue
+                if (ghostCellN < ghostCells.size) ghostCells[ghostCellN++] = cell
+                val gx = mx(r.ghostX); val gy = my(r.ghostZ)
+                val go = Maze.CELL * s * 0.45f; val gi = Maze.CELL * s * 0.17f
+                // Under the interior walls, and measured rather than guessed: the renderer blends
+                // additively, so what the eye gets is rgb x alpha. A wall's is tint x 0.38, and its
+                // green — the channel that carries on this display — is 0.38. The ghost's is 0.368.
+                // Quieter than the structure it stands between, on the glass and not just in the
+                // constant. The first pass at 0.30 was invisible on the waveguide, which is the same
+                // failure as drawing nothing.
+                color(0.38f, 0.92f, 0.55f, 0.40f)
+                hl(gx - go, gy - go, gx - gi, gy - gi); hl(gx + go, gy - go, gx + gi, gy - gi)
+                hl(gx - go, gy + go, gx - gi, gy + gi); hl(gx + go, gy + go, gx + gi, gy + gi)
+                continue
+            }
+            resolved++
             val ex = mx(r.x); val ey = my(r.z)
             val h = if (threat) 2.8f else 2.2f
             val al = if (threat) 0.70f + 0.30f * (0.5f + 0.5f * sin(game.time * 6f)) else 0.55f
@@ -2127,6 +2230,36 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         val lx = tx - fx * 2.8f - rx * 3.4f; val ly = ty - fy * 2.8f - ry * 3.4f
         val qx = tx - fx * 2.8f + rx * 3.4f; val qy = ty - fy * 2.8f + ry * 3.4f
         hl(hx, hy, lx, ly); hl(lx, ly, bx, by); hl(bx, by, qx, qy); hl(qx, qy, hx, hy)
+
+        // ---------------------------------------------------------------- CONTACTS n / m
+        //
+        // The plate stating its own coverage, so it can never again lie by omission. The ghosts
+        // above are the picture; this is the arithmetic that names the two classes, and between
+        // them the plate teaches itself: one bright square and two brackets under "CONTACTS 1/3"
+        // says which mark the number is counting and what the other two marks therefore are.
+        //
+        // THE SEMANTICS, EXACTLY:
+        //   n = RESOLVED — machines drawn at their true live position this frame, bright squares.
+        //       Not the ghosts. A ghost is a place the plate remembers, not a contact it holds, and
+        //       counting it would make n always equal m and the label worth nothing.
+        //   m = ALIVE — `game.recognizersLeft`, the SAME expression the top-left RECOGNIZERS readout
+        //       is built from, read in the same frame off the same list. The two numbers cannot
+        //       disagree, on the frame after a kill or any other, because there is only one of them:
+        //       a shell landing drops hp to 0 and both readouts see it on the next frame together.
+        // So 0/3 means "three machines out there, none of them in my sight" — which is the state the
+        // owner hit, and the state that used to print a full readout over an empty plate.
+        //
+        // PLACED UNDER THE PLATE, not in it: the plate's 65 px square is the arena and nothing that
+        // is not the arena may stand on it. On one baseline at [LBL_Y], the caption small because it
+        // is read once and learned, the value larger because it is read at a glance. The pair is 75
+        // px — exactly the mount's width, so it cannot reach the bezel's right-hand dial column at
+        // x=612, and it starts at x=525, clear of the rim chevrons which clamp at x=502 and reach
+        // 20 px past that at the very worst. Vertically the tallest glyph tops out at 132.8, below
+        // the mount's bottom corners at y=130 and 107 px above the horizon. Nothing to collide with.
+        color(0.75f, 0.9f, 0.85f, 0.45f)
+        text("CONTACTS", PL_X0, LBL_Y, LBL_CAP_S)
+        color(GREEN[0], GREEN[1], GREEN[2], 0.85f)
+        text("$resolved/${game.recognizersLeft}", LBL_VAL_X, LBL_Y, LBL_VAL_S)
     }
 
     private fun buildGameOver() {

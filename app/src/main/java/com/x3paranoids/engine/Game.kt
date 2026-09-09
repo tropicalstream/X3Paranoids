@@ -172,6 +172,21 @@ class Recognizer(var x: Float, var z: Float) {
      * view, audio is the only channel that reaches you regardless of where you are looking.
      */
     var trackSaid = false
+    /**
+     * THE NAV PLATE'S LAST-KNOWN RETURN for this machine — the cell centre it was last sampled in,
+     * and the sweep index that sampled it. Written by the renderer, exactly as [vis] is, because the
+     * plate is the only thing that reads them; they live here rather than in a map beside the
+     * renderer so a machine carries its own return and a wave rollover throws it away with the
+     * machine. See GLRenderer.buildMinimap's GHOSTS note for what they are for and why they are
+     * coarse and late. [ghostSweep] of -1 means "never sampled": the first frame that wants it takes
+     * a return immediately, so a wave opens with its contacts already on the plate.
+     */
+    var ghostX = 0f
+    var ghostZ = 0f
+    /** The same return as cell indices, so the plate can tell two contacts in one room apart. */
+    var ghostC = 0
+    var ghostR = 0
+    var ghostSweep = -1
 }
 
 class Shot(var x: Float, var y: Float, var z: Float, var vx: Float, var vy: Float, var vz: Float, val friendly: Boolean) {
