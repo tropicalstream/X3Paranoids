@@ -64,7 +64,9 @@ class Sfx(private val context: Context) {
         const val TRACKING = 35     // a Recognizer has the line and is bringing its cab round — MOVE
         const val DISC_CUT = 36     // a player shell meets a disc in the air and takes it apart
         const val SCATTER = 37      // the arena falls back after a death: the machines reel off
-        private const val COUNT = 38
+        const val WINDUP = 38       // the disc is coming off the rail — the beat to MOVE on
+        const val POOL_TAKE = 39    // the pool pays out: the draw is worth the drive
+        private const val COUNT = 40
         private const val RATE = 22050
     }
 
@@ -220,6 +222,36 @@ class Sfx(private val context: Context) {
                     v *= 0.65f + 0.35f * sine(17f - 11f * t, t)
                     v += noise() * 0.22f * exp(-t * 3.2f)
                     v * (1f - exp(-t * 40f)) * exp(-t * 1.9f)
+                })
+                // THE WIND-UP — the third beat of the telegraph and the only one that means NOW.
+                //
+                // TRACKING is a servo turning, LOCK is a slit finding you, and both of those are
+                // states. This is a RELEASE: a hard rising third, two square partials climbing a
+                // fifth in 180 ms with a clean bright edge on the front of them, and no gate — the
+                // other two are gated at 9 and 17 Hz so they read as mechanism, and this one is
+                // deliberately smooth so it reads as a thing being LET GO. It is louder and higher
+                // than the LOCK sting it follows because it is the last thing the player is told
+                // before a disc is in the air, and it has to cut through the hover hum, the music
+                // and whatever the two voices are doing.
+                //
+                // Short on purpose. A cue that means "you have 0.38 s" cannot itself last half of
+                // them, so the whole event is over in 200 ms and the disc leaves into silence.
+                ids[WINDUP] = load(dir, "windup", buf(200) { t ->
+                    val u = (t / 0.2f).coerceIn(0f, 1f)
+                    val f = 620f + 560f * u * u
+                    var v = sq(f, t) * 0.34f + saw(f * 1.5f, t) * 0.16f + sine(f * 2f, t) * 0.12f
+                    v += noise() * 0.30f * exp(-t * 90f)
+                    v * (1f - exp(-t * 500f)) * exp(-t * 5.5f)
+                })
+                // THE POOL PAYS OUT. The shell sealing already has SHIELD_UP; this is the other
+                // half of a full draw — a short ascending arpeggio, coin-bright, the cabinet
+                // acknowledging that crossing the maze and standing still in it was worth doing.
+                ids[POOL_TAKE] = load(dir, "pooltake", buf(420) { t ->
+                    val step = (t / 0.09f).toInt().coerceAtMost(3)
+                    val f = floatArrayOf(880f, 1174f, 1568f, 2093f)[step]
+                    var v = sine(f, t) * 0.34f + sq(f * 2f, t) * 0.09f + sine(f * 3f, t) * 0.06f
+                    v *= 1f - exp(-(t - step * 0.09f).coerceAtLeast(0f) * 260f)
+                    v * exp(-t * 2.6f)
                 })
                 // The player's own derez: the same collapse an octave down and four times as long,
                 // with a wobble that widens as cohesion goes, and 250 ms of silence on the end.

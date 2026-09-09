@@ -173,6 +173,19 @@ class Recognizer(var x: Float, var z: Float) {
      */
     var trackSaid = false
     /**
+     * THE WIND-UP HAS BEEN HEARD FOR THIS THROW — the third and last beat of the telegraph, and
+     * the one that makes WARNING an EVENT rather than a level.
+     *
+     * Measured across 47 lock-to-throw pairs on the glasses, the gap between the eye finding you
+     * and the disc leaving it ran a median 1.66 s and a maximum of ELEVEN: [Game.dwell] is only
+     * the floor, and what actually decides the moment of release is whatever was left on
+     * [fireCd] when the line opened. So the player was handed a red frame of unknown, unbounded
+     * length and no cue whatever at the instant that mattered. This flag arms the cue that says
+     * NOW — see [Game.WINDUP_LEAD] — and is cleared by the throw itself, so every disc in this
+     * game is preceded by it exactly once.
+     */
+    var windupSaid = false
+    /**
      * THE NAV PLATE'S LAST-KNOWN RETURN for this machine — the cell centre it was last sampled in,
      * and the sweep index that sampled it. Written by the renderer, exactly as [vis] is, because the
      * plate is the only thing that reads them; they live here rather than in a map beside the
@@ -337,6 +350,19 @@ class Game(val store: SettingsStore, private val host: GameHost) {
          */
         const val FIRE_RANGE = 20f
         /**
+         * INSIDE THIS THE MACHINE SAYS "LOCKON"; OUTSIDE IT, THE STING AND THE CHEVRON SAY IT ALONE.
+         * The lock's median range was 14.9 units and the disc's median 9.5, so the arena's voice was
+         * announcing a threat several seconds and several cells before it was one. The sting, the
+         * red frame and the rim chevron all still fire at full [FIRE_RANGE] — the player is never
+         * less informed — but the SPOKEN line is kept for the range at which the machine is a shape
+         * on the glass rather than a few strokes across the arena.
+         */
+        const val LOCK_SAY_R = 13f
+        /** How far a patrolling machine's chosen sweep may be from the tank, in maze steps. */
+        const val PATROL_NEAR = 4
+        /** How often a lost machine sweeps the player's district rather than anywhere at all. */
+        const val PATROL_HUNT_BIAS = 0.72f
+        /**
          * A PLAYER SHELL CAN CUT A DISC OUT OF THE AIR. This is the radius of that meeting, and it
          * is the only new verb in this game — the answer to a rim chevron that could otherwise only
          * ever say "death is coming from there" and leave you with nothing to do about it but look
@@ -445,6 +471,59 @@ class Game(val store: SettingsStore, private val host: GameHost) {
          * EASY widens it further; see [dwell].
          */
         const val LOCK_DWELL = 0.62f
+        /**
+         * THE WIND-UP: HOW LONG BEFORE THE DISC LEAVES THE CAB THE PLAYER IS TOLD IT IS LEAVING.
+         *
+         * WARNING was a LEVEL and the throw was an unannounced event inside it. The sight went red
+         * when the eye found you and stayed red — for a median 1.66 s, sometimes for eleven — and
+         * then a disc arrived. Nothing in the game marked the release, which is why twenty-one
+         * logged deaths contained essentially no evasions: not because the disc is undodgeable, but
+         * because nobody was ever told when to dodge.
+         *
+         * It IS dodgeable, and the arithmetic is not close. The hit box is 1.15 units, a disc
+         * crosses the median throw distance of 9.5 units in about 0.45 s at [BOLT_SPEED], and the
+         * tank moves at [MAX_SPEED] 9 — four units in that time, three and a half hit boxes. The
+         * disc is aimed at where you ARE, never at where you will be. One cue at the right moment
+         * turns the whole of that arithmetic on.
+         *
+         * 0.38 s is set against human reaction plus the drive: about a fifth of a second to hear
+         * it and act, and the rest of it moving. Longer and the cue stops meaning "now"; shorter
+         * and it is a sound the disc arrives with rather than one it is announced by.
+         */
+        const val WINDUP_LEAD = 0.38f
+        /**
+         * HOW LONG BEFORE A THROW THE CAB COMES ONTO YOU — the window in which TRACKING happens and
+         * the reason it now happens at all. A half-turn at [TURN_HUNT] takes 1.12 s and the worst
+         * case a machine ever faces is well under that, so this is comfortably enough time to
+         * complete any swing and still settle inside [FIRE_ARC] before the cooldown runs out. It is
+         * also, deliberately, about a second — long enough that the player hears the servo, finds
+         * the machine and has a decision (break the line, or turn onto it and be ready to cut the
+         * disc) before the LOCK sting even lands.
+         */
+        const val AIM_LEAD = 1.15f
+        /**
+         * ONE THROWER AT A TIME. No two machines may release inside this — see [lastThrowT].
+         *
+         * The scatter wrote an identical cooldown onto every machine in range, so from wave three
+         * up the arena came off that cooldown on the same frame: logged at wave four, four locks
+         * inside 167 ms and then three throws inside 19 ms, and on the next cycle four inside 3 ms.
+         * Jitter (below) desynchronises the first volley; it does not stop a second one re-forming,
+         * because nothing in the fire path was ever random. This is the backstop that does: a
+         * machine whose moment arrives while the arena is still ringing from another's waits a beat
+         * and takes its shot after. Four discs in three milliseconds is not difficulty, it is a
+         * dice roll; four discs across two seconds is a firefight.
+         */
+        const val VOLLEY_GAP = 0.55f
+        /**
+         * HOW MUCH RANDOM IS PUT ON EVERY RELOAD. The ordinary reload was
+         * `(2.6 - 0.15·wave)·fireRate`, fully deterministic — no rng anywhere in the fire path —
+         * and the scatter's was a flat 3.2. Twenty of twenty-one lives after the first ended
+         * between 3.19 s and 4.80 s of the scatter that began them, median 3.79, which is the
+         * earliest arrival the constants allow: the arena was not fighting the player, it was
+         * counting down at them. The reload is now multiplied by 1 ± this, so no two machines stay
+         * in step and no single machine is a stopwatch.
+         */
+        const val RELOAD_JITTER = 0.28f
         /** How far a released machine backs off over the release, and how far a thrown one is flung. */
         const val CRUSH_BACK_OFF = 3.6f
         const val CRUSH_THROW = 5.5f
@@ -523,6 +602,13 @@ class Game(val store: SettingsStore, private val host: GameHost) {
          */
         const val SCATTER_STAGGER = 1.8f
         const val SCATTER_FIRE_CD = 3.2f
+        /**
+         * AND A DIFFERENT AMOUNT FOR EACH OF THEM. [SCATTER_FIRE_CD] was written identically onto
+         * every machine in range, which turned the one beat that was supposed to hand the player a
+         * window into the starting pistol for a synchronised volley. A machine's push-out is now
+         * 3.2 s plus up to this, rolled per machine, so the arena comes back in ones and twos.
+         */
+        const val SCATTER_FIRE_JITTER = 1.7f
         /** How far a scattered machine is pushed away from the wreck, in units. */
         const val SCATTER_PUSH = 3.2f
         /** Range at which the Bit counts as "in your lap" — the top of the proximity ramp. */
@@ -612,6 +698,8 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         const val POOL_SIP_T = 0.3f
         /** Seconds for a drained pool to stand again — see [THE ENERGY ECONOMY]. */
         const val POOL_REFILL_T = 24f
+        /** What a full draw is worth, wave-scaled: half a Recognizer, a fifth of the Bit. */
+        const val POOL_SCORE = 50
         /**
          * THE MACHINES PRESS A SHIELDED TANK. Standing off six units is what a Recognizer does to
          * something it can kill from there; a program carrying the Protocol's own energy gets
@@ -725,6 +813,26 @@ class Game(val store: SettingsStore, private val host: GameHost) {
          * letter. The lines are on [PROTOCOL_WAVES], never more than three a game, and the last one
          * is the only one the pilot gets to answer.
          */
+        /**
+         * WHEN THE PROTOCOL SPEAKS — and it is no longer a wave number, because a wave number put
+         * the round's own new writing further out of reach than the writing it had already failed
+         * to deliver. The three lines were gated on waves 3, 5 and 7 against a device record whose
+         * best wave, across twenty-nine played games, is ONE. Nobody had ever heard the villain
+         * speak, and the villain speaking is the only piece of lore in this game that is a system
+         * rather than a sentence in a crawl.
+         *
+         * They are gated on KILLS now — cumulative across the game, not the wave — and that is a
+         * better beat than the wave opening ever was. You take one of its machines apart, the flat
+         * indifferent thing that has been narrating at you since GREETINGS, PROGRAM says three
+         * words about it, and the pilot answers the last of them. The Protocol NOTICES you, on the
+         * beat you gave it a reason to. Two kills is inside a first wave; twelve is deep into a
+         * good game.
+         *
+         * [PROTOCOL_WAVES] survives as a floor for the other kind of player — someone who has
+         * survived to wave three without shooting much still meets it — so a line can arrive by
+         * either road and neither can deliver it twice.
+         */
+        val PROTOCOL_KILLS = intArrayOf(2, 6, 12)
         val PROTOCOL_WAVES = intArrayOf(3, 5, 7)
         val PROTOCOL_LINES = arrayOf("protocol_1", "protocol_2", "protocol_3")
         val PROTOCOL_TEXT = arrayOf(
@@ -776,12 +884,26 @@ class Game(val store: SettingsStore, private val host: GameHost) {
     var muzzle = 0f; private set
     private var fireCd = 0f
     var kills = 0; private set
+    /** Kills across the whole game rather than the wave — what the Protocol's three lines run off. */
+    var totalKills = 0; private set
     var waveTotal = 0; private set
     val recognizersLeft get() = recognizers.count { it.hp > 0 }
     /** Some Recognizer is FACING you with the shot line — it can throw now. WARNING, and the brackets go red. */
     var lockedOn = false; private set
     /** Some Recognizer has the shot line and is still bringing its cab round — TRACKING. Move. */
     var tracking = false; private set
+    /**
+     * A DISC IS ABOUT TO LEAVE A CAB — inside [WINDUP_LEAD] of a release. The sight's WARNING band
+     * pulses hard on this and the rim chevron doubles: WARNING stops being a light that is on and
+     * becomes a thing that HAPPENS, which is the difference between knowing you are in danger and
+     * knowing when to move.
+     */
+    var imminent = false; private set
+    /**
+     * When the arena last let a disc go. The volley gate reads it — see [VOLLEY_GAP] — so no two
+     * machines release on the same frame no matter how their cooldowns line up.
+     */
+    private var lastThrowT = -99f
     var bonusText = ""; private set
     /**
      * Seconds left on the FIND THE BIT prompt. The objective band is the one imperative sentence on
@@ -911,11 +1033,28 @@ class Game(val store: SettingsStore, private val host: GameHost) {
      * which it happens moves. The score multiplier is the honest price.
      */
     private val diff get() = store.difficulty.coerceIn(0, 2)
-    /** Machines in wave [w]. Wave one is two on every setting: a wave is where you learn a wave. */
-    private fun waveCount(w: Int): Int = when (diff) {
-        0 -> min(1 + w, 6)
-        2 -> min(2 + w, 9)
-        else -> min(1 + w, 8)
+    /**
+     * Machines in wave [w].
+     *
+     * WAVE ONE WAS TWO AND THAT MADE IT EMPTY. Cutting it to a pair was the right move against a
+     * wave that was killing everybody in twelve seconds, and it worked — and then the reviewer
+     * logged a wave-one run that went SIXTY-FOUR SECONDS with no contact, no score and the plate
+     * stuck on CONTACTS 0/2, in a sixty-four-cell maze. Two machines wandering a maze that size are
+     * not an opening wave, they are a search. The lethality dial had moved and the density dial had
+     * not moved with it.
+     *
+     * So wave one is THREE (four on HARD) — and the two changes that pay for it are elsewhere: the
+     * wind-up cue makes a disc dodgeable, and the patrol bias below means the machines come and
+     * find you instead of you finding them. More contact and more survivable contact are the same
+     * fix from two ends.
+     */
+    private fun waveCount(w: Int): Int {
+        if (w == 1) return when (diff) { 0 -> 3; 2 -> 4; else -> 3 }
+        return when (diff) {
+            0 -> min(1 + w, 6)
+            2 -> min(2 + w, 9)
+            else -> min(1 + w, 8)
+        }
     }
     /** From which wave a Recognizer takes two shells. */
     private val armourWave get() = when (diff) { 0 -> 9; 2 -> 1; else -> 6 }
@@ -923,6 +1062,21 @@ class Game(val store: SettingsStore, private val host: GameHost) {
     private val dwell get() = when (diff) { 0 -> 0.95f; 2 -> 0.45f; else -> LOCK_DWELL }
     /** Multiplies the settled fire cooldown: EASY throws two thirds as often. */
     private val fireRate get() = when (diff) { 0 -> 1.55f; 2 -> 0.82f; else -> 1f }
+    /**
+     * HOW FAR A MACHINE MAY THROW, per setting.
+     *
+     * [FIRE_RANGE] is 20 for everyone, and on the beginners' tier that was most of the arena: the
+     * measured median LOCK came at 14.9 units with a quarter of them beyond fifteen, while the
+     * median disc that actually landed came from 9.5. So the tier meant for someone who has never
+     * seen this maze was being shot at from a range where the machine is a handful of strokes and
+     * the sight has gone red for something the player cannot even pick out of the wireframe.
+     *
+     * Fifteen is a corridor and a half: near enough that the thrower is a SHAPE with a lit eye and
+     * a cab you can watch swing, far enough that breaking the line round a corner is still the
+     * escape [FIRE_RANGE]'s own note describes. Machines beyond it hunt, close, charge and crush
+     * exactly as before — EASY does not make them passive, it makes them come and be seen.
+     */
+    private val fireRange get() = when (diff) { 0 -> 15f; 2 -> 22f; else -> FIRE_RANGE }
     /** Added to the base chase speed. */
     private val speedBonus get() = when (diff) { 0 -> -0.5f; 2 -> 0.8f; else -> 0f }
     /** Score is paid for the risk taken: three quarters on EASY, half again on HARD. */
@@ -933,11 +1087,16 @@ class Game(val store: SettingsStore, private val host: GameHost) {
     private val tmp = FloatArray(2)
     private val tmp3 = FloatArray(3)
     private var lastKillSay = -99f
+    /** How far the nearest live machine is, and the last time one was anywhere near — see [maybeQuiet]. */
+    private var nearestRec = 999f
+    private var lastContactT = 0f
     private var humLevel = 0f
     /** The pool is placed but not yet standing — wave one holds it back until half the wave is down. */
     private var poolPending = false
     /** Set only while [debugStart] is going through [startGame], so the games counter stays honest. */
     private var debugLaunch = false
+    /** Silences the wave-one announcement on a debug launch that is about to jump past it. */
+    private var debugSkipAnnounce = false
     /**
      * THIS WHOLE GAME IS A VERIFICATION LAUNCH and writes NOTHING to the records.
      *
@@ -951,8 +1110,6 @@ class Game(val store: SettingsStore, private val host: GameHost) {
     private var debugGame = false
     /** How many of [PROTOCOL_LINES] the Protocol has spent this game. */
     private var protocolIdx = 0
-    /** Which line it just spoke, 1-based, so the wave's own exchange can answer the last of them. */
-    private var protocolSaid = 0
     /** A life was lost under the clamp: the arena falls back when the legs open, not before. */
     private var pendingScatter = false
     /** 1 → 0 over the beat the arena falls back after a death — the sight's own cyan-white flare. */
@@ -1359,6 +1516,7 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         loreIdx = -1; pilotText = ""; showTap = false
         protocolText = ""; protocolAge = 0f; protocolHold = 0f
         mazeSeed = System.nanoTime(); maze = Maze(8, 8, mazeSeed)
+        regionCells = null; regionC = -1; regionR = -1
         lives = 3; score = 0; wave = 0; elapsed = 0f; kills = 0; invuln = 0f; damageFlash = 0f
         vx = 0f; vz = 0f; hullYaw = 0f; hullTarget = 0f; turnBlend = 0f; newHigh = false
         driveDir = 0; driveT = 0f; driveLogT = 0f; bumpCd = 0f
@@ -1369,8 +1527,8 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         shield = 0; shieldFlash = 0f; poolActive = false; poolDraw = 0f; poolCollapse = 0f; poolVis = 0f
         poolLevel = 0f; poolMaze = null; poolFullHint = false; poolPending = false
         releasePlayer(); impacts.clear(); crushShake = 0f; sightKick = 0f; staticT = 0f
-        lockedOn = false; tracking = false
-        bitHint = 0f; cardT = CARD_T; protocolIdx = 0; protocolSaid = 0; scatterFlash = 0f
+        lockedOn = false; tracking = false; imminent = false
+        bitHint = 0f; cardT = CARD_T; protocolIdx = 0; totalKills = 0; scatterFlash = 0f
         pendingScatter = false; bitHushed = false; bitRelief = 0
         debugGame = debugLaunch
         if (!debugGame) store.games = store.games + 1
@@ -1397,7 +1555,9 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         // verification launches on a developer's own hardware. A statistic that mixes the two is
         // not evidence about anything.
         debugLaunch = true
+        debugSkipAnnounce = atWave > 1
         startGame()
+        debugSkipAnnounce = false
         debugLaunch = false
         cardT = 0f
         if (atWave > 1) { wave = atWave - 1; nextWave() }
@@ -1418,7 +1578,10 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         // a machine that was holding you when the wave rolled over (it cannot: the crusher is the
         // last thing alive, and a dead crusher releases) — belt and braces, the clamp opens
         releasePlayer()
-        if (wave > 1 && (wave - 1) % 3 == 0) { mazeSeed += 7919L; maze = Maze(8, 8, mazeSeed); placePlayer(maze.cols / 2, maze.rows / 2) }
+        if (wave > 1 && (wave - 1) % 3 == 0) {
+            mazeSeed += 7919L; maze = Maze(8, 8, mazeSeed); placePlayer(maze.cols / 2, maze.rows / 2)
+            regionCells = null; regionC = -1; regionR = -1
+        }
         if (!debugGame) store.bestWaveReached = wave
         val n = waveCount(wave)
         waveTotal = n; kills = 0
@@ -1427,8 +1590,18 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         val far = ArrayList<IntArray>()
         for (c in 0 until maze.cols) for (r in 0 until maze.rows) if (dist[c][r] >= 4) far += intArrayOf(c, r)
         far.shuffle(rng)
+        // WAVE ONE IS SPAWNED IN THE PLAYER'S HALF OF THE MAZE. Anywhere at four cells or more is
+        // most of a 64-cell arena, so an opening wave could and did start twelve cells away behind
+        // six walls, which is a minute of empty corridor before the game begins. Four to seven cells
+        // is far enough that nothing is in the tank's lap on the first frame and near enough that
+        // the first engagement is measured in seconds. Later waves keep the whole maze: by then the
+        // player knows the arena and the count fills it.
+        val spawnCells = if (wave == 1) {
+            val near = far.filter { dist[it[0]][it[1]] <= 7 }
+            if (near.size >= n) near else far
+        } else far
         for (i in 0 until n) {
-            val cell = far[i % far.size]
+            val cell = spawnCells[i % spawnCells.size]
             // The jitter keeps a wave from lining up on cell centres. It cannot currently put a
             // Recognizer in a wall — a cell centre is 4.15 units clear and the jitter is at most 1 —
             // but this is the one place in the game a body is positioned without going through
@@ -1496,6 +1669,12 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         }
         bitX = maze.cellX(bc[0]); bitZ = maze.cellZ(bc[1]); bitActive = true; bitT = 0f
         bitNearSaid = false; bitChirpCd = 2.2f; bitNoCd = 3f
+        // A DEBUG LAUNCH AT WAVE N GOES THROUGH HERE TWICE — once for the wave one that
+        // [startGame] always builds and once for the wave actually asked for — and both
+        // announcements went on the bus, 166 ms apart, which is the one place the voice scheduler
+        // was ever caught double-booking itself. The throwaway wave keeps its geometry and loses
+        // its voice.
+        if (debugSkipAnnounce) return
         host.sfx(com.x3paranoids.audio.Sfx.WAVE)
         val waveId = if (wave <= 12) "wave_$wave" else "wave_more"
         // THE PROTOCOL SPEAKS FIRST — see [maybeProtocol]. It goes AHEAD of the wave announcement,
@@ -1521,12 +1700,6 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         // Only when the wave line did NOT fire: the villain gets named out loud, once a game and
         // never early. A flourish stops being one the moment it is on a schedule.
         if (!answered && wave >= 4) pilot("hero_mcp", gap = 0f, chance = 0.22f, once = true, delay = answerAt, patience = 5000L)
-        // and the pilot answers the LAST of the Protocol's three lines — the one that takes the
-        // machines off the leash — after the wave's own exchange has finished
-        if (protocolSaid == PROTOCOL_LINES.size) {
-            protocolSaid = -1
-            pilot("hero_protocol", gap = 0f, cd = 0f, once = true, delay = answerAt + 1.4f, patience = 5000L)
-        }
     }
 
     /**
@@ -1542,15 +1715,57 @@ class Game(val store: SettingsStore, private val host: GameHost) {
      */
     private fun protocolOpening(): Float {
         if (protocolIdx >= PROTOCOL_LINES.size) return 0f
-        if (wave != PROTOCOL_WAVES[protocolIdx]) return 0f
+        if (wave < PROTOCOL_WAVES[protocolIdx]) return 0f
+        val id = PROTOCOL_LINES[protocolIdx]
+        protocolLine(0f, "wave $wave", urgent = true)
+        return after(id)
+    }
+
+    /**
+     * THE PROTOCOL NOTICES A KILL — see [PROTOCOL_KILLS]. Scheduled behind whatever the system has
+     * just said about the machine that died, so the exchange runs: RECOGNIZER DESTROYED, then the
+     * thing that owns the maze, then the pilot on the last of the three.
+     */
+    private fun protocolOnKill(at: Float) {
+        if (protocolIdx >= PROTOCOL_LINES.size) return
+        if (totalKills < PROTOCOL_KILLS[protocolIdx]) return
+        // NOT ON THE KILL THAT ENDS THE WAVE. Caught on the glasses the first time this fired: the
+        // second kill of wave one both tripped the Protocol and emptied the arena, and
+        // "PROTOCOL ATTENTION RISING" went onto the bus 189 ms ahead of "WAVE CLEARED" — two
+        // urgent system lines inside a fifth of a second, which is the exact double-booking the
+        // review found on the debug path. The clear owns that beat; the Protocol is not on a
+        // schedule and loses nothing by taking the next kill instead. [protocolIdx] is untouched
+        // here, so the line is held rather than dropped.
+        if (recognizersLeft <= 0) return
+        protocolLine(at + 0.35f, "kill $totalKills", urgent = false)
+    }
+
+    /**
+     * Speak the next of the three, now or at [delay], and hand the last one to the pilot.
+     *
+     * [urgent] is TRUE only on the wave-opening path, where the line is the first thing said and is
+     * meant to lead. On the kill path it is FALSE and the line waits its turn with a long patience:
+     * a kill can be the one that empties the wave, and an urgent line clears the system's own queue
+     * and cuts its own current sentence (see audio/Voice) — which is how you get the Protocol
+     * talking over WAVE CLEARED. It is a sentence that happens three times a game; it can afford to
+     * wait five seconds for the floor, and it is better late than on top of something.
+     */
+    private fun protocolLine(delay: Float, why: String, urgent: Boolean) {
         val i = protocolIdx++
         val id = PROTOCOL_LINES[i]
-        host.say(id, urgent = true, patienceMs = 5000L)
-        protocolText = PROTOCOL_TEXT[i]; protocolAge = 0f
-        protocolHold = max(400, host.voiceDurationMs(id)) / 1000f + 1.4f
-        protocolSaid = i + 1
-        android.util.Log.i("X3Paranoids", "PROTOCOL wave=$wave line=$id \"${PROTOCOL_TEXT[i]}\"")
-        return after(id)
+        val body = {
+            host.say(id, urgent = urgent, patienceMs = 5000L)
+            protocolText = PROTOCOL_TEXT[i]; protocolAge = 0f
+            protocolHold = max(400, host.voiceDurationMs(id)) / 1000f + 1.4f
+            android.util.Log.i("X3Paranoids", "PROTOCOL $why line=$id \"${PROTOCOL_TEXT[i]}\"")
+            Unit
+        }
+        if (delay > 0f) cue(delay, body) else body()
+        // the pilot answers the LAST of the three — the one that takes the machines off the leash
+        if (i == PROTOCOL_LINES.size - 1) {
+            pilot("hero_protocol", gap = 0f, cd = 0f, once = true,
+                delay = delay + after(id) + 0.4f, patience = 5000L)
+        }
     }
 
     private fun waveCleared() {
@@ -1620,6 +1835,12 @@ class Game(val store: SettingsStore, private val host: GameHost) {
             // anything the pilot is mid-way through stops.
             clearCues()
             host.stopHero()
+            // AND THE CAPTION GOES WITH THE VOICE. Caught on the glasses: ONE LIFE LEFT. MAKE IT
+            // COUNT. was still printed on the glass under the red DEREZZED as the sight collapsed —
+            // a line whose audio had been stopped two frames earlier, left standing because the
+            // caption holds for the clip's own duration and nothing had told it the clip was gone.
+            pilotText = ""; pilotAge = 0f; pilotHold = 0f
+            protocolText = ""; protocolAge = 0f; protocolHold = 0f
             host.sfx(com.x3paranoids.audio.Sfx.DIE)
             host.say("derezzed", urgent = true)
             // THE PLAYER'S OWN DEREZ. The hull comes apart around the periscope (see Derez.seedPlayer)
@@ -1681,13 +1902,19 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         for (r in recognizers) {
             if (r.hp <= 0) continue
             val d = hypot(r.x - px, r.z - pz)
-            if (d > SCATTER_R) continue
+            // EVERY MACHINE THAT CAN SEE THE WRECK, plus everything near it. A flat radius left the
+            // one machine that mattered untouched: measured across nineteen respawns, every single
+            // sub-second death after a scatter came from a machine sitting OUTSIDE [SCATTER_R] with
+            // a clean line — one of them threw nine milliseconds after invulnerability lapsed, from
+            // fifteen units. A machine with the shot line is by definition in the fight whatever the
+            // tape measure says, so the line is the test and the radius is the floor under it.
+            if (d > SCATTER_R && !r.hasLos) continue
             reeled++
             r.stagger = max(r.stagger, SCATTER_STAGGER)
-            r.fireCd = max(r.fireCd, SCATTER_FIRE_CD)
+            r.fireCd = max(r.fireCd, SCATTER_FIRE_CD + rng.nextFloat() * SCATTER_FIRE_JITTER)
             r.crushCd = max(r.crushCd, CRUSH_CD)
             r.charge = 0f; r.chargeCd = CHARGE_CD
-            r.lockSaid = false; r.trackSaid = false
+            r.lockSaid = false; r.trackSaid = false; r.windupSaid = false
             r.reel = rng.nextFloat() * 6.2832f
             r.noLineT = 0f; r.stuckT = 0f
             // AND THEY LOSE YOU. `chasing` outlives line of sight by five seconds so a machine that
@@ -1725,12 +1952,17 @@ class Game(val store: SettingsStore, private val host: GameHost) {
             if (al > 0.05f) { vx = ax / al * IMPULSE; vz = az / al * IMPULSE }
         }
         scatterFlash = 1f
-        lockedOn = false; tracking = false
+        lockedOn = false; tracking = false; imminent = false
         host.sfx(com.x3paranoids.audio.Sfx.SCATTER)
         host.sfx(com.x3paranoids.audio.Sfx.THRUST, 0.75f, 0.7f)
         // The pilot names the window ONCE a game — that is how the player learns the 2.6 s is real
         // and worth running in, rather than a red flash they sit through.
-        pilot("hero_scatter", gap = 0f, cd = 0f, once = true, delay = 0.85f, patience = 2500L)
+        // THE PILOT NAMES THE WINDOW EVERY TIME IT OPENS, not once a game. It was `once`, so nine
+        // plays covered twenty-one scatters: the first death of a game was taught in three channels
+        // and the second and third got the hatching, the word SCATTERED and silence on the one
+        // channel that had explained what they were for. In a three-life game that is two thirds of
+        // the best-taught mechanic here, missing, on the deaths where the player most needs it.
+        pilot("hero_scatter", gap = 0f, cd = 11f, delay = 0.85f, patience = 2500L)
         android.util.Log.i("X3Paranoids", "SCATTER discs=%d reeled=%d/%d invuln=%.2f".format(cut, reeled, recognizers.size, invuln))
     }
 
@@ -1842,8 +2074,35 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         if (a.loops != attractLoops) { attractLoops = a.loops; armAttract() }
     }
 
+    /**
+     * THE PILOT SAYS SOMETHING THAT IS NOT ABOUT DYING.
+     *
+     * Measured across eleven reviewed games: eight of twenty-four pilot lines were ever heard and
+     * FIVE OF THE EIGHT were death lines — start, scatter, last life, derez, game over. The pilot
+     * had become a man who only ever speaks about being killed, not because the script is morbid
+     * but because every other line in it hangs off content nobody reached: a wave clear, a Bit, a
+     * pool, a kill streak.
+     *
+     * THE LULL IS THE ONE BEAT THAT NEEDS NOTHING. "THE GRID'S QUIET. FOR NOW." was written for
+     * exactly this and could only be reached at a wave clear, which is the one moment it is least
+     * true. Fifteen seconds with no machine inside twenty-four units, nothing on the voice bus, and
+     * the pilot says it — a line about the arena, in the arena, available in the first minute of the
+     * first wave. It is also the only thing in this game that comments on the emptiness the review
+     * complained about, which turns a silence into a beat.
+     */
+    private fun maybeQuiet() {
+        if (state != State.PLAY || menuOpen || caught) return
+        if (time - lastContactT < 15f) return
+        if (host.voiceBusy()) return
+        if (pilot("hero_quiet", gap = 10f, cd = 55f, patience = 3000L)) {
+            lastContactT = time
+            android.util.Log.i("X3Paranoids", "QUIET lull line at t=%.1f nearest=%.1f".format(elapsed, nearestRec))
+        }
+    }
+
     private fun updatePlay(dt: Float) {
         elapsed += dt
+        maybeQuiet()
         fireCd = max(0f, fireCd - dt)
         invuln = max(0f, invuln - dt)
         bumpCd = max(0f, bumpCd - dt)
@@ -1995,7 +2254,19 @@ class Game(val store: SettingsStore, private val host: GameHost) {
                 poolDraw = 0f; poolCollapse = 1f; poolLevel = 0f
                 burst(poolX, 1.2f, poolZ, 26, 0.55f, 0.95f, 1f)
                 onShieldUp(topUp)
-                android.util.Log.i("X3Paranoids", "POOL drawn: shield=%d (topUp=%b) refill in %.0fs".format(shield, topUp, POOL_REFILL_T))
+                // AND IT PAYS. The pool was scored at ZERO by design so that it and the Bit pulled
+                // the player two different ways — and the measured outcome of that design was six
+                // reveals and NOT ONE DRAW in eleven games. The reason is not that it is too far
+                // away: it is that on a wave whose only exit is killing the machines, standing
+                // still for nearly a second at the far end of the maze actively delays the
+                // objective, so the correct play was always to ignore it. It is priced now — a
+                // fraction of a kill, wave-scaled, nowhere near the Bit's 500 — so drinking is
+                // never the best points in the arena and is no longer strictly worse than not.
+                // The tension survives; the dead branch does not.
+                score += (POOL_SCORE * wave * scoreMul).toInt()
+                host.sfx(com.x3paranoids.audio.Sfx.POOL_TAKE)
+                android.util.Log.i("X3Paranoids", "POOL drawn: shield=%d (topUp=%b) +%d refill in %.0fs".format(
+                    shield, topUp, (POOL_SCORE * wave * scoreMul).toInt(), POOL_REFILL_T))
             }
         } else {
             poolDraw = max(0f, poolDraw - dt * POOL_DRAW_DECAY / POOL_DRAW_T)
@@ -2008,7 +2279,7 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         /** The tank is wearing the Protocol's energy — see [PRESS_STANDOFF]. They come and take it back. */
         val pressed = hostile && shield > 0 && state == State.PLAY
         var nearest = 999f
-        lockedOn = false; tracking = false
+        lockedOn = false; tracking = false; imminent = false
         val it = recognizers.iterator()
         while (it.hasNext()) {
             val r = it.next()
@@ -2098,33 +2369,122 @@ class Game(val store: SettingsStore, private val host: GameHost) {
                 // THE TURN TO FACE — see [FACING BEFORE FIRING]. The bearing is a target the cab
                 // swings toward at a rate, not a value it is set to; a reeling machine's target
                 // wanders off the tank and it turns at less than half speed.
-                var target = atan2(ddx, -ddz)
-                if (reeling) target += 0.9f * sin(time * 5.3f + r.reel) * (r.stagger / STAGGER_T)
-                r.aimErr = turnToward(r, target, if (reeling) TURN_HUNT * 0.4f else TURN_HUNT, dt)
+                //
+                // AND IT ONLY SWINGS ONTO YOU WHERE YOU CAN SEE IT SWING. This was the round-two
+                // finding and it gutted the whole two-stage grammar: the turn ran on plain line of
+                // sight while the SHOT ran on the padded [fireLos], and `chasing` outlives sight by
+                // five seconds — so the machine spent its entire 160°/s swing behind a wall, out of
+                // frame, and arrived at the corner already aimed. Nine of fifteen sampled locks
+                // logged aimErr = 0.0 degrees. What reached the player was one beat, not two: LOCK,
+                // a pause, a disc. TRACKING fired in nine engagements out of forty-nine.
+                //
+                // THE FIX IS NOT TO FREEZE THE CAB, which is what gating the turn on [fireLos]
+                // alone would do — a Recognizer crabbing sideways at the tank with its head pointed
+                // down an empty corridor is a worse artefact than a silent telegraph. Without the
+                // shot line the cab rides the machine's OWN HEADING at the patrol rate, which is
+                // what a thing walking somewhere looks like; the moment the line opens it swings
+                // onto the tank at [TURN_HUNT], in view, and that swing is the beat TRACKING was
+                // written for. [aimErr] is still measured to the tank throughout, so the servo whine
+                // is pitched by how far round the cab genuinely has to come.
+                // A RECOGNIZER LOOKS WHERE IT IS GOING UNTIL IT IS READY TO THROW. That one rule
+                // is what puts the swing back in front of the player, and it is the rule the
+                // silhouette has always implied: the cab is a HEAD on a gantry, and a thing that
+                // walks does not walk sideways staring at you.
+                //
+                // The old code tracked the tank on every frame it could see it, from the moment it
+                // acquired you until the moment you broke the line — so by the time the shot line
+                // actually opened the cab had been aimed for seconds. The swing existed in the
+                // simulation and was over before the player could see it: nine TRACKING events
+                // against forty-nine locks, and the two-stage grammar this game's whole fairness
+                // argument rests on mostly did not play.
+                //
+                // Now the cab rides the machine's own heading — where it is walking, where it is
+                // strafing — and only comes onto you inside [AIM_LEAD] of a throw. So every throw
+                // cycle carries a visible turn: the head swings round, TRACKING sounds, the eye
+                // settles, WARNING, the wind-up, the disc. Between throws the head goes back to
+                // where the feet are pointed. It is the same machine, doing the same things, at a
+                // moment when somebody is looking at it — and it costs the AI nothing, because
+                // [AIM_LEAD] is more than three times the swing a half-turn needs.
+                val toTank = atan2(ddx, -ddz)
+                val aiming = fireLos && !reeling && r.fireCd <= AIM_LEAD
+                var target = toTank
+                var turnRate = TURN_HUNT
+                if (!aiming) {
+                    if (reeling) {
+                        target = toTank + 0.9f * sin(time * 5.3f + r.reel) * (r.stagger / STAGGER_T)
+                        turnRate = TURN_HUNT * 0.4f
+                    } else if (mx != 0f || mz != 0f) {
+                        target = atan2(mx, -mz); turnRate = TURN_PATROL
+                    } else target = r.yaw
+                }
+                turnToward(r, target, turnRate, dt)
+                // measured to the TANK whatever the cab was aiming at, so [FIRE_ARC] and the servo
+                // whine's pitch both mean the one thing they are supposed to mean
+                r.aimErr = angTo(r.yaw, toTank)
                 r.facing = r.aimErr < FIRE_ARC && fireLos && !reeling
                 if (hostile) {
                     r.fireCd -= dt
-                    canFire = r.facing && d < FIRE_RANGE
+                    canFire = r.facing && d < fireRange
                     if (canFire) {
                         lockedOn = true
                         // THE LOCK is the moment it is looking at you with the line clear — the
                         // sting and WARNING fire on that beat, which is the beat before the throw.
                         if (!r.lockSaid) {
                             r.lockSaid = true; host.sfx(com.x3paranoids.audio.Sfx.LOCK, 1f, 0.7f)
-                            if (time - lastKillSay > 3f) host.say("lockon")
+                            // THE MACHINE ONLY SPEAKS ABOUT A THREAT THAT IS ACTUALLY ON YOU.
+                            // "lockon" was the single most-played line in the game — twenty-five
+                            // plays against three kills — and half of those locks were beyond
+                            // fifteen units while the median disc came from nine and a half. A word
+                            // that fires for a machine two rooms away, several times a minute, is
+                            // not information, it is ambience, and it had made WARNING mean nothing.
+                            if (d < LOCK_SAY_R && time - lastKillSay > 3f) host.say("lockon")
                             // the eye finds you, THEN the disc: never both on one frame
                             r.fireCd = max(r.fireCd, dwell)
                             android.util.Log.i("X3Paranoids", "LOCK d=%.1f aimErr=%.1f deg dwell=%.2f".format(d, r.aimErr * 57.2958f, dwell))
                         }
-                        if (r.fireCd <= 0f) {
-                            // The press multiplies the SETTLED cooldown rather than the raw one, so it
-                            // is a real 30% more fire at every wave instead of being swallowed by the
-                            // floor once the wave scaling has already reached it.
-                            r.fireCd = (2.6f - 0.15f * wave).coerceAtLeast(1.1f) * fireRate *
-                                (if (pressed) PRESS_FIRE else 1f)
-                            throwDisc(r, d)
+                        // THE WIND-UP — see [WINDUP_LEAD]. The cab is aimed, the line is open and
+                        // the disc is coming off the rail: a short rising cue, once, so the RELEASE
+                        // is an event the player can act on rather than a surprise inside a red
+                        // frame of unknown length. It is the loudest thing in the telegraph on
+                        // purpose — TRACKING says "it is turning", LOCK says "it has you", this says
+                        // "NOW" — and it is pitched by range so a disc from across the arena and one
+                        // from the next cell are not the same sound.
+                        // the LEVEL, every frame it is true, so the sight can pulse on it
+                        if (r.fireCd <= WINDUP_LEAD) imminent = true
+                        if (!r.windupSaid && r.fireCd <= WINDUP_LEAD) {
+                            r.windupSaid = true
+                            host.sfx(com.x3paranoids.audio.Sfx.WINDUP,
+                                0.86f + 0.30f * (1f - d / fireRange).coerceIn(0f, 1f),
+                                (0.55f + 0.45f * (1f - d / fireRange)).coerceIn(0.45f, 1f))
+                            android.util.Log.i("X3Paranoids", "WINDUP d=%.1f lead=%.2f".format(d, r.fireCd))
                         }
-                    } else if (fireLos && d < FIRE_RANGE && !reeling) {
+                        if (r.fireCd <= 0f) {
+                            // ONE THROWER AT A TIME — see [VOLLEY_GAP]. A machine whose moment lands
+                            // while the arena is still ringing from someone else's takes its shot a
+                            // beat later instead of on the same frame. It is the difference between
+                            // an arena that fires at you and an arena that fires ONCE, at you, in
+                            // four copies, which is what the logs caught it doing.
+                            if (time - lastThrowT < VOLLEY_GAP) {
+                                r.fireCd = VOLLEY_GAP - (time - lastThrowT) + rng.nextFloat() * 0.35f
+                                r.windupSaid = false
+                            } else {
+                                // The press multiplies the SETTLED cooldown rather than the raw one, so it
+                                // is a real 30% more fire at every wave instead of being swallowed by the
+                                // floor once the wave scaling has already reached it.
+                                // AND IT IS ROLLED, NOT SET — see [RELOAD_JITTER].
+                                r.fireCd = (2.6f - 0.15f * wave).coerceAtLeast(1.1f) * fireRate *
+                                    (if (pressed) PRESS_FIRE else 1f) *
+                                    (1f + (rng.nextFloat() * 2f - 1f) * RELOAD_JITTER)
+                                r.windupSaid = false
+                                // the next cycle's swing is a new event and gets its own servo —
+                                // the LOCK sting stays once per engagement, which is what keeps
+                                // the three cues a grammar rather than a loop
+                                r.trackSaid = false
+                                lastThrowT = time
+                                throwDisc(r, d)
+                            }
+                        }
+                    } else if (fireLos && d < fireRange && !reeling) {
                         // it has the line and is bringing the eye round: the beat to move on
                         tracking = true
                         // AND IT MAKES A SOUND NOW — see [Recognizer.trackSaid]. A quiet rising
@@ -2137,7 +2497,7 @@ class Game(val store: SettingsStore, private val host: GameHost) {
                             r.trackSaid = true
                             val closeness = (1f - (r.aimErr / 1.4f)).coerceIn(0f, 1f)
                             host.sfx(com.x3paranoids.audio.Sfx.TRACKING, 0.78f + 0.34f * closeness,
-                                (0.30f + 0.22f * closeness) * (1f - d / (FIRE_RANGE * 1.4f)).coerceIn(0.35f, 1f))
+                                (0.30f + 0.22f * closeness) * (1f - d / (fireRange * 1.4f)).coerceIn(0.35f, 1f))
                             android.util.Log.i("X3Paranoids", "TRACK d=%.1f aimErr=%.1f deg".format(d, r.aimErr * 57.2958f))
                         }
                     }
@@ -2147,7 +2507,7 @@ class Game(val store: SettingsStore, private val host: GameHost) {
                 r.aimErr = 0f; r.facing = false
                 val c = maze.colOf(r.x); val rr = maze.rowOf(r.z)
                 if (chasing) { r.targetC = maze.colOf(px); r.targetR = maze.rowOf(pz) }
-                if (r.targetC < 0 || (c == r.targetC && rr == r.targetR)) { r.targetC = rng.nextInt(maze.cols); r.targetR = rng.nextInt(maze.rows) }
+                if (r.targetC < 0 || (c == r.targetC && rr == r.targetR)) pickPatrol(r)
                 val step = maze.stepToward(c, rr, r.targetC, r.targetR)
                 if (step != null) {
                     val tx = maze.cellX(step[0]); val tz = maze.cellZ(step[1])
@@ -2158,7 +2518,7 @@ class Game(val store: SettingsStore, private val host: GameHost) {
             }
             // the lock sting re-arms once the shot line is lost, not merely when the eye drifts
             // off you for a frame — a machine tracking a dodging tank does not sting on every arc
-            if (!fireLos) { r.lockSaid = false; r.trackSaid = false }
+            if (!fireLos) { r.lockSaid = false; r.trackSaid = false; r.windupSaid = false }
             r.lock += ((if (canFire) 1f else 0f) - r.lock) * (1f - exp(-dt / (if (canFire) 0.07f else 0.20f)))
             val sp = speedBase * (if (chasing) (if (pressed) PRESS_SPEED else 1.15f) else 0.8f) *
                 (if (r.stagger > 0f) 0.7f else if (r.charge > 0f) CHARGE_SPEED else 1f)
@@ -2182,6 +2542,8 @@ class Game(val store: SettingsStore, private val host: GameHost) {
                 else shove(r)
             }
         }
+        nearestRec = nearest
+        if (nearest < 24f || lockedOn || tracking) lastContactT = time
         // hover hum follows the nearest Recognizer
         val target = if (recognizers.isEmpty() || state == State.GAME_OVER) 0f else (1f - nearest / 26f).coerceIn(0f, 1f)
         humLevel += (target - humLevel) * (1f - exp(-dt / 0.3f))
@@ -2205,7 +2567,7 @@ class Game(val store: SettingsStore, private val host: GameHost) {
                 for (r in recognizers) if (r.hp > 0 && hypot(s.x - r.x, s.z - r.z) < 1.9f && abs(s.y - (r.y + 1.3f)) < 2.2f) {
                     r.hp--; r.hitFlash = 1f
                     if (r.hp <= 0) {
-                        kills++
+                        kills++; totalKills++
                         score += (100 * wave * scoreMul).toInt()
                         // SHOT WHILE IT HAD YOU. The clamp is broken with the machine: the tank is
                         // let go on this frame, and the derez below carries the fold it died in.
@@ -2244,6 +2606,61 @@ class Game(val store: SettingsStore, private val host: GameHost) {
      * Swing the cab toward [target] at up to [rate] radians a second, easing over the last
      * [TURN_EASE] radians so it settles rather than stops. Returns how far off it still is.
      */
+    /**
+     * WHERE A PATROLLING MACHINE GOES NEXT — and it is no longer a uniformly random cell.
+     *
+     * A Recognizer that has lost you picked any of sixty-four cells with equal weight, which in an
+     * eight-by-eight maze is a random walk: measured on the glasses, a two-machine wave could run a
+     * full minute without a single contact, and the plate sat at CONTACTS 0/n while the player drove
+     * identical corridors looking for a fight the game was not bringing. That is not tension, it is
+     * an empty room, and it was doing as much damage to this game as the lethality was.
+     *
+     * So most of the time it patrols TOWARD YOU — a cell within [PATROL_NEAR] steps of the tank by
+     * the maze's own BFS, which is a machine sweeping the district you are in rather than one
+     * homing on you: it does not know where you are (it has no line, and [Recognizer.seenT] has
+     * lapsed), and it still has to find you when it gets there. The rest of the time it goes
+     * anywhere, so the arena never becomes a funnel and a player who breaks contact and moves two
+     * rooms really has broken it.
+     */
+    private fun pickPatrol(r: Recognizer) {
+        val near = playerRegion()
+        if (near != null && near.isNotEmpty() && rng.nextFloat() < PATROL_HUNT_BIAS) {
+            val cell = near[rng.nextInt(near.size)]
+            r.targetC = cell[0]; r.targetR = cell[1]
+            return
+        }
+        r.targetC = rng.nextInt(maze.cols); r.targetR = rng.nextInt(maze.rows)
+    }
+
+    /**
+     * The cells within [PATROL_NEAR] BFS steps of the tank, recomputed at most a few times a second
+     * and only when the tank has actually changed cell. A 64-cell flood is cheap; doing it per
+     * machine per target pick would not be.
+     */
+    private var regionCells: ArrayList<IntArray>? = null
+    private var regionC = -1
+    private var regionR = -1
+    private fun playerRegion(): ArrayList<IntArray>? {
+        val pc = maze.colOf(px); val pr = maze.rowOf(pz)
+        if (regionCells != null && pc == regionC && pr == regionR) return regionCells
+        val dist = maze.distances(pc, pr)
+        val out = ArrayList<IntArray>()
+        for (c in 0 until maze.cols) for (r in 0 until maze.rows) {
+            val dd = dist[c][r]
+            if (dd in 1..PATROL_NEAR) out += intArrayOf(c, r)
+        }
+        regionC = pc; regionR = pr; regionCells = out
+        return out
+    }
+
+    /** The unsigned angle from [from] to [to], wrapped — how far a cab still has to come. */
+    private fun angTo(from: Float, to: Float): Float {
+        var d = to - from
+        while (d > PI.toFloat()) d -= 2f * PI.toFloat()
+        while (d < -PI.toFloat()) d += 2f * PI.toFloat()
+        return abs(d)
+    }
+
     private fun turnToward(r: Recognizer, target: Float, rate: Float, dt: Float): Float {
         var d = target - r.yaw
         while (d > PI.toFloat()) d -= 2f * PI.toFloat()
@@ -2560,13 +2977,24 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         pilotStreak = if (time - lastKillT < 9f) pilotStreak + 1 else 1
         lastKillT = time
         val at = if (systemSpoke) after("destroyed") else 0.35f
+        // THE PROTOCOL GETS FIRST REFUSAL ON A KILL — see [PROTOCOL_KILLS]. It speaks rarely
+        // enough (three times a game, ever) that when its turn comes it takes the beat, and the
+        // pilot's ordinary kill chatter stands down for it rather than talking over the villain.
+        if (protocolIdx < PROTOCOL_LINES.size && totalKills >= PROTOCOL_KILLS[protocolIdx]) {
+            protocolOnKill(at)
+            return
+        }
         if (pilotStreak >= 3 && pilot("hero_kill_streak", gap = 6f, cd = 55f, chance = 0.85f, delay = at, patience = 2500L)) {
             pilotStreak = 0
             return
         }
         val ids = arrayOf("hero_kill_1", "hero_kill_2", "hero_kill_3")
         val id = ids[pilotKillIdx % ids.size]
-        if (pilot(id, gap = 10f, cd = 40f, chance = 0.32f, delay = at, patience = 2000L)) pilotKillIdx++
+        // 0.32 was set when a game contained a dozen kills. The reviewed device managed THREE
+        // across two sessions, so at one in three the pilot answered a kill roughly never; the
+        // three kill lines were among the fourteen that fired zero times in eleven games. At 0.6
+        // most kills get an answer and the repeat guard still does the work it was there for.
+        if (pilot(id, gap = 8f, cd = 30f, chance = 0.60f, delay = at, patience = 2000L)) pilotKillIdx++
     }
 
     private fun spawnDerez(r: Recognizer) {

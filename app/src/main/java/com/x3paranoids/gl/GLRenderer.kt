@@ -400,6 +400,136 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
             while (xx < m.width - 0.01f) { wline(xx, 0f, z, min(xx + seg, m.width), 0f, z, tint[0], tint[1], tint[2], 0.42f); xx += seg }
             z += step
         }
+        buildSectors(m, tint)
+    }
+
+    // ------------------------------------------------------------- [THE SECTOR MARKINGS]
+    /**
+     * SIXTY-FOUR CELLS DRAWN FROM ONE WALL STROKE. That was the finding under three separate
+     * complaints in the last review and it was never filed as one: fifteen seconds of recorded
+     * footage that is identical green corridor; a plate stuck at CONTACTS 0/2 for a minute while the
+     * player drove looking for the fight; and an energy pool revealed six times and visited zero,
+     * at the far end of a maze with nothing whatever to navigate by. The arena had no LANDMARK
+     * VOCABULARY — no per-cell, per-region or per-anything differentiation — so every junction in it
+     * looked like every other junction, and a player could not answer "have I been here" or "which
+     * way was the pool" even in principle. That is an art-direction gap, and it was doing the
+     * navigation damage.
+     *
+     * So the floor is PAINTED, the way an arena floor is painted, in exactly the idiom the rest of
+     * this game is drawn in — strokes on the ground plane, no fills, no colour that is not the
+     * wave's own tint.
+     *
+     * TWO MARKINGS, and between them the player always knows where they are:
+     *
+     *  - THE DIVIDERS: the two centre lines of the maze, drawn as a doubled bright rail instead of
+     *    the ordinary grid stroke. Crossing one is an event you can see from anywhere in the arena,
+     *    and it splits sixty-four identical cells into four quarters that are told apart at a
+     *    glance. It is one extra pass over eight strokes.
+     *
+     *  - THE SECTOR GLYPHS: a DELTA, a RING, a CROSS and three BARS, one painted large across the
+     *    middle of each quarter. They are deliberately unalike in silhouette rather than in detail,
+     *    because what has to survive is the read at twenty units through a doorway at a hard angle,
+     *    where the shape is foreshortened to a smear — a triangle and a circle stay a triangle and a
+     *    circle there and two similar polygons do not. The same four marks are drawn on the nav
+     *    plate's own quarters and on the sight's bottom-right corner, so the instrument, the map and
+     *    the ground all say the same word and none of them has to be taught.
+     *
+     * There is no depth buffer here (see [OCCLUSION]) so these run under the walls exactly as the
+     * floor grid always has, which is the 1982 cabinet's own habit: it drew every edge it knew
+     * about. A marking that reads through a wall is also, usefully, a marking you can steer by
+     * before you can see the room it is in.
+     */
+    /** Beyond this the floor markings are fog and are not submitted. Three cells and a half. */
+    private val MARK_D = 32f
+
+    private fun buildSectors(m: Maze, tint: FloatArray) {
+        val hx = m.width * 0.5f; val hz = m.depth * 0.5f
+        // the dividers — doubled, so they read as a painted rail and not as a grid line that
+        // happens to be brighter
+        // EVERYTHING HERE IS RANGE-CULLED. Sixteen glyphs and sixty-four rail segments is not much
+        // geometry, but the floor markings are the one thing in this scene that is drawn at full
+        // count whether or not any of it is in front of the periscope — the walls are at least
+        // fogged out of existence by their own distance shading — and the frame budget on this
+        // hardware is the thing the last two reviews have both, correctly, kept score of. Past
+        // [MARK_D] a marking is a stroke or two of fogged nothing, so it is not submitted at all.
+        for (o in floatArrayOf(-0.22f, 0.22f)) {
+            var a = 0f
+            while (a < m.depth - 0.01f) {
+                val a1 = min(a + 4.5f, m.depth)
+                if (hypot(hx + o - camX, (a + a1) * 0.5f - camZ) < MARK_D)
+                    wline(hx + o, 0f, a, hx + o, 0f, a1, tint[0], tint[1], tint[2], 0.62f)
+                a += 4.5f
+            }
+            a = 0f
+            while (a < m.width - 0.01f) {
+                val a1 = min(a + 4.5f, m.width)
+                if (hypot((a + a1) * 0.5f - camX, hz + o - camZ) < MARK_D)
+                    wline(a, 0f, hz + o, a1, 0f, hz + o, tint[0], tint[1], tint[2], 0.62f)
+                a += 4.5f
+            }
+        }
+        // THE GLYPHS ARE REPEATED WITHIN THEIR QUARTER, once at each two-by-two junction, rather
+        // than drawn once large in the middle of it. One mark per quadrant was the first version and
+        // it failed the only test that matters: standing in a corridor three cells from the centre
+        // of your own quarter, with walls between you and it, the landmark was thirty units away
+        // and off the side of the glass — which is a map legend, not a landmark. Sixteen small ones
+        // put a mark within a cell or two of wherever the tank actually is, so the answer to "which
+        // quarter am I in" is always in the near field where the eye already is. They sit on cell
+        // JUNCTIONS, not cell centres, so they never sit under the Bit, the pool or a spawn.
+        val step = Maze.CELL * 2f
+        var gx = Maze.CELL
+        while (gx < m.width) {
+            var gz = Maze.CELL
+            while (gz < m.depth) {
+                if (hypot(gx - camX, gz - camZ) < MARK_D) sectorGlyph(sectorAt(m, gx, gz), gx, gz, 3.2f, tint, 0.82f)
+                gz += step
+            }
+            gx += step
+        }
+    }
+
+    /** One sector mark on the ground plane, centred on ([cx],[cz]) at [rad] units. */
+    private fun sectorGlyph(k: Int, cx: Float, cz: Float, rad: Float, t: FloatArray, a: Float) {
+        fun ln(x0: Float, z0: Float, x1: Float, z1: Float) =
+            wline(x0, 0.03f, z0, x1, 0.03f, z1, t[0], t[1], t[2], a)
+        when (k) {
+            0 -> {  // DELTA
+                ln(cx, cz - rad, cx + rad * 0.92f, cz + rad * 0.72f)
+                ln(cx + rad * 0.92f, cz + rad * 0.72f, cx - rad * 0.92f, cz + rad * 0.72f)
+                ln(cx - rad * 0.92f, cz + rad * 0.72f, cx, cz - rad)
+            }
+            1 -> {  // RING
+                for (i in 0 until 12) {
+                    val a0 = 6.2832f * i / 12f; val a1 = 6.2832f * (i + 1) / 12f
+                    ln(cx + cos(a0) * rad, cz + sin(a0) * rad, cx + cos(a1) * rad, cz + sin(a1) * rad)
+                }
+            }
+            2 -> {  // CROSS
+                ln(cx - rad, cz - rad, cx + rad, cz + rad)
+                ln(cx - rad, cz + rad, cx + rad, cz - rad)
+            }
+            else -> {  // BARS
+                for (i in -1..1) ln(cx - rad, cz + i * rad * 0.62f, cx + rad, cz + i * rad * 0.62f)
+            }
+        }
+    }
+
+    /** Which quarter of the arena a world point is in: 0 NW, 1 NE, 2 SW, 3 SE. */
+    private fun sectorAt(m: Maze, x: Float, z: Float): Int =
+        (if (x >= m.width * 0.5f) 1 else 0) or (if (z >= m.depth * 0.5f) 2 else 0)
+
+    /** The same four marks in HUD space — the plate's quarters, and the sight's own corner. */
+    private fun sectorGlyphHud(k: Int, cx: Float, cy: Float, rad: Float) {
+        when (k) {
+            0 -> {
+                hl(cx, cy - rad, cx + rad * 0.92f, cy + rad * 0.72f)
+                hl(cx + rad * 0.92f, cy + rad * 0.72f, cx - rad * 0.92f, cy + rad * 0.72f)
+                hl(cx - rad * 0.92f, cy + rad * 0.72f, cx, cy - rad)
+            }
+            1 -> circle(cx, cy, rad, 12)
+            2 -> { hl(cx - rad, cy - rad, cx + rad, cy + rad); hl(cx - rad, cy + rad, cx + rad, cy - rad) }
+            else -> for (i in -1..1) hl(cx - rad, cy + i * rad * 0.62f, cx + rad, cy + i * rad * 0.62f)
+        }
     }
 
     // ------------------------------------------------------------- wall solidity
@@ -486,7 +616,16 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
      * all of its perceived brightness. What lands on the glass is the same stroke, the same
      * solidity, the same beam-dwell blow-out, in the wall's own colour rather than in white.
      */
-    private val NEAR_HUE = 0.55f
+    /**
+     * IT WAS 0.55 AND THAT WAS MOST OF THE WAY, NOT ALL OF IT. The lift measurably stopped
+     * bleaching the far and middle field — wave one came back at 0.7% whiteish — but re-measured on
+     * a consistent criterion the same build still ran near ten percent in tight quarters at a high
+     * wave, because the correction is a fractional power of a gain that keeps climbing: at the
+     * point-blank end, where the gain is largest, 0.55 was still letting red and blue catch up.
+     * 0.72 holds the hue through the whole of [NEAR_GAIN_D] and costs the blow-out nothing the eye
+     * can see, because green — the channel a green stroke is made of — is untouched at every gain.
+     */
+    private val NEAR_HUE = 0.72f
     private fun nearHue(gain: Float) = if (gain <= 1.001f) 1f else 1f / Math.pow(gain.toDouble(), NEAR_HUE.toDouble()).toFloat()
 
     private fun rungFade(k: Int, d: Float): Float {
@@ -929,8 +1068,18 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
                 aa *= 1f + 2.4f * flash * max(0f, (pax * hx + pay * hy + paz * hz) / la)
                 ab *= 1f + 2.4f * flash * max(0f, (pbx * hx + pby * hy + pbz * hz) / lb)
             }
-            lines.v(camX + pax, camY + pay, camZ + paz, r, g, b, aa)
-            lines.v(camX + pbx, camY + pby, camZ + pbz, r, g, b, ab)
+            // AND THE SHELL KEEPS ITS COLOUR UNDER ITS OWN BLOW-OUT — the same correction the
+            // walls get from [nearHue], for the same reason and against the same measurement. The
+            // shader emits rgb·a and the shell's alpha runs past 1.6 at full charge, so green and
+            // blue clamp while red is still climbing: a cyan rim at (0.45, 0.92, 1) lands on the
+            // glass at (0.72, 1, 1), which is a pale blue-white. On a frame pressed into a corner
+            // with three charges up, the shell — not the walls — was the largest single source of
+            // desaturated pixels in the whole picture. Pulling red back by the same power leaves it
+            // the same brightness, the same rim curve and unmistakably CYAN.
+            val ka = if (aa <= 1f) 1f else 1f / Math.pow(aa.toDouble(), NEAR_HUE.toDouble()).toFloat()
+            val kb = if (ab <= 1f) 1f else 1f / Math.pow(ab.toDouble(), NEAR_HUE.toDouble()).toFloat()
+            lines.v(camX + pax, camY + pay, camZ + paz, r * ka, g, b, aa)
+            lines.v(camX + pbx, camY + pby, camZ + pbz, r * kb, g, b, ab)
         }
     }
 
@@ -1208,6 +1357,8 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
     private val MAP_SWEEP = 2.0f
     /** The instrument label under the plate, on one baseline: a small caption and a bigger value. */
     private val LBL_Y = 143f
+    /** The SECTOR row, one baseline under CONTACTS — the bottom of the plate's instrument stack. */
+    private val SEC_Y = 163f
     private val LBL_CAP_S = 1.1f
     private val LBL_VAL_S = 1.7f
     /** "CONTACTS " at [LBL_CAP_S] is 49.5 px and "n/m" at [LBL_VAL_S] is 25.5 — 75 px, the plate's own width. */
@@ -1232,8 +1383,8 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
      * black is the one value a waveguide renders as "not there", so the plate reads as a small
      * quiet window in the sight rather than a bright panel pasted over it.
      *
-     * THE CLEARED RECTANGLE RUNS PAST THE PLATE'S FRAME to take the CONTACTS label with it, down to
-     * [LBL_Y] plus a pixel of air. The label is the smallest type on the glass and it is the one
+     * THE CLEARED RECTANGLE RUNS PAST THE PLATE'S FRAME to take the CONTACTS and SECTOR rows with
+     * it, down to [SEC_Y] plus a few pixels of air. The label is the smallest type on the glass and it is the one
      * readout whose whole job is to be believed; a wall-top stroke running through "0/3" turns it
      * into "8/3", which is worse than not printing it. The extra bite is 75 x 16 px of sky a hundred
      * pixels above the horizon — the same argument that put the plate up here in the first place.
@@ -1241,7 +1392,7 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
     private fun clearPlate(eye: Int, vw: Int) {
         if (!mapDrawn) return
         val sx = vw / 640f; val sy = height / 480f
-        val y1 = LBL_Y + 1f
+        val y1 = SEC_Y + 4f
         GLES30.glEnable(GLES30.GL_SCISSOR_TEST)
         GLES30.glScissor((eye * vw + PL_X0 * sx).toInt(), (height - y1 * sy).toInt(),
             ((PL_X1 - PL_X0) * sx).toInt() + 1, ((y1 - PL_Y0) * sy).toInt() + 1)
@@ -1547,8 +1698,20 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         // machine is facing you with the line clear — it can throw NOW; TRACKING, dimmer and
         // amber, when one has the line and is still bringing its cab round. TRACKING is the
         // teachable one: it is the beat on which moving still works.
+        //
+        // AND WARNING IS NOW TWO WORDS, because it used to be one LEVEL. A machine that had the
+        // line lit the band and held it lit for a median 1.66 seconds and occasionally for eleven,
+        // and then a disc arrived with nothing on the glass to mark the release. The band now says
+        // WARNING while the eye is on you and INCOMING, hard and fast, for the [Game.WINDUP_LEAD]
+        // before the disc actually leaves — the same beat as the wind-up cue, so the ear and the
+        // eye are told the same thing at the same instant. A player who never looks up still hears
+        // it; a player who never hears anything still sees it.
         when {
             caught -> { color(1f, 0.3f, 0.2f, 0.65f + 0.35f * blink); textC("CAPTURED", 320f, 68f, 2.0f) }
+            game.imminent -> {
+                val fast = 0.5f + 0.5f * sin(t * 26f)
+                color(1f, 0.25f, 0.18f, 0.7f + 0.3f * fast); textC("INCOMING", 320f, 68f, 2.3f)
+            }
             lock -> { color(1f, 0.35f, 0.25f, blink); textC("WARNING", 320f, 68f, 1.8f) }
             game.tracking -> { color(1f, 0.72f, 0.3f, 0.45f + 0.2f * blink); textC("TRACKING", 320f, 68f, 1.6f) }
         }
@@ -1709,6 +1872,32 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
 
     private fun buildThreatBearings() {
         if (game.state != State.PLAY && game.state != State.DYING) return
+        // A DISC ALREADY IN THE AIR GETS ITS OWN BEARING, and it gets it FIRST.
+        //
+        // The rim used to iterate Recognizers only, which left the single most lethal object in the
+        // game undrawn: a disc thrown from behind the periscope was invisible (it is behind you),
+        // unannounced (the throw cue is a world sound in a room the player is not looking at) and
+        // its thrower dropped off the rim the instant the padded line broke — which a thrown disc
+        // very often does, because the machine is moving. Twenty-one logged deaths, essentially no
+        // evasions. The thing that kills you must be on the instrument.
+        //
+        // It is drawn as a CLOSING mark rather than a threat mark: an arrowhead on the bearing with
+        // a ring inboard of it that SHRINKS as the disc closes, so the rim carries a countdown
+        // rather than a warning light. Time-to-impact drives the ring, the blink and the weight, so
+        // the marker is loudest in the last third of a second — the part the player can act on.
+        var discs = 0
+        for (sh in game.shots) {
+            if (discs >= 3) break
+            if (sh.friendly || sh.dead) continue
+            val dx = sh.x - game.px; val dz = sh.z - game.pz
+            val dist = hypot(dx, dz)
+            if (dist > 26f) continue
+            // closing speed along the line to the tank: a disc that already went past is not a threat
+            val sp = -(sh.vx * dx + sh.vz * dz) / max(dist, 0.01f)
+            if (sp < 2f) continue
+            discChevron(sh, (dist / sp).coerceIn(0f, 4f))
+            discs++
+        }
         val crusher = game.crusher
         var drawn = 0
         if (crusher != null) { threatChevron(crusher, 2); drawn++ }
@@ -1792,6 +1981,49 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
             hl(ex - ox * t0 + nx * 4.5f * sc, ey - oy * t0 + ny * 4.5f * sc,
                ex - ox * t0 - nx * 4.5f * sc, ey - oy * t0 - ny * 4.5f * sc)
         }
+    }
+
+    /**
+     * ONE DISC ON THE RIM. [tti] is seconds to impact; everything about the mark is driven by it.
+     *
+     * It is skipped only when the disc is already plainly in the middle of the sight — a thing you
+     * are looking straight at does not need a compass — so what the rim carries is exactly the set
+     * of discs the player cannot see, which is the set that was killing them.
+     */
+    private fun discChevron(sh: com.x3paranoids.engine.Shot, tti: Float) {
+        val onGlass = project(sh.x, sh.y, sh.z, bearPt)
+        if (onGlass && bearPt[0] > 190f && bearPt[0] < 450f && bearPt[1] > 130f && bearPt[1] < 350f) return
+        val x0 = 138f; val x1 = 502f; val y0 = 88f; val y1 = 392f
+        val cxm = (x0 + x1) * 0.5f; val cym = (y0 + y1) * 0.5f
+        var sx: Float; var sy: Float
+        if (onGlass) { sx = bearPt[0]; sy = bearPt[1] }
+        else {
+            val dx = sh.x - game.px; val dz = sh.z - game.pz
+            var a = kotlin.math.atan2(dx, -dz) - game.yaw
+            while (a > 3.14159f) a -= 6.28318f
+            while (a < -3.14159f) a += 6.28318f
+            sx = cxm + sin(a) * 400f
+            sy = cym + (if (abs(a) > 1.5708f) 260f else 0f) - cos(a) * 40f
+        }
+        val ex = sx.coerceIn(x0, x1); val ey = sy.coerceIn(y0, y1)
+        var ox = ex - cxm; var oy = ey - cym
+        val ol = hypot(ox, oy)
+        if (ol < 1f) { ox = 0f; oy = -1f } else { ox /= ol; oy /= ol }
+        val nx = -oy; val ny = ox
+        // urgency: 0 across the arena, 1 at the windscreen
+        val u = (1f - tti / 1.2f).coerceIn(0f, 1f)
+        val blink = 0.5f + 0.5f * sin(game.time * (8f + 26f * u))
+        val sc = 0.85f + 0.75f * u
+        color(1f, 0.42f, 0.55f, (0.55f + 0.45f * blink) * (0.5f + 0.5f * u))
+        val tipX = ex + ox * 9f * sc; val tipY = ey + oy * 9f * sc
+        val aX = ex - ox * 4f * sc + nx * 7.5f * sc; val aY = ey - oy * 4f * sc + ny * 7.5f * sc
+        val bX = ex - ox * 4f * sc - nx * 7.5f * sc; val bY = ey - oy * 4f * sc - ny * 7.5f * sc
+        hl(tipX, tipY, aX, aY); hl(tipX, tipY, bX, bY); hl(aX, aY, bX, bY)
+        // THE CLOSING RING. It is the disc, drawn small, and it tightens onto the chevron as the
+        // real one closes — the only countdown on the glass, and the reason this mark reads as
+        // "0.3 seconds" rather than as "danger".
+        val rx = ex - ox * 20f; val ry = ey - oy * 20f
+        circle(rx, ry, 3f + 11f * (1f - u), 10)
     }
 
     private val bearEye = FloatArray(3)
@@ -2054,6 +2286,21 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
             hl(mx(w.x0), my(w.z0), mx(w.x1), my(w.z1))
         }
 
+        // THE SECTOR DIVIDERS, on the plate exactly as they are on the floor — see [THE SECTOR
+        // MARKINGS]. Dimmer than the faintest interior wall on purpose: they are printed on the
+        // instrument, not sensed by it, and nothing that is not a contact may compete with one.
+        // Their whole job is to let the eye carry "I am in the lower-left quarter" from the ground
+        // to the map without either of them having to say it in words.
+        color(0.55f, 0.85f, 0.7f, 0.30f)
+        val midX = mx(m.width * 0.5f); val midY = my(m.depth * 0.5f)
+        var dseg = 0
+        while (dseg < 8) {
+            val a0 = MAP_Y + dseg * (MAP_S / 8f) + 1.4f; val a1 = a0 + MAP_S / 8f - 2.8f
+            hl(midX, a0, midX, a1)
+            val b0 = MAP_X + dseg * (MAP_S / 8f) + 1.4f; val b1 = b0 + MAP_S / 8f - 2.8f
+            hl(b0, midY, b1, midY)
+            dseg++
+        }
         // The mount: four corner brackets in the bezel's colour — the same shorthand the sight
         // itself uses, so the plate reads as another instrument on the same panel. Eight short
         // strokes, and they are what stops the scissored black square reading as a hole punched in
@@ -2260,6 +2507,23 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         text("CONTACTS", PL_X0, LBL_Y, LBL_CAP_S)
         color(GREEN[0], GREEN[1], GREEN[2], 0.85f)
         text("$resolved/${game.recognizersLeft}", LBL_VAL_X, LBL_Y, LBL_VAL_S)
+
+        // ---------------------------------------------------------------- SECTOR
+        //
+        // WHERE YOU ARE, IN ONE MARK — the glyph painted on the floor of the quarter the tank is
+        // standing in (see [THE SECTOR MARKINGS]). It goes on the instrument stack under the plate
+        // rather than anywhere else on the glass because that is where navigation lives: the map,
+        // its coverage, and the name of the room you are in, read top to bottom in one glance.
+        //
+        // It is a MARK and not a word because it is not being read, it is being MATCHED. The player
+        // sees a ring on the ground and a ring under the plate and sixty-four identical cells become
+        // four places with names. The caption is there once, small, so the first player knows what
+        // the mark is; after that it is the mark that is doing the work.
+        val k = sectorAt(m, game.px, game.pz)
+        color(0.75f, 0.9f, 0.85f, 0.45f)
+        text("SECTOR", PL_X0, SEC_Y, LBL_CAP_S)
+        color(GREEN[0], GREEN[1], GREEN[2], 0.8f)
+        sectorGlyphHud(k, PL_X0 + 46f, SEC_Y - 4.5f, 7f)
     }
 
     private fun buildGameOver() {
