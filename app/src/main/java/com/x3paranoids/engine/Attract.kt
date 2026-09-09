@@ -661,8 +661,9 @@ class Attract(seed: Long, val plan: AttractPlan) {
 
         for (r in recognizers) {
             r.y = 1.6f + 0.3f * sin(t * 2.1f + r.phase)
-            // the same three-sample sight test the arena runs — see GLRenderer's OCCLUSION note
-            val ec = cos(r.yaw) * Recognizer.HALF_W; val es = -sin(r.yaw) * Recognizer.HALF_W
+            // the same three-sample sight test the arena runs — see GLRenderer's OCCLUSION note;
+            // local +x is (cos yaw, sin yaw), per RecognizerModel.toWorld
+            val ec = cos(r.yaw) * Recognizer.HALF_W; val es = sin(r.yaw) * Recognizer.HALF_W
             val seen = maze.lineOfSight(r.x, r.z, camX, camZ) ||
                 maze.lineOfSight(r.x + ec, r.z + es, camX, camZ) ||
                 maze.lineOfSight(r.x - ec, r.z - es, camX, camZ)

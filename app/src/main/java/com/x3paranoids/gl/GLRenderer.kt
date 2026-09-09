@@ -133,34 +133,21 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         head.update(dt)
         val headOn = store.headLook && head.running
         game.update(dt, head.yaw, head.pitch, headOn)
-        buildScene()
-        buildHud()
 
         val eyes = if (sbs) 2 else 1
         val vw = if (sbs) width / 2 else width
         val aspect = vw.toFloat() / height.toFloat()
 
+        // The scene sets the camera; the camera is fixed BEFORE the HUD is built, because the sight
+        // projects world points onto the glass (the disc's impact rings) and they have to land on
+        // this frame's view, not last frame's.
+        buildScene()
+        setupCamera(aspect)
+        buildHud()
+
         GLES30.glViewport(0, 0, width, height)
         GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
         GLES30.glUseProgram(program)
-
-        // periscope
-        val title = game.state == State.TITLE
-        // The tank's death carries its own judder on top of the damage shake — decaying, so the
-        // world steadies as the sight fails, rather than both of them going at once.
-        val shake = game.damageFlash * 0.25f +
-            (if (game.state == State.DYING) 0.16f * kotlin.math.exp(-game.stateT * 0.9f) else 0f)
-        val sx = (rnd.nextFloat() - 0.5f) * shake; val sy = (rnd.nextFloat() - 0.5f) * shake
-        // On the title the periscope belongs to the ATTRACT LOOP, which is flying its own route and
-        // taking its own corners; in play it is the head plus the hull.
-        val att = game.attract
-        val yaw = if (title) att?.yaw ?: 0f else game.yaw
-        val pitch = if (title) att?.pitch ?: 0.04f else game.pitch
-        val cp = cos(pitch)
-        val fx = sin(yaw) * cp; val fy = sin(pitch); val fz = -cos(yaw) * cp
-        Matrix.setLookAtM(view, 0, camX + sx, camY + sy, camZ, camX + sx + fx, camY + sy + fy, camZ + fz, 0f, 1f, 0f)
-        Matrix.perspectiveM(proj, 0, 60f, aspect, 0.25f, 240f)
-        Matrix.multiplyMM(mvp, 0, proj, 0, view, 0)
 
         statFrames++; statT += dt
         verifyT += dt
@@ -174,7 +161,8 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
                 var b = (kotlin.math.atan2(r.x - game.px, -(r.z - game.pz)) - game.yaw) * 57.2958f
                 while (b > 180f) b -= 360f
                 while (b < -180f) b += 360f
-                sb.append(" | R$i d=%.1f bear=%.0f vis=%.2f hasLos=%b".format(hypot(r.x - game.px, r.z - game.pz), b, r.vis, r.hasLos))
+                sb.append(" | R$i d=%.1f bear=%.0f vis=%.2f hasLos=%b face=%b err=%.0f crush=%d fold=%.2f y=%.2f".format(
+                    hypot(r.x - game.px, r.z - game.pz), b, r.vis, r.hasLos, r.facing, r.aimErr * 57.2958f, r.crush, r.fold, r.y))
             }
             var bb = (kotlin.math.atan2(game.bitX - game.px, -(game.bitZ - game.pz)) - game.yaw) * 57.2958f
             while (bb > 180f) bb -= 360f
@@ -185,7 +173,7 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
             while (pb < -180f) pb += 360f
             sb.append(" || POOL d=%.1f bear=%.0f act=%b draw=%.2f".format(
                 hypot(game.poolX - game.px, game.poolZ - game.pz), pb, game.poolActive, game.poolDraw))
-            sb.append(" || SHIELD %d flash=%.2f".format(game.shield, game.shieldFlash))
+            sb.append(" || SHIELD %d flash=%.2f level=%.2f caught=%b".format(game.shield, game.shieldFlash, game.poolLevel, game.caught))
             sb.append(" || lock=%b bolts=%d lives=%d wave=%d".format(game.lockedOn, game.shots.count { !it.friendly }, game.lives, game.wave))
             android.util.Log.i("X3Paranoids", sb.toString())
         }
@@ -222,6 +210,40 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
 
     // ------------------------------------------------------------------ scene
 
+    /** The periscope: where it stands (set by the scene), which way it looks, and how much it is shaking. */
+    private fun setupCamera(aspect: Float) {
+        val title = game.state == State.TITLE
+        // The tank's death carries its own judder on top of the damage shake — decaying, so the
+        // world steadies as the sight fails, rather than both of them going at once. The crush's
+        // judder sits on top of both: the gantry's servos coming through the hull.
+        val shake = game.damageFlash * 0.25f + game.crushShake * 0.30f +
+            (if (game.state == State.DYING) 0.16f * kotlin.math.exp(-game.stateT * 0.9f) else 0f)
+        val sx = (rnd.nextFloat() - 0.5f) * shake; val sy = (rnd.nextFloat() - 0.5f) * shake
+        // On the title the periscope belongs to the ATTRACT LOOP, which is flying its own route and
+        // taking its own corners; in play it is the head plus the hull.
+        val att = game.attract
+        val yaw = if (title) att?.yaw ?: 0f else game.yaw
+        val pitch = if (title) att?.pitch ?: 0.04f else game.pitch
+        val cp = cos(pitch)
+        val fx = sin(yaw) * cp; val fy = sin(pitch); val fz = -cos(yaw) * cp
+        Matrix.setLookAtM(view, 0, camX + sx, camY + sy, camZ, camX + sx + fx, camY + sy + fy, camZ + fz, 0f, 1f, 0f)
+        Matrix.perspectiveM(proj, 0, 60f, aspect, 0.25f, 240f)
+        Matrix.multiplyMM(mvp, 0, proj, 0, view, 0)
+    }
+
+    /** A world point onto the 640×480 glass; false when it is behind the eye. */
+    private val projIn = FloatArray(4)
+    private val projOut = FloatArray(4)
+    private fun project(x: Float, y: Float, z: Float, out: FloatArray): Boolean {
+        projIn[0] = x; projIn[1] = y; projIn[2] = z; projIn[3] = 1f
+        Matrix.multiplyMV(projOut, 0, mvp, 0, projIn, 0)
+        val w = projOut[3]
+        if (w < 0.05f) return false
+        out[0] = 320f + (projOut[0] / w) * 320f
+        out[1] = 240f - (projOut[1] / w) * 240f
+        return true
+    }
+
     private fun buildScene() {
         lines.reset(); pts.reset(); tris.reset(); mesh.reset()
         sceneGain = 1f
@@ -254,13 +276,17 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         culled = 0
         for (r in game.recognizers) {
             if (r.vis <= 0.001f) { culled++; continue }
-            buildRecognizer(r.x, r.y, r.z, r.yaw, 1f, r.alert, r.hitFlash, r.vis)
+            // the machine on top of you is the nearest thing in the world: its strokes get the
+            // near-wall treatment, alpha driven past 1 into a hot core, for as long as it holds
+            val crushing = r.crush != com.x3paranoids.engine.Recognizer.CRUSH_NONE
+            buildRecognizer(r.x, r.y, r.z, r.yaw, 1f, r.alert, r.hitFlash, r.vis, gain = if (crushing) 1.45f else 1f,
+                fold = r.fold, lock = r.lock)
         }
         if (game.bitActive && game.bitVis > 0.001f) {
             buildBit(game.bitX, 1.4f + 0.25f * sin(game.time * 3f), game.bitZ, game.bitT, game.bitVis)
         }
         if (game.poolActive && game.poolVis > 0.001f) {
-            buildPool(game.poolX, game.poolZ, game.poolT, game.poolVis, game.poolDraw)
+            buildPool(game.poolX, game.poolZ, game.poolT, game.poolVis, game.poolDraw, game.poolLevel)
         }
         if (game.poolCollapse > 0f) buildPoolCollapse(game.poolX, game.poolZ, game.poolCollapse)
         buildShots(game.shots)
@@ -539,8 +565,20 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
      * Recognizer that hugged a wall put 45 cm of cross-bar inside it. Now the derez is a third
      * reader of the same numbers, and there is still no way to change one of them alone.
      */
+    /**
+     * [fold] poses the legs — 0 hanging, 1 clamped shut — through [RecognizerModel.segment], so
+     * the crush is drawn from the same numbers the collider and the derez use. [lock] is the eye:
+     * as the machine brings its cab onto you the slit BRIGHTENS and pulses, and at full lock it
+     * is drawn three times, stacked, so it reads as a bar of hot light rather than a line — the
+     * one cue that says "it has you" before the disc leaves. The pulse is fast (about 7 Hz) so it
+     * is unmistakably an alarm and not the machine's hover bob.
+     */
+    private val recSeg = FloatArray(6)
+    private val recPa = FloatArray(3)
+    private val recPb = FloatArray(3)
+
     private fun buildRecognizer(x: Float, y: Float, z: Float, yaw: Float, sc: Float, alert: Float, flash: Float, vis: Float,
-                                gain: Float = 1f, whiten: Float = 0f) {
+                                gain: Float = 1f, whiten: Float = 0f, fold: Float = 0f, lock: Float = 0f) {
         var r = 0.25f + 0.75f * alert; var g = 1f - 0.75f * alert; var b = 0.45f - 0.25f * alert
         r += (1f - r) * flash; g += (1f - g) * flash; b += (1f - b) * flash
         // THE OVERLOAD wash: colour drains toward white before the shape gives way, and the alpha
@@ -548,26 +586,36 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         // the beam dwelling — the same trick nearGain uses on a wall you are about to hit).
         r += (1f - r) * whiten; g += (1f - g) * whiten; b += (1f - b) * whiten
         val a = 0.95f * vis * gain
-        val c = cos(yaw); val s = sin(yaw)
-        fun lx(ox: Float, oz: Float) = x + (ox * c + oz * s) * sc
-        fun lz(ox: Float, oz: Float) = z + (-ox * s + oz * c) * sc
         // The silhouette comes from RecognizerModel, which is also what the derez takes apart — the
         // machine you watch break is made of exactly the segments you were looking at a frame before.
+        // The local→world is the model's own (RecognizerModel.toWorld): local −z, the eye, maps to
+        // the heading the AI steers by, so a machine that has turned to face you is DRAWN facing you.
         val eyeR = 1f; val eyeG = 0.25f + 0.2f * (1f - alert) + (1f - 0.25f) * whiten; val eyeB = 0.2f + 0.8f * whiten
-        val ea = (0.55f + 0.45f * alert) * vis * gain
+        val pulse = 0.5f + 0.5f * sin(game.time * 44f)
+        val ea = (0.55f + 0.45f * alert) * vis * gain * (1f + lock * (1.3f + 1.2f * pulse))
         val m = RecognizerModel
         for (i in 0 until m.count) {
-            val k = i * 6
-            val ax = lx(m.seg[k], m.seg[k + 2]); val ay = y + m.seg[k + 1] * sc; val az = lz(m.seg[k], m.seg[k + 2])
-            val bx = lx(m.seg[k + 3], m.seg[k + 5]); val by = y + m.seg[k + 4] * sc; val bz = lz(m.seg[k + 3], m.seg[k + 5])
+            m.segment(i, fold, recSeg)
+            m.toWorld(x, y, z, yaw, sc, recSeg[0], recSeg[1], recSeg[2], recPa)
+            m.toWorld(x, y, z, yaw, sc, recSeg[3], recSeg[4], recSeg[5], recPb)
+            val ax = recPa[0]; val ay = recPa[1]; val az = recPa[2]
+            val bx = recPb[0]; val by = recPb[1]; val bz = recPb[2]
             when (m.kind[i]) {
                 RecognizerModel.RIB -> wline(ax, ay, az, bx, by, bz, r, g, b, 0.6f * vis * gain)
-                RecognizerModel.EYE -> wline(ax, ay, az, bx, by, bz, eyeR, eyeG, eyeB, ea)
+                RecognizerModel.EYE -> {
+                    wline(ax, ay, az, bx, by, bz, eyeR, eyeG, eyeB, ea)
+                    if (lock > 0.05f) {
+                        // the slit stacked into a bar: two more strokes, a hand's width above and below
+                        val h = 0.07f * sc * lock
+                        wline(ax, ay + h, az, bx, by + h, bz, eyeR, eyeG + 0.3f * lock, eyeB + 0.3f * lock, ea * 0.85f * lock)
+                        wline(ax, ay - h, az, bx, by - h, bz, eyeR, eyeG + 0.3f * lock, eyeB + 0.3f * lock, ea * 0.85f * lock)
+                    }
+                }
                 else -> wline(ax, ay, az, bx, by, bz, r, g, b, a)
             }
         }
-        pts.v(lx(RecognizerModel.EYE_PT_X, RecognizerModel.EYE_PT_Z), y + RecognizerModel.EYE_PT_Y * sc,
-            lz(RecognizerModel.EYE_PT_X, RecognizerModel.EYE_PT_Z), eyeR, 0.3f + 0.7f * whiten, 0.25f + 0.75f * whiten, ea * fog(x, y, z))
+        m.toWorld(x, y, z, yaw, sc, RecognizerModel.EYE_PT_X, RecognizerModel.EYE_PT_Y, RecognizerModel.EYE_PT_Z, recPa)
+        pts.v(recPa[0], recPa[1], recPa[2], eyeR, 0.3f + 0.7f * whiten + 0.4f * lock * pulse, 0.25f + 0.75f * whiten + 0.3f * lock * pulse, ea * fog(x, y, z))
     }
 
     // ------------------------------------------------------------------ [DEREZ]
@@ -609,7 +657,7 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
                 val jy = (hash01(step * 7 + 3) - 0.5f) * 0.16f * f
                 val jz = (hash01(step * 7 + 5) - 0.5f) * 0.20f * f
                 buildRecognizer(d.ox + jx, d.oy + jy, d.oz + jz, d.yaw, d.sc * (1f + 0.07f * f),
-                    d.alert, 0f, 1f, gain = 1f + 2.4f * f, whiten = f)
+                    d.alert, 0f, 1f, gain = 1f + 2.4f * f, whiten = f, fold = d.fold)
                 continue
             }
             for (p in d.frags) {
@@ -697,9 +745,15 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         }
     }
 
-    private fun buildPool(x: Float, z: Float, t: Float, vis: Float, draw: Float) {
+    /**
+     * [level] is how much the pool holds, 0 drained … 1 standing — see [Game.poolLevel]. A
+     * drained pool keeps its rings, dimmed, and its aperture; the COLUMN is what it has lost, and
+     * it climbs back with the level, its dashes running upward the whole time: energy returning
+     * to a place you can come back to. At full it is exactly the pool it always was.
+     */
+    private fun buildPool(x: Float, z: Float, t: Float, vis: Float, draw: Float, level: Float = 1f) {
         val c = POOL_C
-        val a0 = vis
+        val a0 = vis * (0.40f + 0.60f * level)
         // the surface: three rings, brightness travelling outward, the outer one AT the draw radius
         val radii = floatArrayOf(0.8f, 1.5f, Game.POOL_R)
         for (k in radii.indices) {
@@ -718,7 +772,9 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         }
         // the column. Six faint strands carry the silhouette at range; the travelling dashes on them
         // are the energy itself, climbing — or, once you are drinking, falling back into the pool.
-        val top = 5.4f - 3.6f * draw
+        // Its height is the level: a drained pool has a stub, a full one the whole five and a half.
+        val top = 0.35f + (5.4f - 0.35f) * level - 3.6f * draw
+        if (top < 0.5f) { pts.v(x, 0.1f, z, c[0], c[1], c[2], a0 * fog(x, 0.1f, z)); return }
         val strandR = 0.62f
         for (i in 0 until 6) {
             val b = spin * 0.4f + 6.2832f * i / 6f
@@ -872,11 +928,80 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
             // firing one of those on every shot the game has ever taken. So the tail is cut to the
             // distance from the eye, and a shell in your lap simply draws short.
             val head = sqrt((s.x - camX) * (s.x - camX) + (s.y - camY) * (s.y - camY) + (s.z - camZ) * (s.z - camZ))
-            val k = min(if (s.friendly) 1.6f else 1.1f, max(0f, head - 0.45f)) / l
-            val r = if (s.friendly) 1f else 1f; val g = if (s.friendly) 0.88f else 0.28f; val b = if (s.friendly) 0.3f else 0.22f
-            wline(s.x, s.y, s.z, s.x - s.vx * k, s.y - s.vy * k, s.z - s.vz * k, r, g, b, 1f)
-            pts.v(s.x, s.y, s.z, r, g, b, fog(s.x, s.y, s.z))
+            if (!s.friendly) { buildDisc(s, l, head); continue }
+            val k = min(1.6f, max(0f, head - 0.45f)) / l
+            wline(s.x, s.y, s.z, s.x - s.vx * k, s.y - s.vy * k, s.z - s.vz * k, 1f, 0.88f, 0.3f, 1f)
+            pts.v(s.x, s.y, s.z, 1f, 0.88f, 0.3f, fog(s.x, s.y, s.z))
         }
+    }
+
+    // ------------------------------------------------------------------ [THE DISC]
+    /**
+     * A RECOGNIZER THROWS A DISC, and it has to be a THING coming at you, not a streak. On a
+     * see-through display a thin red line moving at twenty units a second registers as a flicker
+     * if it registers at all, and the hit it delivered was a red frame with nothing in front of it.
+     *
+     * So: a spinning wireframe disc in the Tron idiom — an outer ring, an inner ring, four spokes
+     * — with its face SQUARE TO ITS TRAVEL, spinning about the travel axis. Square to travel is the
+     * whole trick: a disc thrown at your face is a circle that GROWS in the sight as it closes, and
+     * a circle growing is a thing the eye reads as "approaching" from the first frame, at a range
+     * where the same disc edge-on would be a dash. The spokes turning are what make it a spinning
+     * object rather than a reticle.
+     *
+     * Behind it, a WAKE: three rings trailing along the axis, each a little larger and dimmer than
+     * the last, so the disc drags a cone of light — and because the wake widens BACKWARD, a disc
+     * coming at you shows its rings nested inside one another, which sells the motion toward the
+     * eye harder than any streak. A short bright core streak and the head point carry it at range,
+     * where the rings are a few pixels across.
+     *
+     * Nothing of it may reach behind the periscope (see the tail note above): the wake is drawn
+     * back along the axis only as far as the disc is from the eye, less a margin.
+     *
+     * Budget: 12 + 8 + 4 + 3×8 + 1 = 49 strokes a disc; nine machines' worth in the air is under
+     * a thousand vertices in a batch that caps at forty thousand.
+     */
+    private fun buildDisc(s: com.x3paranoids.engine.Shot, speed: Float, head: Float) {
+        val fx = s.vx / speed; val fy = s.vy / speed; val fz = s.vz / speed
+        // a basis square to the travel axis: u from up×f, w = f×u
+        var ux = -fz; var uy = 0f; var uz = fx
+        var ul = sqrt(ux * ux + uz * uz)
+        if (ul < 1e-3f) { ux = 1f; uy = 0f; uz = 0f; ul = 1f }
+        ux /= ul; uz /= ul
+        val wx = fy * uz - fz * uy; val wy = fz * ux - fx * uz; val wz = fx * uy - fy * ux
+        val spin = s.spin + game.time * 15f
+        val r = 1f; val g = 0.30f; val b = 0.22f
+        // the disc closing on you brightens: alpha above 1 blows the core out white-hot
+        val near = (1f - head / 14f).coerceIn(0f, 1f)
+        val a = 0.95f + 0.6f * near
+        fun ring(cx: Float, cy: Float, cz: Float, rad: Float, n: Int, ph: Float, al: Float) {
+            for (i in 0 until n) {
+                val a0 = ph + 6.2832f * i / n; val a1 = ph + 6.2832f * (i + 1) / n
+                val c0 = cos(a0); val s0 = sin(a0); val c1 = cos(a1); val s1 = sin(a1)
+                wline(cx + (ux * c0 + wx * s0) * rad, cy + (uy * c0 + wy * s0) * rad, cz + (uz * c0 + wz * s0) * rad,
+                      cx + (ux * c1 + wx * s1) * rad, cy + (uy * c1 + wy * s1) * rad, cz + (uz * c1 + wz * s1) * rad, r, g, b, al)
+            }
+        }
+        val R = 0.62f
+        ring(s.x, s.y, s.z, R, 12, spin, a)
+        ring(s.x, s.y, s.z, R * 0.42f, 8, -spin * 0.7f, a * 0.8f)
+        for (i in 0 until 4) {
+            val an = spin + 1.5708f * i
+            val c0 = cos(an); val s0 = sin(an)
+            wline(s.x + (ux * c0 + wx * s0) * R * 0.42f, s.y + (uy * c0 + wy * s0) * R * 0.42f, s.z + (uz * c0 + wz * s0) * R * 0.42f,
+                  s.x + (ux * c0 + wx * s0) * R, s.y + (uy * c0 + wy * s0) * R, s.z + (uz * c0 + wz * s0) * R, 1f, 0.6f, 0.4f, a * 0.9f)
+        }
+        // the wake, back along the axis, never past the eye
+        val reach = max(0f, head - 0.5f)
+        for (k in 1..3) {
+            val back = 0.55f * k
+            if (back > reach) break
+            val cx = s.x - fx * back; val cy = s.y - fy * back; val cz = s.z - fz * back
+            ring(cx, cy, cz, R * (1f + 0.28f * k), 8, spin * 0.5f + k * 0.4f, a * (0.42f - 0.11f * k))
+        }
+        // the core: a short white-hot streak from the head back, and the head point
+        val kk = min(0.9f, reach) / speed
+        wline(s.x, s.y, s.z, s.x - s.vx * kk, s.y - s.vy * kk, s.z - s.vz * kk, 1f, 0.75f, 0.6f, a * 1.1f)
+        pts.v(s.x, s.y, s.z, 1f, 0.5f, 0.4f, min(1f, a) * fog(s.x, s.y, s.z))
     }
 
     /** A derez behind a wall stays behind it: sparks take the same sight test, per particle. */
@@ -1080,6 +1205,9 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         // second of nothing (the beat where you register what happened), then a steady collapse that
         // is total well before GAME OVER, so the ending arrives on a clean screen.
         glitch = if (game.state == State.DYING) ((game.stateT - 0.25f) / 2.35f).coerceIn(0f, 1f) else 0f
+        // a hull hit borrows a fraction of the same failure — text garbles, rows tear — for the
+        // third of a second the static lasts
+        if (game.staticT > 0f) glitch = max(glitch, 0.30f * (game.staticT / 0.32f).coerceIn(0f, 1f))
         glitchSeed = (game.stateT * 14f).toInt()
         revealY = OFF; traceLimit = -1f; hudGain = 1f
         // On the title the whole sight is the attract loop's: it resolves out of black behind the
@@ -1291,30 +1419,50 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
      * over the corridor, fires, and stands it down again, which is a promise about what the player
      * gets when they tap. A second, prettier set of brackets for the title screen would be a lie.
      */
-    private fun sightBrackets() {
+    /**
+     * [kick] is the sight being HIT — see [Game.sightKick]. Positive punches the whole bracket set
+     * outward from the centre and jolts it; negative is the clamp, the brackets driven inward.
+     * The jolt is re-rolled per frame on purpose: a bracket set that shudders for a quarter of a
+     * second reads as an instrument taking a blow, which a clean scale change does not.
+     */
+    private var kickS = 1f; private var kickX = 0f; private var kickY = 0f
+
+    private fun bhl(x0: Float, y0: Float, x1: Float, y1: Float) =
+        hl(320f + (x0 - 320f) * kickS + kickX, 240f + (y0 - 240f) * kickS + kickY,
+           320f + (x1 - 320f) * kickS + kickX, 240f + (y1 - 240f) * kickS + kickY)
+
+    private fun sightBrackets(kick: Float = 0f) {
+        val k = abs(kick)
+        kickS = 1f + kick * 0.07f
+        kickX = (rnd.nextFloat() - 0.5f) * 14f * k; kickY = (rnd.nextFloat() - 0.5f) * 10f * k
         // outer sight brackets
-        hl(120f, 70f, 195f, 70f); hl(120f, 70f, 120f, 118f)
-        hl(520f, 70f, 445f, 70f); hl(520f, 70f, 520f, 118f)
-        hl(120f, 410f, 195f, 410f); hl(120f, 410f, 120f, 362f)
-        hl(520f, 410f, 445f, 410f); hl(520f, 410f, 520f, 362f)
-        hl(320f, 70f, 320f, 96f); hl(320f, 410f, 320f, 384f)
-        hl(120f, 240f, 152f, 240f); hl(520f, 240f, 488f, 240f)
+        bhl(120f, 70f, 195f, 70f); bhl(120f, 70f, 120f, 118f)
+        bhl(520f, 70f, 445f, 70f); bhl(520f, 70f, 520f, 118f)
+        bhl(120f, 410f, 195f, 410f); bhl(120f, 410f, 120f, 362f)
+        bhl(520f, 410f, 445f, 410f); bhl(520f, 410f, 520f, 362f)
+        bhl(320f, 70f, 320f, 96f); bhl(320f, 410f, 320f, 384f)
+        bhl(120f, 240f, 152f, 240f); bhl(520f, 240f, 488f, 240f)
         // inner chevrons converging on the target
-        hl(205f, 138f, 248f, 181f); hl(435f, 138f, 392f, 181f); hl(205f, 342f, 248f, 299f); hl(435f, 342f, 392f, 299f)
+        bhl(205f, 138f, 248f, 181f); bhl(435f, 138f, 392f, 181f); bhl(205f, 342f, 248f, 299f); bhl(435f, 342f, 392f, 299f)
         // centre box ticks
-        hl(288f, 214f, 304f, 214f); hl(288f, 214f, 288f, 226f); hl(352f, 214f, 336f, 214f); hl(352f, 214f, 352f, 226f)
-        hl(288f, 266f, 304f, 266f); hl(288f, 266f, 288f, 254f); hl(352f, 266f, 336f, 266f); hl(352f, 266f, 352f, 254f)
+        bhl(288f, 214f, 304f, 214f); bhl(288f, 214f, 288f, 226f); bhl(352f, 214f, 336f, 214f); bhl(352f, 214f, 352f, 226f)
+        bhl(288f, 266f, 304f, 266f); bhl(288f, 266f, 288f, 254f); bhl(352f, 266f, 336f, 266f); bhl(352f, 266f, 352f, 254f)
+        kickS = 1f; kickX = 0f; kickY = 0f
     }
 
     private fun buildPlayHud() {
         val t = game.time
         val lock = game.lockedOn
+        val caught = game.caught
         val blink = 0.5f + 0.5f * sin(t * 9f)
         var r = GREEN[0]; var g = GREEN[1]; var b = GREEN[2]
-        if (lock) { r += (1f - r) * blink * 0.9f; g -= g * blink * 0.8f; b -= b * blink * 0.6f }
+        if (lock || caught) { r += (1f - r) * blink * 0.9f; g -= g * blink * 0.8f; b -= b * blink * 0.6f }
         val inv = if (game.invuln > 0f) 0.45f + 0.55f * abs(sin(t * 14f)) else 1f
         color(r, g, b, 0.9f * inv)
-        sightBrackets()
+        // held: the brackets are driven in and stay in, over whatever kick the landing gave them
+        sightBrackets(if (caught) min(game.sightKick, -0.35f - 0.15f * blink) else game.sightKick)
+        buildImpacts()
+        buildStatic()
         // readouts
         color(GREEN[0], GREEN[1], GREEN[2], 0.95f)
         text("RECOGNIZERS ${game.recognizersLeft}", 52f, 46f, 2.2f)
@@ -1329,7 +1477,15 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
             val on = i < (prog * 14f + 0.5f).toInt()
             color(GREEN[0], GREEN[1], GREEN[2], if (on) 0.95f else 0.22f); hl(x, 465f, x + 6f, 465f)
         }
-        if (lock) { color(1f, 0.35f, 0.25f, blink); textC("WARNING", 320f, 68f, 1.8f) }
+        // ONE WORD IN THE TOP BAND, by priority. CAPTURED while the legs are on you; WARNING when a
+        // machine is facing you with the line clear — it can throw NOW; TRACKING, dimmer and
+        // amber, when one has the line and is still bringing its cab round. TRACKING is the
+        // teachable one: it is the beat on which moving still works.
+        when {
+            caught -> { color(1f, 0.3f, 0.2f, 0.65f + 0.35f * blink); textC("CAPTURED", 320f, 68f, 2.0f) }
+            lock -> { color(1f, 0.35f, 0.25f, blink); textC("WARNING", 320f, 68f, 1.8f) }
+            game.tracking -> { color(1f, 0.72f, 0.3f, 0.45f + 0.2f * blink); textC("TRACKING", 320f, 68f, 1.6f) }
+        }
         buildThrottle()
         buildShieldHud()
         // damage: red frame
@@ -1351,6 +1507,77 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
             }
             State.DYING -> { color(1f, 0.3f, 0.25f, 0.6f + 0.4f * abs(sin(t * 12f))); textC("DEREZZED", 320f, 215f, 5f) }
             else -> {}
+        }
+    }
+
+    // ------------------------------------------------------------------ [ON THE GLASS]
+    /**
+     * WHERE THE DISC LANDED. Each [com.x3paranoids.engine.Impact] is a world point; it is projected
+     * onto the glass every frame so the ring stays on the spot as the head moves, and drawn as a
+     * SHOCK: a ring expanding fast from the point and fading, a second ring a beat behind it, and
+     * for a hull hit a cross through the centre — the strike itself. Red for the hull, cyan for
+     * the shell (the same grammar as the frames), and a near miss is a fainter, faster ring out
+     * where the disc went past. The rings are clamped to the sight's area so an impact off the
+     * edge of the glass still shows as a ring pressed against that edge — which is also where it
+     * came from.
+     */
+    private val projPt = FloatArray(2)
+
+    private fun buildImpacts() {
+        if (game.impacts.isEmpty()) return
+        for (im in game.impacts) {
+            val u = (im.age / com.x3paranoids.engine.Impact.LIFE).coerceIn(0f, 1f)
+            if (!project(im.x, im.y, im.z, projPt)) continue
+            val cx = projPt[0].coerceIn(60f, 580f); val cy = projPt[1].coerceIn(40f, 440f)
+            val near = im.kind == com.x3paranoids.engine.Impact.NEAR
+            val shell = im.kind == com.x3paranoids.engine.Impact.SHIELD
+            val fade = 1f - u
+            val cr: Float; val cg: Float; val cb: Float
+            if (shell) { cr = 0.55f; cg = 0.95f; cb = 1f } else { cr = 1f; cg = 0.3f; cb = 0.22f }
+            if (near) {
+                color(cr, cg, cb, 0.55f * fade * fade)
+                circle(cx, cy, 14f + 70f * u, 14)
+                continue
+            }
+            val e = 1f - (1f - u) * (1f - u)
+            color(cr, cg, cb, (0.95f + 0.6f * (1f - u)) * fade)
+            circle(cx, cy, 10f + 95f * e, 18)
+            val u2 = ((u - 0.12f) / 0.88f).coerceIn(0f, 1f)
+            color(cr, cg, cb, 0.6f * (1f - u2))
+            circle(cx, cy, 6f + 60f * u2, 14)
+            if (!shell) {
+                // the strike: a cross that flares and is gone in the first third
+                val f = (1f - u * 3f).coerceIn(0f, 1f)
+                if (f > 0f) {
+                    color(1f, 0.85f, 0.7f, 1.4f * f)
+                    val l = 16f + 30f * (1f - f)
+                    hl(cx - l, cy, cx + l, cy); hl(cx, cy - l, cx, cy + l)
+                }
+            }
+        }
+    }
+
+    /**
+     * STATIC. A hull hit puts a moment of noise into the periscope: forty-odd short horizontal
+     * dashes scattered over the sight, re-rolled about fifteen times a second so they stutter
+     * rather than shimmer, and the readouts corrupt a little with them (see [buildHud], which
+     * hands the same beat to the sight's own failure filter at a fraction of its strength). It
+     * clears inside a third of a second: a fault, not a state.
+     */
+    private fun buildStatic() {
+        val s = game.staticT
+        if (s <= 0f) return
+        val k = (s / 0.32f).coerceIn(0f, 1f)
+        val seed = (game.time * 15f).toInt()
+        val n = (46 * k).toInt()
+        for (i in 0 until n) {
+            var h = (i * 7919 + seed * 104729) * -0x61c88647
+            h = h xor (h ushr 15); h *= -0x7a143595; h = h xor (h ushr 13)
+            val x = 40f + ((h ushr 8) and 0xFFF) / 4095f * 560f
+            val y = 30f + ((h ushr 20) and 0xFFF) / 4095f * 420f
+            val w = 8f + ((h ushr 3) and 0x3F) * 0.9f
+            color(0.9f, 1f, 0.9f, (0.25f + 0.5f * (((h ushr 1) and 0xF) / 15f)) * k)
+            hl(x, y, x + w, y)
         }
     }
 
@@ -1436,17 +1663,34 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
             }
         }
         val d = game.poolDraw
+        val inPool = game.poolActive && hypot(game.px - game.poolX, game.pz - game.poolZ) < Game.POOL_R
         if (d > 0.001f) {
             color(cy[0], cy[1], cy[2], 0.85f)
             textC("DRAWING ENERGY", 320f, 132f, 1.5f)
-            val w = 150f; val bx = 320f - w / 2f; val by = 140f
-            color(cy[0], cy[1], cy[2], 0.4f); rect(bx - 3f, by - 3f, bx + w + 3f, by + 9f)
-            val n = (d * 20f + 0.001f).toInt()
-            for (i in 0 until 20) {
-                color(cy[0], cy[1], cy[2], if (i < n) 0.95f else 0.18f)
-                val x = bx + i * 7.5f + 1f
-                hl(x, by, x, by + 6f)
-            }
+            drawMeter(d, 0.95f)
+        } else if (inPool && game.poolLevel < 1f) {
+            // STANDING IN A DRAINED POOL. The column climbing back is the world's answer; this is
+            // the plate's — the same meter, dim, filling on the pool's own clock, so nobody waits
+            // in a pool wondering whether it is broken.
+            color(cy[0], cy[1], cy[2], 0.6f)
+            textC("POOL RECHARGING", 320f, 132f, 1.5f)
+            drawMeter(game.poolLevel, 0.5f)
+        } else if (game.poolFullHint) {
+            color(cy[0], cy[1], cy[2], 0.6f + 0.2f * sin(game.time * 4f))
+            textC("SHIELD FULL", 320f, 132f, 1.5f)
+        }
+    }
+
+    /** The draw meter: twenty ticks in a box, [f] of them lit, at [bright]. Same idiom as the wave bar. */
+    private fun drawMeter(f: Float, bright: Float) {
+        val cy = floatArrayOf(0.5f, 0.95f, 1f)
+        val w = 150f; val bx = 320f - w / 2f; val by = 140f
+        color(cy[0], cy[1], cy[2], 0.4f * bright); rect(bx - 3f, by - 3f, bx + w + 3f, by + 9f)
+        val n = (f * 20f + 0.001f).toInt()
+        for (i in 0 until 20) {
+            color(cy[0], cy[1], cy[2], if (i < n) bright else 0.18f)
+            val x = bx + i * 7.5f + 1f
+            hl(x, by, x, by + 6f)
         }
     }
 
@@ -1522,14 +1766,25 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
             val al = if (threat) 0.70f + 0.30f * (0.5f + 0.5f * sin(game.time * 6f)) else 0.55f
             color(0.25f + 0.75f * r.alert, 1f - 0.75f * r.alert, 0.45f - 0.25f * r.alert, al)
             rect(ex - h, ey - h, ex + h, ey + h)
-            // A spur toward the tank on the frames it actually has the shot. This is the plate
+            // A spur toward the tank on the frames it actually has the shot line. This is the plate
             // earning its keep: WARNING already tells you that something has you, the spur tells you
             // WHERE FROM — the difference between backing away blind and stepping behind a wall.
-            // It also makes breaking line of sight a move you can see working.
+            // It also makes breaking line of sight a move you can see working. Dim while the
+            // machine is still turning onto you, full once it is FACING — the plate agrees with
+            // the eye you can see swinging in the world.
             if (r.hasLos) {
                 var dx = tx - ex; var dy = ty - ey
                 val dl = hypot(dx, dy).coerceAtLeast(0.001f); dx /= dl; dy /= dl
+                color(0.25f + 0.75f * r.alert, 1f - 0.75f * r.alert, 0.45f - 0.25f * r.alert, if (r.facing) al else al * 0.45f)
                 hl(ex + dx * (h + 1.5f), ey + dy * (h + 1.5f), ex + dx * (h + 7f), ey + dy * (h + 7f))
+            }
+            // and the clamp: a machine holding the tank draws as a ring round it on the plate
+            if (r.crush != com.x3paranoids.engine.Recognizer.CRUSH_NONE) {
+                color(1f, 0.3f, 0.2f, 0.6f + 0.4f * (0.5f + 0.5f * sin(game.time * 12f)))
+                for (i in 0 until 8) {
+                    val a0 = 6.2832f * i / 8f; val a1 = 6.2832f * (i + 1) / 8f
+                    hl(ex + cos(a0) * 5.5f, ey + sin(a0) * 5.5f, ex + cos(a1) * 5.5f, ey + sin(a1) * 5.5f)
+                }
             }
         }
 
@@ -1547,7 +1802,8 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         // inside it — so on the one bearing where both markers coincide they are still two
         // different marks at two different radii, rather than one smudge.
         if (game.poolActive) {
-            color(0.65f, 1f, 1f, 0.85f)
+            // dimmer while it refills: the plate says "there is a pool" always, and "it is ready" by brightness
+            color(0.65f, 1f, 1f, 0.35f + 0.5f * game.poolLevel)
             val pdx = mx(game.poolX); val pdy = my(game.poolZ)
             if (hypot(game.px - game.poolX, game.pz - game.poolZ) <= MAP_BIT_NEAR) {
                 for (i in 0 until 6) {

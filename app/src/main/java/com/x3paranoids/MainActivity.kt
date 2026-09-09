@@ -1,6 +1,7 @@
 package com.x3paranoids
 
 import android.app.Activity
+import android.content.pm.ApplicationInfo
 import android.opengl.GLSurfaceView
 import android.os.Build
 import android.os.Bundle
@@ -141,6 +142,14 @@ class MainActivity : Activity(), GameHost {
         voice.enabled = store.voice; hero.enabled = store.voice
         game.boot()
         music.play()
+        // DEBUGGABLE BUILDS ONLY: `am start ... --ei wave N --ei shield M` jumps straight into a
+        // game at wave N wearing M charges — see Game.debugStart. Release builds ignore the extras.
+        if ((applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0) {
+            val w = intent?.getIntExtra("wave", 0) ?: 0
+            val s = intent?.getIntExtra("shield", 0) ?: 0
+            val atPool = (intent?.getIntExtra("atpool", 0) ?: 0) != 0
+            if (w > 0) glView.queueEvent { game.debugStart(w, s, atPool) }
+        }
     }
 
     // ------------------------------------------------------------ GameHost (any thread)

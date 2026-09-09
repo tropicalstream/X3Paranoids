@@ -61,6 +61,12 @@ class Derez(
     val player: Boolean,
     /** The SHIELD bursting rather than a machine dying — see [seedShield]. Drawn cyan, not green. */
     val shield: Boolean = false,
+    /**
+     * How far the legs were folded when it died — see [RecognizerModel.segment]. A machine shot
+     * while it is clamped round the tank overloads and fractures with its legs still closed; the
+     * pieces it breaks into are the pose you were looking at, not the pose it was drawn in.
+     */
+    val fold: Float = 0f,
 ) {
     var t = 0f
     var broken = false
@@ -93,16 +99,15 @@ class Derez(
      */
     fun seedRecognizer(rnd: () -> Float) {
         broken = true
-        val c = kotlin.math.cos(yaw); val s = kotlin.math.sin(yaw)
         val m = RecognizerModel
+        val local = FloatArray(6); val pa = FloatArray(3); val pb = FloatArray(3)
         for (i in 0 until m.count) {
-            val b = i * 6
-            val ax0 = ox + (m.seg[b] * c + m.seg[b + 2] * s) * sc
-            val ay0 = oy + m.seg[b + 1] * sc
-            val az0 = oz + (-m.seg[b] * s + m.seg[b + 2] * c) * sc
-            val bx0 = ox + (m.seg[b + 3] * c + m.seg[b + 5] * s) * sc
-            val by0 = oy + m.seg[b + 4] * sc
-            val bz0 = oz + (-m.seg[b + 3] * s + m.seg[b + 5] * c) * sc
+            // the same posed segment and the same local→world the renderer drew a frame ago
+            m.segment(i, fold, local)
+            m.toWorld(ox, oy, oz, yaw, sc, local[0], local[1], local[2], pa)
+            m.toWorld(ox, oy, oz, yaw, sc, local[3], local[4], local[5], pb)
+            val ax0 = pa[0]; val ay0 = pa[1]; val az0 = pa[2]
+            val bx0 = pb[0]; val by0 = pb[1]; val bz0 = pb[2]
             val cx = (ax0 + bx0) * 0.5f; val cy = (ay0 + by0) * 0.5f; val cz = (az0 + bz0) * 0.5f
             var dx = cx - ox; val dy = cy - (oy + RecognizerModel.CORE_Y * sc); var dz = cz - oz
             val dl = kotlin.math.sqrt(dx * dx + dy * dy + dz * dz).coerceAtLeast(0.25f)

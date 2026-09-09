@@ -73,13 +73,80 @@ class Recognizer(var x: Float, var z: Float) {
         const val HALF_W = LEG_X + FOOT_FLARE
         /** The collision radius: no part of the model may end up inside a wall, at any heading. */
         val RADIUS = sqrt(HALF_W * HALF_W + HALF_D * HALF_D)
+
+        // the beats of a capture — see [Game.updateCrush]
+        const val CRUSH_NONE = 0
+        /** Rising over the tank, legs splaying: the anticipation. */
+        const val CRUSH_LUNGE = 1
+        /** Coming down, legs swinging shut: the descent. */
+        const val CRUSH_DROP = 2
+        /** Landed and clamped: the hold. */
+        const val CRUSH_HOLD = 3
+        /** Legs opening, lifting off (or being thrown off): the release. */
+        const val CRUSH_RELEASE = 4
     }
+
+    /** The eye's world position — where a disc leaves from, and the point the lock glow sits on. */
+    fun eye(out: FloatArray) = RecognizerModel.toWorld(x, y, z, yaw, 1f,
+        RecognizerModel.EYE_PT_X, RecognizerModel.EYE_PT_Y, RecognizerModel.EYE_PT_Z, out)
 
     var y = 1.6f
     var yaw = 0f
     var hp = 1
     var alert = 0f          // 0 patrol green … 1 hunting red
     var hunting = false
+    /**
+     * IT HAS TO BE LOOKING AT YOU. True on the frames the cab is within [Game.FIRE_ARC] of the
+     * tank with a clear shot line — the only state a disc may leave from. Until then the machine
+     * is TURNING, and the turn is the telegraph the whole facing rule exists to give you.
+     */
+    var facing = false
+    /** Radians the cab is still off the tank while it tracks you; 0 when it is not tracking. */
+    var aimErr = 0f
+    /** 0..1 ramp of [facing] — the eye's lock glow, so the slit brightens as it finds you rather than blinking. */
+    var lock = 0f
+    // ------------------------------------------------------------------ the crush
+    /** [CRUSH_NONE], or which beat of the capture this machine is in — see [Game.updateCrush]. */
+    var crush = CRUSH_NONE
+    var crushT = 0f
+    /** Where it was hovering when the lunge began, so the rise starts from there. */
+    var crushY0 = 1.6f
+    /** How far the legs are folded, 0 hanging … 1 clamped shut, a little below 0 splayed — see [RecognizerModel.segment]. */
+    var fold = 0f
+    /** Seconds before this machine may capture again. The player's recovery window. */
+    var crushCd = 0f
+    /** Seconds of reeling after a release: it neither fires nor closes, and its heading wanders. */
+    var stagger = 0f
+    /** The release was the SHELL throwing it off rather than the machine letting go. */
+    var thrown = false
+    /** How long the current hold lasts — shorter when it is straining against a shell. */
+    var holdT = 0f
+    /** Yaw wobble seed for the stagger. */
+    var reel = 0f
+    /** Seconds left of a CHARGE — it has stopped standing off and is coming to capture. */
+    var charge = 0f
+    var chargeCd = 0f
+    /** The approach line at the moment of capture, unit, machine → tank. Fixed for the sequence. */
+    var crushUx = 0f
+    var crushUz = -1f
+    /**
+     * WEDGED. A hunter drives straight at the tank it can see, and a wall corner between them
+     * stops it dead: it sees you through the gap, presses on the wall, and stands there. Watched
+     * on the glasses for a full minute, two machines at seventeen units, neither able to close
+     * nor fire. [stuckT] accumulates while a chase step goes nowhere; past a beat it sets
+     * [reroute], and for that long the machine walks the BFS step toward your cell instead of
+     * the straight line — still turning to face you, still firing if the line clears.
+     */
+    var stuckT = 0f
+    var reroute = 0f
+    /**
+     * SIGHT WITHOUT THE LINE. Standing off at six units with the tank in view but the shot line
+     * clipping a door post, the old AI circled there indefinitely — two machines did, for seventy
+     * seconds, on the glasses. This accumulates while it can see you and cannot shoot you; past a
+     * beat it CLOSES instead of standing off, which walks it round the post and into the line —
+     * or into the tank, which is the other thing it does.
+     */
+    var noLineT = 0f
     /**
      * How much of this machine the periscope can actually see, 0..1 — the renderer's alpha, and its
      * whole occlusion test (see GLRenderer's OCCLUSION note). It ramps rather than switching so a
@@ -100,9 +167,31 @@ class Recognizer(var x: Float, var z: Float) {
 
 class Shot(var x: Float, var y: Float, var z: Float, var vx: Float, var vy: Float, var vz: Float, val friendly: Boolean) {
     var life = if (friendly) 1.6f else 2.4f
+    /** The disc's spin phase about its own travel axis — set at the throw so no two spin in step. */
+    var spin = 0f
+    /** Range to the tank on the previous frame, for the closest-approach test — see [Game.NEAR_MISS_D]. */
+    var prevD = 999f
+    /** The near miss has been called; a disc whooshes once. */
+    var passed = false
 }
 
 class Spark(var x: Float, var y: Float, var z: Float, var vx: Float, var vy: Float, var vz: Float, var life: Float, val r: Float, val g: Float, val b: Float)
+
+/**
+ * SOMETHING LANDED ON THE SIGHT. A world point the HUD projects each frame and draws a shock ring
+ * around, so the impact stays anchored to where it happened as the head moves. [kind] is what
+ * happened there: the hull took it, the shell took it, or it went past.
+ */
+class Impact(val x: Float, val y: Float, val z: Float, val kind: Int) {
+    var age = 0f
+    companion object {
+        const val HULL = 0
+        const val SHIELD = 1
+        const val NEAR = 2
+        /** How long a ring lives on the glass. */
+        const val LIFE = 0.55f
+    }
+}
 
 /**
  * X3Paranoids — a first-person tank in a maze of light, hunting Recognizers. Head motion aims the
@@ -172,10 +261,115 @@ class Game(val store: SettingsStore, private val host: GameHost) {
          * taken straight down a corridor, hugging the wall, still reads as clear.
          */
         const val FIRE_PAD = 0.6f
-        /** Centre-to-centre range at which a Recognizer is riding the tank down. */
+        /** Centre-to-centre range at which a Recognizer has TOUCHED the tank — the capture trigger. */
         const val RAM_D = 2.3f
-        /** How hard a ram throws the pair apart — spent on the Recognizer first, then on the tank. */
+        /** How hard a contact that cannot become a capture throws the pair apart — spent on the Recognizer first, then on the tank. */
         const val RAM_PUSH = 2.5f
+
+        // ------------------------------------------------------------------ [FACING BEFORE FIRING]
+        /**
+         * A RECOGNIZER MUST BE LOOKING AT YOU BEFORE IT CAN SHOOT YOU, and it has to get there by
+         * turning. The old AI wrote the bearing to the tank straight into the machine's yaw on the
+         * frame it acquired you — a snap — and fired on the same frame if its cooldown allowed,
+         * which from the seat read as a machine shooting without ever having faced you. Now the
+         * cab SWINGS: [TURN_HUNT] radians a second when it is hunting (about 160 degrees a second —
+         * a half-turn takes just over a second), [TURN_PATROL] on the beat (about 115, a machine
+         * on its rounds), and it may only fire once the cab is within [FIRE_ARC] of the tank —
+         * ten degrees — with the shot line clear. The swing is the telegraph. "It is turning
+         * toward me — move" is a thing the player can learn, and a Recognizer that acquires you
+         * side-on gives you most of a second to act on it.
+         *
+         * The servo eases over its last twenty degrees ([TURN_EASE]) rather than stopping dead —
+         * a rate limit that hits its target at full speed reads as a snap in miniature.
+         */
+        const val TURN_HUNT = 2.8f
+        const val TURN_PATROL = 2.0f
+        const val FIRE_ARC = 0.175f
+        const val TURN_EASE = 0.35f
+        /** Range inside which a facing Recognizer with the shot line will throw. */
+        const val FIRE_RANGE = 26f
+        /** A disc passing inside this without landing is a NEAR MISS: it whooshes, and the sight feels it. */
+        const val NEAR_MISS_D = 3.2f
+
+        // ------------------------------------------------------------------ [THE CRUSH]
+        /**
+         * WHAT A RECOGNIZER DOES WHEN IT TOUCHES YOU. It does not bump. It captures, the way the
+         * machines in the film do: it comes down over its target and its two legs fold inward
+         * beneath the bar until the feet meet, closing on whatever is between them. Here that is
+         * the tank, and you are inside it, so the whole sequence is watched from the seat.
+         *
+         * Five beats on the machine's own clock — see [updateCrush]:
+         *  LUNGE   [CRUSH_LUNGE_T]  it rises to [CRUSH_RISE_Y] and slides to directly over the hull
+         *                           while the legs SPLAY a little: the anticipation, the hands opening.
+         *  DROP    [CRUSH_DROP_T]   it falls — accelerating — to [CRUSH_LAND_Y], and the legs swing
+         *                           shut on a cubic so the clamp SNAPS closed at the bottom of the drop.
+         *  LAND                     the hard beat: the slam, the sight kicked inward, static in the
+         *                           periscope — and the OUTCOME, which depends on the shell (below).
+         *  HOLD    [CRUSH_HOLD_T]   clamped, juddering, the servos straining. You can still look —
+         *                           that is the point — and you can still shoot it.
+         *  RELEASE [CRUSH_RELEASE_T] the legs open and it lifts off and backs away, or the shell
+         *                           THROWS it open and away; either way it then reels for
+         *                           [STAGGER_T] and may not capture again for [CRUSH_CD].
+         *
+         * THE SHELL. A crush against a shielded tank costs [CRUSH_CHARGES] = 2 of the shell's three
+         * bands. Not one: a bolt costs one, and the heaviest thing a Recognizer can do to you must
+         * cost more than a bolt or the crush is a bump with a longer animation. Not three: the
+         * machines already PRESS a shielded tank — closer standoff, faster chase — so a shell that
+         * popped on any touch would be a shell that only stops bolts, and the pool would stop being
+         * worth crossing for. Two means a full shell survives exactly one capture with a single
+         * band left, and a shell already touched does not. The tank is untouchable for a beat
+         * longer than a bolt buys ([SHIELD_IFRAME] + [CRUSH_GRACE]) so the thrown machine's
+         * companions cannot land the next one while you are still finding the pad.
+         *
+         * BARE, it is a life, with the full derez if it was the last — and the machine holds its
+         * clamp through the death rather than letting go: the periscope sinks between its legs.
+         */
+        const val CRUSH_LUNGE_T = 0.40f
+        const val CRUSH_DROP_T = 0.30f
+        const val CRUSH_HOLD_T = 0.65f
+        /** The strain before a shell discharges — long enough to wonder whether it will hold. */
+        const val CRUSH_HOLD_SHELL_T = 0.50f
+        const val CRUSH_RELEASE_T = 0.55f
+        const val CRUSH_RISE_Y = 2.55f
+        /** Where the axle sits when landed: the bar at ~2.15, over the periscope; the legs closing at eye height. */
+        const val CRUSH_LAND_Y = 0.12f
+        const val CRUSH_CHARGES = 2
+        const val CRUSH_GRACE = 0.55f
+        const val CRUSH_CD = 3.5f
+        const val STAGGER_T = 1.4f
+        /** How fast the gantry slides over the tank during the lunge, units a second. */
+        const val CRUSH_CLOSE_SPEED = 9f
+        /**
+         * WHERE THE GANTRY LANDS, and why it is not dead over the periscope. Measured on the glasses:
+         * a machine centred exactly on the eye puts its legs 1.35 units to either SIDE of the
+         * camera — ninety degrees off the view axis — and the whole fold happens out of frame while
+         * the sight fills with the bar's strokes crossing overhead. The periscope sits at the back
+         * of the hull; the machine comes down over the FRONT of it, [CRUSH_STAND] short of the eye
+         * along its own approach line, so from the seat the two legs enter from both edges of the
+         * sight and swing shut in the centre of it, at knee height, with the bar across the top.
+         * That is the film's image, seen from inside.
+         */
+        const val CRUSH_STAND = 1.9f
+        /** After the eye first finds you, the disc waits this long: the lock bar and WARNING always precede the first throw. */
+        const val LOCK_DWELL = 0.45f
+        /** How far a released machine backs off over the release, and how far a thrown one is flung. */
+        const val CRUSH_BACK_OFF = 3.6f
+        const val CRUSH_THROW = 5.5f
+        /**
+         * THE CHARGE — when a Recognizer decides to capture rather than shoot. A machine that only
+         * ever stood off at six units would crush you only when you drove into it, and a set piece
+         * nobody sees is not a set piece. So, hunting inside [CHARGE_RANGE] with the line clear, a
+         * Recognizer rolls every [CHARGE_CD] seconds: a [CHARGE_CHANCE] chance to close for
+         * [CHARGE_T] seconds, straight at the hull, faster, no sway. A shielded tank is charged
+         * EVERY time — that is the press: they come and take the Protocol's energy back, and the
+         * crush is how. The charge is readable — the sway stops, the machine grows, the eye stays
+         * on you — and it is also the machine walking into your cannon, which is its cost.
+         */
+        const val CHARGE_RANGE = 11f
+        const val CHARGE_CD = 3.2f
+        const val CHARGE_CHANCE = 0.30f
+        const val CHARGE_T = 2.4f
+        const val CHARGE_SPEED = 1.30f
         /**
          * How fast a thing fades in or out of sight as a wall clears or closes, in units of alpha
          * per second — about a tenth of a second end to end. Fast enough that nothing is ever
@@ -195,27 +389,40 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         // ------------------------------------------------------------------ [THE ENERGY ECONOMY]
         /**
          * PROGRAMS ON THE GRID RUN ON ENERGY. They drink it from pools; starved of it they derez.
-         * The arena hides one ENERGY POOL a wave, and a tank that stands in it long enough to DRAW
-         * comes away wearing a shell of light that takes hits so the hull does not.
-         *
-         * Every number below exists to keep that from switching the threat off.
+         * In the fiction a pool is not a coin, it is a PLACE — somewhere a program goes to be
+         * restored — and that is what it is here: each maze has one, it stands where it stands for
+         * the life of the maze, and a tank that stands in it long enough to DRAW comes away with
+         * its shell of light RESTORED TO FULL. The shell takes hits so the hull does not; the pool
+         * heals it. That is the whole loop, and every number below exists to keep it from switching
+         * the threat off.
          *
          * [SHIELD_MAX] = 3 — one per band of [ShieldModel], so the shell IS the readout. Three is
          * three hits, which is a whole life more than the tank itself carries between deaths, and
          * that is deliberate: a pool has to be worth abandoning a corridor and crossing the arena
          * for, or nobody will ever go and the whole system is decoration.
          *
-         * [SHIELD_IFRAME] = 0.8 s, against the 2.6 s a real hit buys. THIS IS THE BALANCE. Losing a
-         * life makes you briefly untouchable, which is mercy; the shield does not, which is the
-         * price of it. Stand in a Recognizer's fire lane wearing three charges and they are gone in
-         * two and a half seconds — the shell absorbs MISTAKES, it does not license standing still.
+         * [SHIELD_IFRAME] against the 2.6 s a real hit buys. THIS IS THE BALANCE. Losing a life
+         * makes you briefly untouchable, which is mercy; the shield does not, which is the price
+         * of it. Stand in a Recognizer's fire lane wearing three charges and they are gone in a
+         * few seconds — the shell absorbs MISTAKES, it does not license standing still.
          *
-         * NO REGENERATION, and no stacking past the cap: drawing again while shielded TOPS UP to
-         * three rather than adding. Energy that came back on its own would stop being worth
-         * crossing for, and energy that banked would let a careful player walk into wave six with
-         * six charges — flattening the difficulty curve at exactly the point it is supposed to bite.
-         * Charges DO survive a wave boundary, because taking them off you for clearing a wave would
-         * be a punishment for winning.
+         * THE SHELL NEVER REGENERATES ON ITS OWN, and never stacks past the cap: drawing again
+         * while shielded RESTORES to three rather than adding. Energy that came back by itself
+         * would stop being worth crossing for, and energy that banked would let a careful player
+         * walk into wave six with six charges — flattening the difficulty curve at exactly the
+         * point it is supposed to bite. Charges DO survive a wave boundary, because taking them
+         * off you for clearing a wave would be a punishment for winning.
+         *
+         * THE POOL IS PERSISTENT, AND IT REFILLS — SLOWLY. A draw drains it (the column collapses)
+         * and it takes [POOL_REFILL_T] seconds to stand again; until then standing in it does
+         * nothing, and the column climbing back is the only progress bar. This is what makes it a
+         * place rather than a pickup: a corner of the maze you LEARN, and can retreat to when the
+         * wave has stripped you — at the cost of crossing the arena to it, standing still in a
+         * known spot for [POOL_DRAW_T] while the machines BFS to your cell, and coming out of it
+         * shielded, which is exactly the state the machines PRESS (below). Twenty-odd seconds is
+         * set against how long a wave runs: a pool that refilled inside a firefight would be a
+         * regenerator with extra steps; one that refills once or twice a wave is a decision.
+         * A full shell does not drink: the pool holds its energy for when it is needed.
          *
          * [POOL_DRAW_T] = 0.9 s of continuous presence. A pickup you drive over is a coin; a pool
          * you have to STAND IN while the machines close is a decision, and it is also the image the
@@ -226,7 +433,8 @@ class Game(val store: SettingsStore, private val host: GameHost) {
          * The pool is scored at ZERO on purpose. The Bit is points and a life; the pool is survival.
          * Pay for both in the same currency and the choice between them collapses into "take the
          * Bit first, then the pool" — priced differently, they pull you two ways at once, which is
-         * the only reason to have two objectives in one arena.
+         * the only reason to have two objectives in one arena. The Bit is placed far from the pool
+         * each wave for the same reason: no one route sweeps them both.
          */
         const val SHIELD_MAX = ShieldModel.BANDS
         /** The shell's radius about the hull: outside the tank, inside the cannon's reach. */
@@ -256,6 +464,8 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         const val POOL_DRAW_DECAY = 1.5f
         /** Seconds between the pool's climbing "pull" blips while you drink. */
         const val POOL_SIP_T = 0.3f
+        /** Seconds for a drained pool to stand again — see [THE ENERGY ECONOMY]. */
+        const val POOL_REFILL_T = 24f
         /**
          * THE MACHINES PRESS A SHIELDED TANK. Standing off six units is what a Recognizer does to
          * something it can kill from there; a program carrying the Protocol's own energy gets
@@ -347,7 +557,7 @@ class Game(val store: SettingsStore, private val host: GameHost) {
      * the settings menu stays strictly one-swipe-one-step: off the arena, a held pad is classified
      * the old way — once, on finger-up — so a hold cannot walk the menu.
      */
-    val holdDriveArmed: Boolean get() = state == State.PLAY && !menuOpen
+    val holdDriveArmed: Boolean get() = state == State.PLAY && !menuOpen && !caught
     var lives = 3; private set
     var score = 0; private set
     var wave = 0; private set
@@ -359,8 +569,31 @@ class Game(val store: SettingsStore, private val host: GameHost) {
     var kills = 0; private set
     var waveTotal = 0; private set
     val recognizersLeft get() = recognizers.count { it.hp > 0 }
+    /** Some Recognizer is FACING you with the shot line — it can throw now. WARNING, and the brackets go red. */
     var lockedOn = false; private set
+    /** Some Recognizer has the shot line and is still bringing its cab round — TRACKING. Move. */
+    var tracking = false; private set
     var bonusText = ""; private set
+
+    // ------------------------------------------------------------------ the sight, reacting
+    /**
+     * THE TANK IS HELD. Volatile because the input thread reads it through [holdDriveArmed]: a
+     * finger on the pad while the legs are closing must not drive, and the classifier has to know
+     * that on the ACTION_MOVE, not a frame later. [crusher] is the machine doing it.
+     */
+    @Volatile var caught = false; private set
+    var crusher: Recognizer? = null; private set
+    /** Periscope judder from the crush — the lunge, the landing, the strain — on top of the damage shake. */
+    var crushShake = 0f; private set
+    /**
+     * The sight's brackets KICKED: positive is a punch outward (something landed on the glass),
+     * negative is the clamp closing in. Decays fast; the renderer displaces the brackets by it.
+     */
+    var sightKick = 0f; private set
+    /** Seconds of static left in the periscope after a hull hit. */
+    var staticT = 0f; private set
+    /** Rings on the glass — see [Impact]. Drained by age. */
+    val impacts = ArrayList<Impact>()
 
     val recognizers = ArrayList<Recognizer>()
     val shots = ArrayList<Shot>()
@@ -383,6 +616,12 @@ class Game(val store: SettingsStore, private val host: GameHost) {
     var poolDraw = 0f; private set
     /** 1 → 0 while a drained pool folds itself away — the renderer's collapse. */
     var poolCollapse = 0f; private set
+    /** 0 drained … 1 standing. The column's height, and whether a draw is possible at all. */
+    var poolLevel = 0f; private set
+    /** The tank is in the pool and there is nothing to restore — the HUD says so rather than staying mute. */
+    var poolFullHint = false; private set
+    /** Which maze the pool was placed in — it is a feature of the maze, placed once per maze. */
+    private var poolMaze: Maze? = null
     private var poolSipCd = 0f
     /** Charges left on the shell, 0 … [SHIELD_MAX]. The one number the whole system is about. */
     var shield = 0; private set
@@ -431,6 +670,7 @@ class Game(val store: SettingsStore, private val host: GameHost) {
     private val rng = Random(System.nanoTime())
     private val rnd: () -> Float = { rng.nextFloat() }
     private val tmp = FloatArray(2)
+    private val tmp3 = FloatArray(3)
     private var lastKillSay = -99f
     private var humLevel = 0f
 
@@ -560,6 +800,8 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         state = State.TITLE; stateT = 0f
         recognizers.clear(); shots.clear(); sparks.clear(); derezzes.clear(); bitActive = false
         deathSink = 0f
+        releasePlayer(); impacts.clear(); crushShake = 0f; sightKick = 0f; staticT = 0f
+        poolActive = false; poolMaze = null
         clearCues()
         host.stopHero(); host.stopVoice()
         val plan = composeAttract()
@@ -676,6 +918,9 @@ class Game(val store: SettingsStore, private val host: GameHost) {
     fun swipe(dir: Swipe) {
         if (menuOpen) { menuSwipe(dir); return }
         if (state != State.PLAY) return
+        // CLAMPED. The hull is between a Recognizer's legs; the pad does nothing to it until they
+        // open. The periscope still looks, the cannon still fires — see [updateCrush].
+        if (caught) return
         val fx = sin(yaw); val fz = -cos(yaw)
         when (dir) {
             Swipe.UP -> impulse(fx, fz)
@@ -803,6 +1048,9 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         lastKillT = -99f; lastKillSay = -99f
         hitsRecent = 0; lastHitT = -99f; bitNearSaid = false; bitChirpCd = 1.4f; bitNoCd = 0f
         shield = 0; shieldFlash = 0f; poolActive = false; poolDraw = 0f; poolCollapse = 0f; poolVis = 0f
+        poolLevel = 0f; poolMaze = null; poolFullHint = false
+        releasePlayer(); impacts.clear(); crushShake = 0f; sightKick = 0f; staticT = 0f
+        lockedOn = false; tracking = false
         store.games = store.games + 1
         placePlayer(maze.cols / 2, maze.rows / 2)
         host.recentreHead()
@@ -812,10 +1060,35 @@ class Game(val store: SettingsStore, private val host: GameHost) {
 
     private fun placePlayer(c: Int, r: Int) { px = maze.cellX(c); pz = maze.cellZ(r); vx = 0f; vz = 0f }
 
+    /**
+     * DEBUGGABLE BUILDS ONLY (MainActivity gates it): start a game at [atWave] wearing [withShield]
+     * charges — `am start -n com.x3paranoids/.MainActivity --ei wave 2 --ei shield 3`. It exists
+     * because the things worth verifying on the glasses — the pool, a shielded capture, wave-six
+     * armour — live several minutes of play past the title, and a hull that turns in quarter
+     * steps cannot be driven there over adb in any reasonable time. It goes through [startGame]
+     * and [nextWave] exactly as a played game does; only the counter is advanced first.
+     */
+    fun debugStart(atWave: Int, withShield: Int, atPool: Boolean = false) {
+        if (state != State.TITLE) return
+        startGame()
+        if (atWave > 1) { wave = atWave - 1; nextWave() }
+        shield = withShield.coerceIn(0, SHIELD_MAX)
+        // [atPool] stands the tank in the pool's cell, a few units short of the rings, facing them
+        if (atPool && poolActive) {
+            placePlayer(maze.colOf(poolX), maze.rowOf(poolZ))
+            maze.move(px, pz, 0f, 3.2f, PLAYER_R, tmp); px = tmp[0]; pz = tmp[1]
+            hullYaw = 0f; hullTarget = 0f
+        }
+        android.util.Log.i("X3Paranoids", "DEBUG start wave=$wave shield=$shield atPool=$atPool p=(%.1f,%.1f)".format(px, pz))
+    }
+
     private fun nextWave() {
         wave++
         state = State.PLAY; stateT = 0f
         shots.clear(); recognizers.clear()
+        // a machine that was holding you when the wave rolled over (it cannot: the crusher is the
+        // last thing alive, and a dead crusher releases) — belt and braces, the clamp opens
+        releasePlayer()
         if (wave > 1 && (wave - 1) % 3 == 0) { mazeSeed += 7919L; maze = Maze(8, 8, mazeSeed); placePlayer(maze.cols / 2, maze.rows / 2) }
         val hard = store.difficulty == 1
         val n = min(2 + wave, 9)
@@ -840,33 +1113,46 @@ class Game(val store: SettingsStore, private val host: GameHost) {
             rec.fireCd = 2f + rng.nextFloat() * 2f
             recognizers += rec
         }
-        // the Bit hides somewhere far
-        val bitCells = far.filter { dist[it[0]][it[1]] >= 3 }
-        val bc = if (bitCells.isNotEmpty()) bitCells[rng.nextInt(bitCells.size)] else far[0]
-        bitX = maze.cellX(bc[0]); bitZ = maze.cellZ(bc[1]); bitActive = true; bitT = 0f
-        bitNearSaid = false; bitChirpCd = 2.2f; bitNoCd = 3f
-        // THE POOL GOES AS FAR FROM THE BIT AS THE MAZE ALLOWS, and that placement is the whole
-        // reason there are two objectives. Both are already far from the player; putting the pool
-        // at the cell of maximum BFS distance FROM THE BIT means no single route sweeps them both,
-        // so every wave asks the same question — energy first and hunt the Bit shielded, or the Bit
-        // first and take the wave bare. The player's own distance only breaks ties.
+        // THE POOL IS A FEATURE OF THE MAZE — placed once when the maze is, at the cell furthest by
+        // BFS from where the tank stands, and left there for the life of the maze so it is a place
+        // you learn and can go back to (see [THE ENERGY ECONOMY]). It refills on its own clock, so
+        // whatever it held at the end of the last wave it still holds now.
         //
         // NOT ON WAVE ONE. Wave one is where the game teaches the base loop, and a second cyan
         // objective in the arena the first time you are ever in it competes with FIND THE BIT for
         // the one thing a new player has none of. From wave two the shell is a thing you have
-        // already wanted once.
-        poolActive = false; poolDraw = 0f; poolCollapse = 0f; poolT = 0f; poolVis = 0f; poolSipCd = 0f
-        if (wave >= 2) {
-            val fromBit = maze.distances(bc[0], bc[1])
+        // already wanted once — and the pool stands, full, from then on.
+        poolDraw = 0f; poolSipCd = 0f; poolFullHint = false
+        if (wave >= 2 && poolMaze !== maze) {
+            var best: IntArray? = null; var bestD = -1
+            for (cell in far) { val dd = dist[cell[0]][cell[1]]; if (dd > bestD) { bestD = dd; best = cell } }
+            best?.let {
+                poolX = maze.cellX(it[0]); poolZ = maze.cellZ(it[1])
+                poolActive = true; poolLevel = 1f; poolCollapse = 0f; poolT = 0f; poolVis = 0f
+                poolMaze = maze
+            }
+        }
+        // THE BIT GOES AS FAR FROM THE POOL AS THE MAZE ALLOWS, and that placement is the whole
+        // reason there are two objectives. Both are already far from the player; putting the Bit
+        // at the cell of maximum BFS distance FROM THE POOL means no single route sweeps them both,
+        // so every wave asks the same question — energy first and hunt the Bit shielded, or the Bit
+        // first and take the wave bare. The player's own distance only breaks ties. Before the pool
+        // exists (wave one) the Bit simply hides somewhere far.
+        val bitCells = far.filter { dist[it[0]][it[1]] >= 3 }
+        var bc = if (bitCells.isNotEmpty()) bitCells[rng.nextInt(bitCells.size)] else far[0]
+        if (poolActive) {
+            val fromPool = maze.distances(maze.colOf(poolX), maze.rowOf(poolZ))
             var best: IntArray? = null; var bestScore = -1
-            for (cell in far) {
-                val db = fromBit[cell[0]][cell[1]]
-                if (db < 3) continue
-                val sc = db * 16 + dist[cell[0]][cell[1]]
+            for (cell in bitCells) {
+                val dp = fromPool[cell[0]][cell[1]]
+                if (dp < 3) continue
+                val sc = dp * 16 + dist[cell[0]][cell[1]] + rng.nextInt(6)
                 if (sc > bestScore) { bestScore = sc; best = cell }
             }
-            best?.let { poolX = maze.cellX(it[0]); poolZ = maze.cellZ(it[1]); poolActive = true }
+            best?.let { bc = it }
         }
+        bitX = maze.cellX(bc[0]); bitZ = maze.cellZ(bc[1]); bitActive = true; bitT = 0f
+        bitNearSaid = false; bitChirpCd = 2.2f; bitNoCd = 3f
         host.sfx(com.x3paranoids.audio.Sfx.WAVE)
         val waveId = if (wave <= 12) "wave_$wave" else "wave_more"
         host.say(waveId, urgent = true)
@@ -899,11 +1185,10 @@ class Game(val store: SettingsStore, private val host: GameHost) {
             bitActive = false
             cue(after("wave_clear") - 0.15f) { host.sfx(com.x3paranoids.audio.Sfx.BIT_LOSE, 1f, 0.75f) }
         }
-        // An untaken pool just closes with the wave, silently. The Bit's "you never came" is a
-        // character having an opinion about you and it only works once per clear; a second lament
-        // stacked behind it would blunt the one that means something. Charges already drawn STAY —
-        // see [THE ENERGY ECONOMY].
-        poolActive = false; poolDraw = 0f
+        // THE POOL STAYS. It is a feature of the maze, not of the wave; it keeps refilling through
+        // the clear and is there for the next one. Only a draw in progress is abandoned. Charges
+        // already drawn STAY — see [THE ENERGY ECONOMY].
+        poolDraw = 0f
         // The pilot answers the clear; failing that, it sometimes just thinks out loud in the quiet.
         val at = after("wave_clear")
         pilot("hero_wave_clear", gap = 5f, cd = 40f, chance = 0.70f, delay = at, patience = 4000L) ||
@@ -918,8 +1203,11 @@ class Game(val store: SettingsStore, private val host: GameHost) {
      * there". Defaulting to the tank's own position gives a hit no direction, and the shell simply
      * flares evenly, which is the honest thing to draw when nothing knows better.
      */
-    private fun damagePlayer(srcX: Float = px, srcZ: Float = pz, srcY: Float = EYE_H) {
-        if (invuln > 0f || state != State.PLAY) return
+    private fun damagePlayer(srcX: Float = px, srcZ: Float = pz, srcY: Float = EYE_H, force: Boolean = false) {
+        // [force] is the crush landing: a capture only ever BEGINS on a tank with no grace left,
+        // and nothing else can touch a held tank, so this is belt and braces — the landing beat
+        // must never be a beat on which nothing happened.
+        if ((invuln > 0f && !force) || state != State.PLAY) return
         // THE SHELL EATS IT FIRST, and buys only [SHIELD_IFRAME] of grace rather than the 2.6 s a
         // real hit does. That asymmetry is the whole economy: the shield stops you dying for a
         // mistake, it does not stop you being under fire.
@@ -1027,6 +1315,18 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         // to you, and it must not read like one that did.
         shieldFlash = max(0f, shieldFlash - dt * 2.6f)
         poolCollapse = max(0f, poolCollapse - dt * 1.7f)
+        // The sight's own reactions. The kick is a spring — it lands hard and is gone inside a
+        // quarter of a second — and the crush judder is held up by the hold itself (see
+        // updateCrush), so what decays here is only the tail after the legs open.
+        sightKick *= exp(-dt / 0.13f)
+        if (abs(sightKick) < 0.01f) sightKick = 0f
+        crushShake *= exp(-dt / 0.18f)
+        if (crushShake < 0.005f) crushShake = 0f
+        staticT = max(0f, staticT - dt)
+        if (impacts.isNotEmpty()) {
+            val ii = impacts.iterator()
+            while (ii.hasNext()) { val im = ii.next(); im.age += dt; if (im.age > Impact.LIFE) ii.remove() }
+        }
         runCues(dt)
         // Derez runs outside the state machine: a machine that broke apart a moment before the wave
         // cleared, or the tank's own hull leaving the seat, has to finish falling wherever it is.
@@ -1074,6 +1374,10 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         // looking are the same ray, and a cruise that ran down a second, different forward would be
         // a lie the minimap could not draw. Look off-axis while cruising and you lean on the
         // corridor wall, which the slide below turns into a graze rather than a stop.
+        // HELD. Between a Recognizer's legs the hull goes nowhere: no thrust, no coasting, and a
+        // pad still down is dropped so that letting go and pressing again after the release is a
+        // fresh, deliberate drive rather than a stale one resuming.
+        if (caught) { driveEnd("caught"); vx = 0f; vz = 0f }
         if (driveDir != 0) {
             driveT += dt
             val a = DRIVE_ACCEL * (DRIVE_FLOOR + (1f - DRIVE_FLOOR) * min(1f, driveT / DRIVE_RAMP)) * driveDir
@@ -1158,13 +1462,25 @@ class Game(val store: SettingsStore, private val host: GameHost) {
      * unit pool in half a second, so a draw genuinely has to be committed to, not driven through.
      */
     private fun updatePool(dt: Float) {
+        poolFullHint = false
         if (!poolActive) { poolDraw = max(0f, poolDraw - dt * 3f); return }
         poolT += dt
         val seen = maze.lineOfSight(poolX, poolZ, px, pz)
         val step = dt * VIS_RATE
         poolVis = if (seen) min(1f, poolVis + step) else max(0f, poolVis - step)
         poolSipCd = max(0f, poolSipCd - dt)
-        if (hypot(px - poolX, pz - poolZ) < POOL_R) {
+        // THE REFILL, on its own clock — through a fight, through a wave clear, whether or not
+        // anyone is watching. The moment it stands again is worth one quiet blip: a player
+        // fighting at the far end of the maze learns the retreat is open without looking at the
+        // plate. Quiet, and only ever while the tank is in play; the pool is seen and not heard.
+        if (poolLevel < 1f) {
+            poolLevel = min(1f, poolLevel + dt / POOL_REFILL_T)
+            if (poolLevel >= 1f && state == State.PLAY) host.sfx(com.x3paranoids.audio.Sfx.POOL_SIP, 1.45f, 0.30f)
+        }
+        val inPool = hypot(px - poolX, pz - poolZ) < POOL_R
+        val ready = poolLevel >= 1f
+        if (inPool && ready && shield >= SHIELD_MAX) poolFullHint = true
+        if (inPool && ready && shield < SHIELD_MAX && state == State.PLAY) {
             poolDraw = min(1f, poolDraw + dt / POOL_DRAW_T)
             // one climbing blip per POOL_SIP_T of dwell — it stops dead when you step out, which a
             // single long clip started on entry could not do
@@ -1173,10 +1489,13 @@ class Game(val store: SettingsStore, private val host: GameHost) {
                 host.sfx(com.x3paranoids.audio.Sfx.POOL_SIP, 0.85f + 0.55f * poolDraw, 0.55f)
             }
             if (poolDraw >= 1f) {
+                // RESTORED. The shell comes back to full, whatever it had; the pool is spent and
+                // folds away, and starts the long climb back. The place stays.
                 val topUp = shield > 0
-                poolActive = false; poolDraw = 0f; poolCollapse = 1f
+                poolDraw = 0f; poolCollapse = 1f; poolLevel = 0f
                 burst(poolX, 1.2f, poolZ, 26, 0.55f, 0.95f, 1f)
                 onShieldUp(topUp)
+                android.util.Log.i("X3Paranoids", "POOL drawn: shield=%d (topUp=%b) refill in %.0fs".format(shield, topUp, POOL_REFILL_T))
             }
         } else {
             poolDraw = max(0f, poolDraw - dt * POOL_DRAW_DECAY / POOL_DRAW_T)
@@ -1190,13 +1509,15 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         /** The tank is wearing the Protocol's energy — see [PRESS_STANDOFF]. They come and take it back. */
         val pressed = hostile && shield > 0 && state == State.PLAY
         var nearest = 999f
-        lockedOn = false
+        lockedOn = false; tracking = false
         val it = recognizers.iterator()
         while (it.hasNext()) {
             val r = it.next()
             if (r.hp <= 0) { it.remove(); continue }
             r.hitFlash = max(0f, r.hitFlash - dt * 6f)
-            r.y = 1.6f + 0.3f * sin(time * 2.1f + r.phase)
+            r.crushCd = max(0f, r.crushCd - dt)
+            r.stagger = max(0f, r.stagger - dt)
+            val bobY = 1.6f + 0.3f * sin(time * 2.1f + r.phase)
             val ddx = px - r.x; val ddz = pz - r.z
             val d = hypot(ddx, ddz)
             nearest = min(nearest, d)
@@ -1204,9 +1525,9 @@ class Game(val store: SettingsStore, private val host: GameHost) {
             // the wall occlusion for entities. Three samples across the machine's own width — axle
             // and both ends of the cross-bar in its current heading — because it is 3.7 units wide
             // and a test on the axle alone would blink the thing out while a third of it is still
-            // round the corner in plain sight. The local +x axis maps to world (cos yaw, -sin yaw),
-            // matching GLRenderer.buildRecognizer exactly, so the samples sit on the drawn bar.
-            val ec = cos(r.yaw) * Recognizer.HALF_W; val es = -sin(r.yaw) * Recognizer.HALF_W
+            // round the corner in plain sight. The local +x axis maps to world (cos yaw, sin yaw)
+            // — RecognizerModel.toWorld, the one transform — so the samples sit on the drawn bar.
+            val ec = cos(r.yaw) * Recognizer.HALF_W; val es = sin(r.yaw) * Recognizer.HALF_W
             val seen = maze.lineOfSight(r.x, r.z, px, pz) ||
                 maze.lineOfSight(r.x + ec, r.z + es, px, pz) ||
                 maze.lineOfSight(r.x - ec, r.z - es, px, pz)
@@ -1216,51 +1537,102 @@ class Game(val store: SettingsStore, private val host: GameHost) {
             if (los) r.seenT = time
             // SEEING YOU AND HAVING THE SHOT ARE TWO DIFFERENT TESTS. Sight is measured axle to
             // axle, so a Recognizer whose body is still mostly behind a corner has a centre that
-            // can already see round it — and a bolt fired from there leaves the barrel inside the
+            // can already see round it — and a disc thrown from there leaves the eye inside the
             // wall and reads, fairly, as shooting through it. The shot gate re-runs the same test
             // with every wall grown by [FIRE_PAD], so it must be genuinely clear of the corner
             // before it will take the shot, while it still hunts you the moment it spots you.
             val fireLos = los && maze.lineOfSight(r.x, r.z, px, pz, FIRE_PAD)
-            // The plate's spur and the WARNING both mean "this one can shoot you NOW", so they read
-            // the shot gate, not the sight gate. Stepping behind a wall must visibly switch them off.
+            // The plate's spur means "this one has the shot line" — it is bright once it is also
+            // FACING you (see below), dim while it is still bringing its cab round. Stepping
+            // behind a wall must visibly switch it off.
             r.hasLos = hostile && fireLos
             val chasing = hostile && (los || time - r.seenT < 5f)
             r.hunting = chasing
             r.alert += ((if (chasing) 1f else 0f) - r.alert) * (1f - exp(-dt / 0.45f))
+            // THE CRUSH OWNS THE MACHINE while it runs: no hunting, no patrol, no throwing. It has
+            // its own clock and its own outcome — see [updateCrush].
+            if (r.crush != Recognizer.CRUSH_NONE) {
+                r.facing = false; r.aimErr = 0f
+                r.lock = max(0f, r.lock - dt * 4f)
+                updateCrush(r, dt)
+                continue
+            }
+            // Off the clamp the hover eases back to its bob (a thrown machine comes down out of
+            // the air on this), and any fold left in the legs relaxes out.
+            r.y += (bobY - r.y) * (1f - exp(-dt / 0.28f))
+            if (r.fold != 0f) { r.fold *= exp(-dt / 0.22f); if (abs(r.fold) < 0.005f) r.fold = 0f }
             var mx = 0f; var mz = 0f
+            var canFire = false
             if (chasing && los) {
-                // stand off at ~6 u — or close to four and strip the shell, if there is one
+                // stand off at ~6 u — or close to four and strip the shell, if there is one. A
+                // machine REELING from a release does neither: it drifts back and wanders.
+                val reeling = r.stagger > 0f
+                // THE CHARGE — see [CHARGE_RANGE]. Decided on a clock, not a frame, so it is a
+                // choice the machine visibly makes and holds.
+                r.charge = max(0f, r.charge - dt); r.chargeCd = max(0f, r.chargeCd - dt)
+                if (hostile && !reeling && r.charge <= 0f && r.chargeCd <= 0f && d < CHARGE_RANGE && fireLos && r.crushCd <= 0f) {
+                    r.chargeCd = CHARGE_CD
+                    if (pressed || rng.nextFloat() < CHARGE_CHANCE) {
+                        r.charge = CHARGE_T
+                        android.util.Log.i("X3Paranoids", "CHARGE d=%.1f pressed=%b".format(d, pressed))
+                    }
+                }
+                r.noLineT = if (fireLos) 0f else r.noLineT + dt
+                val closing = r.noLineT > 0.8f && !reeling
+                val charging = r.charge > 0f || closing
                 val want = if (pressed) PRESS_STANDOFF else 6f
-                val towards = if (d > want + 1f) 1f else if (d < want - 1.5f) -0.6f else 0f
+                val towards = if (reeling) -0.45f else if (charging) 1f else if (d > want + 1f) 1f else if (d < want - 1.5f) -0.6f else 0f
                 val nx = ddx / max(d, 0.01f); val nz = ddz / max(d, 0.01f)
-                val side = sin(time * 0.7f + r.phase)
+                val side = if (reeling || charging) 0f else sin(time * 0.7f + r.phase)
                 mx = nx * towards + (-nz) * side * 0.5f
                 mz = nz * towards + nx * side * 0.5f
-                r.yaw = atan2(ddx, -ddz)
+                // WEDGED ON A CORNER — see [Recognizer.stuckT]: walk the maze toward you instead
+                r.reroute = max(0f, r.reroute - dt)
+                if (r.reroute > 0f && towards > 0f) {
+                    val step = maze.stepToward(maze.colOf(r.x), maze.rowOf(r.z), maze.colOf(px), maze.rowOf(pz))
+                    if (step != null) {
+                        val dx = maze.cellX(step[0]) - r.x; val dz = maze.cellZ(step[1]) - r.z
+                        val l = hypot(dx, dz).coerceAtLeast(0.01f)
+                        mx = dx / l; mz = dz / l
+                    }
+                }
+                // THE TURN TO FACE — see [FACING BEFORE FIRING]. The bearing is a target the cab
+                // swings toward at a rate, not a value it is set to; a reeling machine's target
+                // wanders off the tank and it turns at less than half speed.
+                var target = atan2(ddx, -ddz)
+                if (reeling) target += 0.9f * sin(time * 5.3f + r.reel) * (r.stagger / STAGGER_T)
+                r.aimErr = turnToward(r, target, if (reeling) TURN_HUNT * 0.4f else TURN_HUNT, dt)
+                r.facing = r.aimErr < FIRE_ARC && fireLos && !reeling
                 if (hostile) {
                     r.fireCd -= dt
-                    if (r.fireCd <= 0f && d < 26f && fireLos) {
-                        // The press multiplies the SETTLED cooldown rather than the raw one, so it
-                        // is a real 30% more fire at every wave instead of being swallowed by the
-                        // floor once the wave scaling has already reached it.
-                        r.fireCd = (2.6f - 0.15f * wave - (if (hard) 0.5f else 0f)).coerceAtLeast(1.1f) *
-                            (if (pressed) PRESS_FIRE else 1f)
-                        val spread = (0.10f - 0.008f * wave).coerceAtLeast(0.03f)
-                        val aimX = px + (rng.nextFloat() - 0.5f) * spread * d
-                        val aimZ = pz + (rng.nextFloat() - 0.5f) * spread * d
-                        val ax = aimX - r.x; val ay = EYE_H - 0.2f - (r.y + 0.8f); val az = aimZ - r.z
-                        val al = sqrt(ax * ax + ay * ay + az * az).coerceAtLeast(0.01f)
-                        shots += Shot(r.x, r.y + 0.8f, r.z, ax / al * BOLT_SPEED, ay / al * BOLT_SPEED, az / al * BOLT_SPEED, false)
-                        host.sfx(com.x3paranoids.audio.Sfx.ENEMY_FIRE, 0.9f + rng.nextFloat() * 0.2f, (1f - d / 40f).coerceIn(0.3f, 1f))
-                    }
-                    if (d < 20f && fireLos) {
+                    canFire = r.facing && d < FIRE_RANGE
+                    if (canFire) {
                         lockedOn = true
-                        if (!r.lockSaid) { r.lockSaid = true; host.sfx(com.x3paranoids.audio.Sfx.LOCK, 1f, 0.7f); if (time - lastKillSay > 3f) host.say("lockon") }
+                        // THE LOCK is the moment it is looking at you with the line clear — the
+                        // sting and WARNING fire on that beat, which is the beat before the throw.
+                        if (!r.lockSaid) {
+                            r.lockSaid = true; host.sfx(com.x3paranoids.audio.Sfx.LOCK, 1f, 0.7f)
+                            if (time - lastKillSay > 3f) host.say("lockon")
+                            // the eye finds you, THEN the disc: never both on one frame
+                            r.fireCd = max(r.fireCd, LOCK_DWELL)
+                            android.util.Log.i("X3Paranoids", "LOCK d=%.1f aimErr=%.1f deg".format(d, r.aimErr * 57.2958f))
+                        }
+                        if (r.fireCd <= 0f) {
+                            // The press multiplies the SETTLED cooldown rather than the raw one, so it
+                            // is a real 30% more fire at every wave instead of being swallowed by the
+                            // floor once the wave scaling has already reached it.
+                            r.fireCd = (2.6f - 0.15f * wave - (if (hard) 0.5f else 0f)).coerceAtLeast(1.1f) *
+                                (if (pressed) PRESS_FIRE else 1f)
+                            throwDisc(r, d)
+                        }
+                    } else if (fireLos && d < FIRE_RANGE && !reeling) {
+                        // it has the line and is bringing the eye round: the beat to move on
+                        tracking = true
                     }
                 }
             } else {
                 // patrol the corridors by cell; a chaser that lost sight paths to the tank's last cell
-                r.lockSaid = false
+                r.aimErr = 0f; r.facing = false
                 val c = maze.colOf(r.x); val rr = maze.rowOf(r.z)
                 if (chasing) { r.targetC = maze.colOf(px); r.targetR = maze.rowOf(pz) }
                 if (r.targetC < 0 || (c == r.targetC && rr == r.targetR)) { r.targetC = rng.nextInt(maze.cols); r.targetR = rng.nextInt(maze.rows) }
@@ -1269,40 +1641,33 @@ class Game(val store: SettingsStore, private val host: GameHost) {
                     val tx = maze.cellX(step[0]); val tz = maze.cellZ(step[1])
                     val dx = tx - r.x; val dz = tz - r.z; val l = hypot(dx, dz).coerceAtLeast(0.01f)
                     mx = dx / l; mz = dz / l
-                    r.yaw = atan2(dx, -dz)
+                    turnToward(r, atan2(dx, -dz), TURN_PATROL, dt)
                 } else { r.targetC = -1 }
             }
-            val sp = speedBase * (if (chasing) (if (pressed) PRESS_SPEED else 1.15f) else 0.8f)
+            // the lock sting re-arms once the shot line is lost, not merely when the eye drifts
+            // off you for a frame — a machine tracking a dodging tank does not sting on every arc
+            if (!fireLos) r.lockSaid = false
+            r.lock += ((if (canFire) 1f else 0f) - r.lock) * (1f - exp(-dt / (if (canFire) 0.07f else 0.20f)))
+            val sp = speedBase * (if (chasing) (if (pressed) PRESS_SPEED else 1.15f) else 0.8f) *
+                (if (r.stagger > 0f) 0.7f else if (r.charge > 0f) CHARGE_SPEED else 1f)
             if (mx != 0f || mz != 0f) {
+                val ox = r.x; val oz = r.z
                 maze.move(r.x, r.z, mx * sp * dt, mz * sp * dt, Recognizer.RADIUS, tmp); r.x = tmp[0]; r.z = tmp[1]
+                // did the step go anywhere? A chase pressing on a wall corner accumulates here.
+                val wanted = sp * dt * hypot(mx, mz)
+                if (chasing && los && r.reroute <= 0f && wanted > 1e-4f && hypot(r.x - ox, r.z - oz) < 0.3f * wanted) {
+                    r.stuckT += dt
+                    if (r.stuckT > 0.45f) { r.stuckT = 0f; r.reroute = 2f; android.util.Log.i("X3Paranoids", "REROUTE d=%.1f".format(d)) }
+                } else r.stuckT = 0f
             }
-            // RAMMING. The recoil used to be written straight into r.x/r.z — a raw 2.5-unit
-            // displacement with no collision test at all, which is a teleport: ram the tank with a
-            // wall at your back and the recoil put the Recognizer through that wall and out the far
-            // side. It goes through maze.move now, like every other metre this thing travels.
-            //
-            // But clipping the shove is only half of it, because this runs on EVERY frame the two
-            // are touching, not once per hit. Clipped and left there, a Recognizer shoved straight
-            // into a wall simply does not move — so it stands inside the tank and takes another life
-            // every time the invulnerability lapses. So the shove SEPARATES the pair instead of
-            // displacing one of them: the Recognizer gives way first, and whatever of the push a
-            // wall behind it refuses is spent driving the TANK back by the remainder. Both halves go
-            // through maze.move, so the two always come apart and neither travels through a wall to
-            // do it. The direction is taken fresh from where the Recognizer stands NOW, not from the
-            // (ddx, ddz) measured before this frame's step, so the shove is along the line you see.
-            if (hostile && d < RAM_D && state == State.PLAY) {
-                damagePlayer(r.x, r.z, r.y + 0.8f)
-                val bx = r.x - px; val bz = r.z - pz
-                val bl = hypot(bx, bz).coerceAtLeast(0.01f)
-                val ux = bx / bl; val uz = bz / bl
-                maze.move(r.x, r.z, ux * RAM_PUSH, uz * RAM_PUSH, Recognizer.RADIUS, tmp)
-                val gave = hypot(tmp[0] - r.x, tmp[1] - r.z)
-                r.x = tmp[0]; r.z = tmp[1]
-                val rest = RAM_PUSH - gave
-                if (rest > 0.01f) {
-                    maze.move(px, pz, -ux * rest, -uz * rest, PLAYER_R, tmp)
-                    px = tmp[0]; pz = tmp[1]
-                }
+            // CONTACT. A Recognizer that touches the tank CAPTURES it — see [THE CRUSH] — unless
+            // the tank is inside a grace window, another machine already has it, or this one is
+            // still recovering from its last capture. Those cases fall back to the old separating
+            // shove, so a machine can never stand inside the hull waiting for the grace to lapse.
+            val d2 = hypot(px - r.x, pz - r.z)
+            if (hostile && d2 < RAM_D && state == State.PLAY) {
+                if (!caught && crusher == null && invuln <= 0f && r.crushCd <= 0f && r.stagger <= 0f) beginCrush(r)
+                else shove(r)
             }
         }
         // hover hum follows the nearest Recognizer
@@ -1328,6 +1693,12 @@ class Game(val store: SettingsStore, private val host: GameHost) {
                     if (r.hp <= 0) {
                         kills++
                         score += 100 * wave * (if (hard) 3 else 2) / 2
+                        // SHOT WHILE IT HAD YOU. The clamp is broken with the machine: the tank is
+                        // let go on this frame, and the derez below carries the fold it died in.
+                        if (r.crush != Recognizer.CRUSH_NONE) {
+                            android.util.Log.i("X3Paranoids", "CRUSH killed mid-sequence phase=%d fold=%.2f".format(r.crush, r.fold))
+                            if (crusher === r) { releasePlayer(); sightKick = 0.7f }
+                        }
                         spawnDerez(r)
                         // A handful of sparks at the break, no more. The fragments carry the death now;
                         // the old 36-dot puff on top of them was just a second, worse explosion.
@@ -1339,8 +1710,8 @@ class Game(val store: SettingsStore, private val host: GameHost) {
                     } else host.sfx(com.x3paranoids.audio.Sfx.RICOCHET, 0.7f)
                     si.remove(); break
                 }
-            } else if (hostile && state == State.PLAY && hypot(s.x - px, s.z - pz) < 1.15f && abs(s.y - EYE_H) < 1.6f) {
-                si.remove(); damagePlayer(s.x, s.z, s.y)
+            } else if (hostile && state == State.PLAY) {
+                discAtTank(s, si)
             }
         }
         // sparks
@@ -1352,6 +1723,251 @@ class Game(val store: SettingsStore, private val host: GameHost) {
             p.x += p.vx * dt; p.y += p.vy * dt; p.z += p.vz * dt
             p.vy -= 9f * dt
         }
+    }
+
+    // ------------------------------------------------------------------ the Recognizer's craft
+    /**
+     * Swing the cab toward [target] at up to [rate] radians a second, easing over the last
+     * [TURN_EASE] radians so it settles rather than stops. Returns how far off it still is.
+     */
+    private fun turnToward(r: Recognizer, target: Float, rate: Float, dt: Float): Float {
+        var d = target - r.yaw
+        while (d > PI.toFloat()) d -= 2f * PI.toFloat()
+        while (d < -PI.toFloat()) d += 2f * PI.toFloat()
+        val ad = abs(d)
+        val step = rate * dt * (ad / TURN_EASE).coerceIn(0.35f, 1f)
+        if (ad <= step) { r.yaw = target; return 0f }
+        r.yaw += if (d > 0f) step else -step
+        while (r.yaw > PI.toFloat()) r.yaw -= 2f * PI.toFloat()
+        while (r.yaw < -PI.toFloat()) r.yaw += 2f * PI.toFloat()
+        return ad - step
+    }
+
+    /**
+     * THE DISC LEAVES THE EYE. The origin is the model's own eye point put through the model's
+     * own transform, so the thing you watched turn to face you is the thing the disc comes out of
+     * — from the cab, four units up, so it comes DOWN at the periscope. The aim carries the wave's
+     * spread; the disc's spin phase is randomised so two in the air never turn in step.
+     */
+    private fun throwDisc(r: Recognizer, d: Float) {
+        val spread = (0.10f - 0.008f * wave).coerceAtLeast(0.03f)
+        val aimX = px + (rng.nextFloat() - 0.5f) * spread * d
+        val aimZ = pz + (rng.nextFloat() - 0.5f) * spread * d
+        r.eye(tmp3)
+        val ox = tmp3[0]; val oy = tmp3[1]; val oz = tmp3[2]
+        val ax = aimX - ox; val ay = EYE_H - 0.15f - oy; val az = aimZ - oz
+        val al = sqrt(ax * ax + ay * ay + az * az).coerceAtLeast(0.01f)
+        shots += Shot(ox, oy, oz, ax / al * BOLT_SPEED, ay / al * BOLT_SPEED, az / al * BOLT_SPEED, false)
+            .also { it.spin = rng.nextFloat() * 6.2832f }
+        host.sfx(com.x3paranoids.audio.Sfx.ENEMY_FIRE, 0.9f + rng.nextFloat() * 0.2f, (1f - d / 40f).coerceIn(0.3f, 1f))
+        android.util.Log.i("X3Paranoids", "THROW d=%.1f aimErr=%.1f deg from eye=(%.1f,%.1f,%.1f)".format(d, r.aimErr * 57.2958f, ox, oy, oz))
+    }
+
+    /**
+     * A DISC AT THE TANK: it lands, or it goes past. Landing is the old hit box; the shell takes
+     * it first, and either way the SIGHT reacts — an [Impact] ring at the point it struck, the
+     * brackets punched outward, and for a hull hit a moment of static in the periscope. A disc
+     * that comes inside [NEAR_MISS_D] and then starts to recede without landing is a NEAR MISS,
+     * called once at its closest point: the whoosh, and a fainter ring out at the edge of the
+     * glass on the side it passed. A held tank is not hit by discs — the machine on top of it is
+     * in the way, and the crush is already the event.
+     */
+    private fun discAtTank(s: Shot, si: MutableIterator<Shot>) {
+        val dp = hypot(s.x - px, s.z - pz)
+        if (!caught && dp < 1.15f && abs(s.y - EYE_H) < 1.6f) {
+            si.remove()
+            if (invuln > 0f) {
+                // inside the grace after a hit: it glances off — a ring, no punch, no damage
+                impacts += Impact(s.x, s.y, s.z, Impact.NEAR)
+                host.sfx(com.x3paranoids.audio.Sfx.DISC_PASS, 1.2f, 0.4f)
+                return
+            }
+            val shielded = shield > 0
+            impacts += Impact(s.x, s.y, s.z, if (shielded) Impact.SHIELD else Impact.HULL)
+            if (shielded) {
+                sightKick = 0.55f
+                host.sfx(com.x3paranoids.audio.Sfx.DISC_HIT, 1.15f, 0.55f)
+            } else {
+                sightKick = 1f; staticT = 0.32f
+                host.sfx(com.x3paranoids.audio.Sfx.DISC_HIT, 0.95f + rng.nextFloat() * 0.1f, 1f)
+            }
+            damagePlayer(s.x, s.z, s.y)
+            return
+        }
+        if (!s.passed && s.prevD < 900f && dp > s.prevD && s.prevD < NEAR_MISS_D) {
+            s.passed = true
+            val close = (1f - s.prevD / NEAR_MISS_D).coerceIn(0f, 1f)
+            impacts += Impact(s.x, s.y, s.z, Impact.NEAR)
+            host.sfx(com.x3paranoids.audio.Sfx.DISC_PASS, 0.9f + 0.3f * close, 0.45f + 0.55f * close)
+            android.util.Log.i("X3Paranoids", "NEAR MISS closest=%.2f".format(s.prevD))
+        }
+        s.prevD = dp
+    }
+
+    /** The contact that cannot become a capture: separate the pair, Recognizer first, tank for the remainder. */
+    private fun shove(r: Recognizer) {
+        val bx = r.x - px; val bz = r.z - pz
+        val bl = hypot(bx, bz).coerceAtLeast(0.01f)
+        val ux = bx / bl; val uz = bz / bl
+        maze.move(r.x, r.z, ux * RAM_PUSH, uz * RAM_PUSH, Recognizer.RADIUS, tmp)
+        val gave = hypot(tmp[0] - r.x, tmp[1] - r.z)
+        r.x = tmp[0]; r.z = tmp[1]
+        val rest = RAM_PUSH - gave
+        if (rest > 0.01f) {
+            maze.move(px, pz, -ux * rest, -uz * rest, PLAYER_R, tmp)
+            px = tmp[0]; pz = tmp[1]
+        }
+    }
+
+    // ------------------------------------------------------------------ [THE CRUSH]
+    /** It has you. The lunge begins: the hull is held, the servos spin up, the machine says so. */
+    private fun beginCrush(r: Recognizer) {
+        r.crush = Recognizer.CRUSH_LUNGE; r.crushT = 0f; r.crushY0 = r.y; r.fold = 0f; r.thrown = false
+        r.charge = 0f
+        r.reel = rng.nextFloat() * 6.2832f
+        // the line it came down: it lands CRUSH_STAND short of the eye along this, and it is fixed
+        // now because the hull cannot move for the rest of the sequence
+        var ux = px - r.x; var uz = pz - r.z
+        val ul = hypot(ux, uz)
+        if (ul < 0.05f) { ux = -sin(r.yaw); uz = cos(r.yaw) } else { ux /= ul; uz /= ul }
+        r.crushUx = ux; r.crushUz = uz
+        caught = true; crusher = r
+        driveEnd("caught"); vx = 0f; vz = 0f
+        crushShake = max(crushShake, 0.18f); sightKick = -0.3f
+        host.sfx(com.x3paranoids.audio.Sfx.CRUSH_ARM)
+        host.say("captured", urgent = true)
+        android.util.Log.i("X3Paranoids", "CRUSH begin r=(%.1f,%.1f) p=(%.1f,%.1f) shield=%d lives=%d".format(r.x, r.z, px, pz, shield, lives))
+    }
+
+    /** Slide the gantry to its landing point over the hull's nose — see [CRUSH_STAND] — through the walls' own collision. */
+    private fun converge(r: Recognizer, dt: Float) {
+        val tx = px - r.crushUx * CRUSH_STAND; val tz = pz - r.crushUz * CRUSH_STAND
+        val dx = tx - r.x; val dz = tz - r.z
+        val l = hypot(dx, dz)
+        if (l < 0.02f) return
+        val stepL = min(l, CRUSH_CLOSE_SPEED * dt)
+        maze.move(r.x, r.z, dx / l * stepL, dz / l * stepL, Recognizer.RADIUS, tmp)
+        r.x = tmp[0]; r.z = tmp[1]
+    }
+
+    /**
+     * The capture's clock — the beats are laid out under [THE CRUSH]. Runs in every state: a
+     * machine holding a dying tank keeps holding it, and one mid-release when the wave clears
+     * finishes opening. Only the OUTCOME needs the arena live, and it is applied at the landing.
+     */
+    private fun updateCrush(r: Recognizer, dt: Float) {
+        r.crushT += dt
+        when (r.crush) {
+            Recognizer.CRUSH_LUNGE -> {
+                val u = (r.crushT / CRUSH_LUNGE_T).coerceIn(0f, 1f)
+                val e = 1f - (1f - u) * (1f - u)
+                r.y = r.crushY0 + (CRUSH_RISE_Y - r.crushY0) * e
+                r.fold = -0.18f * e
+                converge(r, dt)
+                crushShake = max(crushShake, 0.10f)
+                if (u >= 1f) { r.crush = Recognizer.CRUSH_DROP; r.crushT = 0f }
+            }
+            Recognizer.CRUSH_DROP -> {
+                val u = (r.crushT / CRUSH_DROP_T).coerceIn(0f, 1f)
+                r.y = CRUSH_RISE_Y + (CRUSH_LAND_Y - CRUSH_RISE_Y) * u * u
+                r.fold = -0.18f + 1.18f * u * u * u
+                converge(r, dt)
+                if (u >= 1f) { r.y = CRUSH_LAND_Y; r.fold = 1f; land(r) }
+            }
+            Recognizer.CRUSH_HOLD -> {
+                r.fold = 1f
+                r.y = CRUSH_LAND_Y + 0.03f * sin(r.crushT * 61f)
+                crushShake = max(crushShake, if (state == State.DYING) 0.08f else 0.24f)
+                // a shell under the clamp STRAINS: it flickers hard, lit from above, for the hold
+                if (shield > 0) { shieldFlash = max(shieldFlash, 0.55f + 0.45f * abs(sin(r.crushT * 31f))); shieldHitX = 0f; shieldHitY = 1f; shieldHitZ = 0f }
+                if (state != State.DYING && r.crushT >= r.holdT) open(r)
+            }
+            Recognizer.CRUSH_RELEASE -> {
+                val u = (r.crushT / CRUSH_RELEASE_T).coerceIn(0f, 1f)
+                val eo = 1f - (1f - u) * (1f - u)
+                if (r.thrown) {
+                    // flung: the legs snap open past straight, it is thrown up and away
+                    r.fold = 1f - 1.35f * min(1f, u * 1.7f)
+                    r.y = CRUSH_LAND_Y + (2.9f - CRUSH_LAND_Y) * eo
+                } else {
+                    // let go: the legs open, then it lifts off
+                    r.fold = 1f - eo
+                    r.y = CRUSH_LAND_Y + (1.6f - CRUSH_LAND_Y) * u * u
+                }
+                // and backs away from the hull, wall-clipped, over the whole release
+                val away = if (r.thrown) CRUSH_THROW else CRUSH_BACK_OFF
+                var bx = r.x - px; var bz = r.z - pz
+                val bl = hypot(bx, bz)
+                if (bl < 0.05f) { bx = -sin(r.yaw); bz = cos(r.yaw) } else { bx /= bl; bz /= bl }
+                maze.move(r.x, r.z, bx * away * dt / CRUSH_RELEASE_T, bz * away * dt / CRUSH_RELEASE_T, Recognizer.RADIUS, tmp)
+                r.x = tmp[0]; r.z = tmp[1]
+                if (u >= 1f) {
+                    r.crush = Recognizer.CRUSH_NONE; r.crushT = 0f
+                    r.stagger = STAGGER_T; r.crushCd = CRUSH_CD
+                    if (!r.thrown) r.fold = 0f
+                }
+            }
+        }
+    }
+
+    /**
+     * THE LANDING BEAT. The slam, the sight kicked inward, the judder — and the outcome. With a
+     * shell up the legs close on the SHELL: it flares under them and the strain begins, and what
+     * the strain ends in is decided at [open]. Bare, the hull is crushed here and now: a life, or
+     * the derez, with the clamp held through it.
+     */
+    private fun land(r: Recognizer) {
+        r.crush = Recognizer.CRUSH_HOLD; r.crushT = 0f
+        crushShake = 1f; sightKick = -1f
+        host.sfx(com.x3paranoids.audio.Sfx.CRUSH_SLAM)
+        cue(0.10f) { if (r.crush == Recognizer.CRUSH_HOLD) host.sfx(com.x3paranoids.audio.Sfx.CRUSH_GRIND, 1f, 0.9f) }
+        if (shield > 0) {
+            r.holdT = CRUSH_HOLD_SHELL_T
+            shieldFlash = 1f; shieldHitX = 0f; shieldHitY = 1f; shieldHitZ = 0f
+            host.sfx(com.x3paranoids.audio.Sfx.SHIELD_HIT, 0.72f, 0.9f)
+            android.util.Log.i("X3Paranoids", "CRUSH landed on shell=%d".format(shield))
+        } else {
+            r.holdT = CRUSH_HOLD_T
+            staticT = 0.30f
+            burst(px, EYE_H + 0.4f, pz, 10, 1f, 0.4f, 0.3f)
+            android.util.Log.i("X3Paranoids", "CRUSH landed on hull lives=%d".format(lives))
+            damagePlayer(r.x, r.z, r.y + 2.2f, force = true)
+        }
+    }
+
+    /**
+     * THE CLAMP OPENS. If it was straining on a shell, the shell DISCHARGES: it spends
+     * [CRUSH_CHARGES] and throws the machine off, open and reeling; if that was the last of it,
+     * the shell derezzes outward past the periscope on the same frame. Otherwise the machine
+     * simply lets go and lifts off. Either way the tank is released now — as the legs start to
+     * open, not when they finish — so the player has the whole release to get clear on.
+     */
+    private fun open(r: Recognizer) {
+        r.crush = Recognizer.CRUSH_RELEASE; r.crushT = 0f
+        if (shield > 0) {
+            r.thrown = true
+            val taken = min(shield, CRUSH_CHARGES)
+            shield -= taken
+            shieldFlash = 1f; shieldHitX = 0f; shieldHitY = 1f; shieldHitZ = 0f
+            invuln = SHIELD_IFRAME + CRUSH_GRACE
+            burst(px, EYE_H + 0.6f, pz, 18, 0.55f, 0.95f, 1f)
+            host.sfx(com.x3paranoids.audio.Sfx.CRUSH_OPEN, 1.15f, 1f)
+            if (shield > 0) onShieldHit() else onShieldDown()
+            sightKick = 0.8f
+            android.util.Log.i("X3Paranoids", "CRUSH shell discharged: took %d, shield=%d".format(taken, shield))
+        } else {
+            r.thrown = false
+            host.sfx(com.x3paranoids.audio.Sfx.CRUSH_OPEN)
+            sightKick = 0.45f
+            android.util.Log.i("X3Paranoids", "CRUSH released lives=%d".format(lives))
+        }
+        releasePlayer()
+    }
+
+    /** The hull is free. Idempotent; the crusher's own clock carries on without it. */
+    private fun releasePlayer() {
+        if (!caught && crusher == null) return
+        caught = false; crusher = null
     }
 
     // ------------------------------------------------------------------ derez
@@ -1391,7 +2007,7 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         // Oldest first: a wave that dies all at once should show you the DEATHS IN FRONT OF YOU, and
         // the one still coming apart is always the newest.
         while (derezzes.size >= MAX_DEREZ) derezzes.removeAt(0)
-        derezzes += Derez(r.x, r.y, r.z, r.yaw, 1f, r.alert, false)
+        derezzes += Derez(r.x, r.y, r.z, r.yaw, 1f, r.alert, false, fold = r.fold)
     }
 
     // ------------------------------------------------------------------ the Bit's voice

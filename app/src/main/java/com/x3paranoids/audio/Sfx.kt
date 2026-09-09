@@ -54,7 +54,14 @@ class Sfx(private val context: Context) {
         const val SHIELD_UP = 26    // the draw completes and the shell seals
         const val SHIELD_HIT = 27   // the shell eats a bolt
         const val SHIELD_DOWN = 28  // the last charge goes — the DEREZ, an octave up and half as long
-        private const val COUNT = 29
+        // ---- the Recognizer's disc, and the crush
+        const val DISC_HIT = 29     // a disc lands on the hull: the strike itself, under HIT or SHIELD_HIT
+        const val DISC_PASS = 30    // a disc goes past the periscope — the whoosh of a near miss
+        const val CRUSH_ARM = 31    // the gantry rises over the tank: servos spinning up
+        const val CRUSH_SLAM = 32   // it comes down and the legs close: the landing beat
+        const val CRUSH_GRIND = 33  // the clamp straining on the hull
+        const val CRUSH_OPEN = 34   // the legs let go and it lifts off
+        private const val COUNT = 35
         private const val RATE = 22050
     }
 
@@ -77,7 +84,82 @@ class Sfx(private val context: Context) {
             runCatching {
                 val dir = File(context.cacheDir, "sfx").apply { mkdirs() }
                 ids[FIRE] = load(dir, "fire", buf(160) { t -> (saw(1500f - 1100f * t, t) * 0.6f + 0.25f * noise() * exp(-t * 30f)) * exp(-t * 14f) })
-                ids[ENEMY_FIRE] = load(dir, "efire", buf(260) { t -> (sq(420f - 200f * t, t) * 0.45f + saw(210f, t) * 0.25f) * exp(-t * 8f) })
+                // THE DISC IS THROWN. The old bolt buzz, with a spin on it: a 26 Hz flutter that
+                // slows as the clip decays, so it reads as a thing set turning and let go rather
+                // than a beam. Still low and buzzy — it has to sit under the tank's own cannon.
+                ids[ENEMY_FIRE] = load(dir, "efire", buf(300) { t ->
+                    var v = sq(420f - 200f * t, t) * 0.40f + saw(210f, t) * 0.22f + sine(1400f - 900f * t, t) * 0.14f
+                    v *= 0.62f + 0.38f * sine(26f - 10f * t, t)
+                    v * exp(-t * 7.5f)
+                })
+                // ------------------------------------------------- the disc landing, and passing
+                // ON THE HULL. Three layers, all short: a sub thud (55 Hz, fast decay) for the
+                // weight, a burst of noise for the strike, and a metallic ring at 1.9 kHz that
+                // decays slower than either — the disc is a ringing thing and it has just hit a
+                // tank. Nothing in the old HIT had a transient this hard; the disc needed one.
+                ids[DISC_HIT] = load(dir, "dischit", buf(460) { t ->
+                    var v = sine(55f, t) * 0.70f * exp(-t * 9f)
+                    v += noise() * 0.85f * exp(-t * 38f)
+                    v += (sine(1900f, t) * 0.26f + sine(2850f, t) * 0.12f) * exp(-t * 7f) * (0.7f + 0.3f * sine(90f, t))
+                    v += sq(140f, t) * 0.18f * exp(-t * 14f)
+                    v * (1f - exp(-t * 400f))
+                })
+                // PAST THE EAR. Band-passed noise whose centre sweeps DOWN — a doppler in miniature
+                // — with a whistle riding on it that falls the same way. It is the one sound in the
+                // game that means "that would have hit you", and it must be felt, not heard.
+                ids[DISC_PASS] = load(dir, "discpass", buf(340) { t ->
+                    val env = sin(3.1416f * (t / 0.34f).coerceIn(0f, 1f))
+                    val f = 1500f - 1100f * t
+                    var v = noise() * 0.55f
+                    v = v * (0.55f + 0.45f * sine(f, t))          // a crude band-pass: noise modulated at the sweep
+                    v += sine(f * 1.6f, t) * 0.22f * env
+                    v * env * env
+                })
+                // ------------------------------------------------------------- the crush
+                // ARMING. Servos spinning up as the gantry rises over you: a whine climbing from
+                // 180 to 900 Hz with a 12 Hz flutter, under a growing hiss. It is the sound of a
+                // decision being made, and it is the player's last chance to shoot.
+                ids[CRUSH_ARM] = load(dir, "crusharm", buf(420) { t ->
+                    val f = 180f + 720f * (t / 0.42f).coerceIn(0f, 1f)
+                    var v = saw(f, t) * 0.32f + sq(f * 0.5f, t) * 0.14f + sine(f * 2f, t) * 0.10f
+                    v *= 0.70f + 0.30f * sine(12f, t)
+                    v += noise() * 0.18f * (t / 0.42f).coerceIn(0f, 1f)
+                    v * (1f - exp(-t * 60f)) * (1f - ((t - 0.36f) / 0.06f).coerceIn(0f, 1f))
+                })
+                // THE LANDING. The heaviest sound in the game and it earns it: a 38 Hz sub with a
+                // pitch drop for the mass coming down, a hard noise strike, an iron clang (two
+                // inharmonic partials) for the legs meeting, and a servo lock — a fast falling saw
+                // — on the tail. Half a second and then it is over, because the grind takes over.
+                ids[CRUSH_SLAM] = load(dir, "crushslam", buf(620) { t ->
+                    var v = sine(38f + 60f * exp(-t * 18f), t) * 0.85f * exp(-t * 5.5f)
+                    v += noise() * 0.95f * exp(-t * 30f)
+                    v += (sine(640f, t) * 0.30f + sine(1010f, t) * 0.20f + sine(2230f, t) * 0.10f) * exp(-t * 6f)
+                    v += saw(520f - 380f * (t / 0.25f).coerceIn(0f, 1f), t) * 0.22f * exp(-t * 9f)
+                    v += sq(70f, t) * 0.25f * exp(-t * 10f)
+                    v * (1f - exp(-t * 500f))
+                })
+                // STRAIN. The clamp holding on the hull: a low grinding buzz — saw against square
+                // at a rough fifth, gated at 22 Hz so it chatters — with a slow swell and a metal
+                // whine drifting on top. It stops when the legs open, whichever way that happens.
+                ids[CRUSH_GRIND] = load(dir, "crushgrind", buf(700) { t ->
+                    var v = saw(64f, t) * 0.36f + sq(96f, t) * 0.20f + saw(65.5f, t) * 0.18f
+                    val gate = if ((t * 22f).toInt() % 2 == 0) 1f else 0.35f
+                    v *= gate
+                    v += sine(1240f + 90f * sine(3f, t), t) * 0.10f
+                    v += noise() * 0.12f
+                    val env = sin(3.1416f * (t / 0.70f).coerceIn(0f, 1f))
+                    v * (0.35f + 0.65f * env)
+                })
+                // RELEASE. The servos reversing — a whine falling from 800 to 150 Hz — with a hiss
+                // of pressure let go and a soft clunk as the legs reach the end of their travel.
+                ids[CRUSH_OPEN] = load(dir, "crushopen", buf(480) { t ->
+                    val f = 800f - 650f * (t / 0.40f).coerceIn(0f, 1f)
+                    var v = saw(f, t) * 0.28f + sine(f * 2f, t) * 0.10f
+                    v *= 0.72f + 0.28f * sine(14f, t)
+                    v += noise() * 0.30f * exp(-t * 6f)
+                    if (t > 0.34f) { val lt = t - 0.34f; v += (sine(120f, lt) * 0.45f + noise() * 0.3f * exp(-lt * 40f)) * exp(-lt * 14f) }
+                    v * (1f - exp(-t * 80f)) * (1f - ((t - 0.42f) / 0.06f).coerceIn(0f, 1f))
+                })
                 // [DEREZ SOUND] — a program coming apart, not a crush. Four things happen at once
                 // and all four run DOWN: the tone falls 900→75 Hz; the grain gate slows from a
                 // 115 Hz buzz to ~8 Hz chunks, so continuous sound becomes discrete pieces; the

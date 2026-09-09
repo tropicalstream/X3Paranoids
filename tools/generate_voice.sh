@@ -38,6 +38,9 @@ render bit "Bit acquired. Extra life." 160
 render energy "Energy drawn." 160
 render shield_down "Shield collapsed." 165
 render hit "Tank hit." 175
+# A Recognizer has closed on the tank (Game.beginCrush). One word, flat: the machine stating a
+# capture the way it states everything, while the legs come down.
+render captured "Captured." 165
 render lockon "Warning. Recognizer locked on." 170
 render wave_clear "Wave cleared." 160
 render last_life "Last life." 165

@@ -138,22 +138,42 @@ class Maze(val cols: Int, val rows: Int, seed: Long) {
         return best
     }
 
-    /** Slide a circle of radius `rad` from (x,z) by (dx,dz) against the walls; returns the new position and whether it bumped. */
+    /**
+     * Slide a circle of radius `rad` from (x,z) by (dx,dz) against the walls; returns the new
+     * position and whether it bumped.
+     *
+     * AN AXIS IS RESOLVED ONLY AGAINST A WALL THE BODY WAS CLEAR OF ALONG THAT AXIS BEFORE THE
+     * STEP. The first version snapped to a face on any overlap, in both passes, and a body RESTING
+     * on a wall — placed at exactly `maxX + rad` by the x pass — can read as overlapping it by one
+     * float ulp (0.35 + 1.916 − 1.916 rounds a hair under 0.35; the tank's 0.9 happens to round the
+     * other way, which is why only the Recognizers ever suffered it). The z pass then took that
+     * x-touch for a z-collision and "resolved" it to the wall's far END in z — and a boundary wall
+     * is seventy-two units long, so a Recognizer sliding along it was teleported clean outside the
+     * arena, where two of them were found pressed against the south wall from the far side. The
+     * entry test makes the sign of the step irrelevant to a wall you are already alongside, and
+     * [EPS] absorbs the ulp.
+     */
     fun move(x: Float, z: Float, dx: Float, dz: Float, rad: Float, out: FloatArray): Boolean {
         var nx = x + dx; var nz = z
         var bumped = false
         for (w in walls) if (overlaps(nx, nz, rad, w)) {
-            nx = if (dx > 0) w.minX - rad else w.maxX + rad
+            if (x + rad <= w.minX + EPS) nx = w.minX - rad
+            else if (x - rad >= w.maxX - EPS) nx = w.maxX + rad
+            else continue                       // alongside it already: not an x-collision
             bumped = true
         }
         nz = z + dz
         for (w in walls) if (overlaps(nx, nz, rad, w)) {
-            nz = if (dz > 0) w.minZ - rad else w.maxZ + rad
+            if (z + rad <= w.minZ + EPS) nz = w.minZ - rad
+            else if (z - rad >= w.maxZ - EPS) nz = w.maxZ + rad
+            else continue
             bumped = true
         }
         out[0] = nx; out[1] = nz
         return bumped
     }
+
+    private val EPS = 2e-3f
 
     private fun overlaps(x: Float, z: Float, rad: Float, w: Wall) =
         x + rad > w.minX && x - rad < w.maxX && z + rad > w.minZ && z - rad < w.maxZ
