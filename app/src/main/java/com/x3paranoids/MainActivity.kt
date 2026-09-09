@@ -176,6 +176,18 @@ class MainActivity : Activity(), GameHost {
         music.volume = 0.55f * v; sfx.volume = 0.9f * v; voice.volume = 1f * v; hero.volume = 0.92f * v
     }
     override fun voiceDurationMs(id: String): Int = voice.durations[id] ?: 0
+
+    /**
+     * Leave the game. The sign-off line is already speaking when this arrives, so the exit waits
+     * out the clip rather than cutting the machine off mid-sentence — the one place in the game
+     * where the system voice gets the last word. finish() and not a force-stop: the launcher drops
+     * a force-stopped app off the Mercury drawer, and a game you quit politely should still be
+     * there when you want it again.
+     */
+    override fun quitGame() {
+        val hold = (voice.durations["end_of_line"] ?: 0).coerceIn(0, 2000) + 250L.toInt()
+        ui.postDelayed({ if (!isFinishing) finish() }, hold.toLong())
+    }
     override fun heroDurationMs(id: String): Int = hero.durations[id] ?: 0
     override fun voiceBusy(): Boolean = voice.isSpeaking || hero.isSpeaking
 

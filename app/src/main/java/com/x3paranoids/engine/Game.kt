@@ -38,6 +38,8 @@ interface GameHost {
     fun heroDurationMs(id: String): Int
     /** True while EITHER voice is speaking — ambient chatter stands aside rather than ducking under it. */
     fun voiceBusy(): Boolean
+    /** Leave the game and hand the glasses back to the launcher. */
+    fun quitGame()
 }
 
 enum class State { TITLE, PLAY, WAVE_CLEAR, DYING, GAME_OVER }
@@ -1352,18 +1354,28 @@ class Game(val store: SettingsStore, private val host: GameHost) {
     private var newHigh = false
 
     // menu
-    val menuItems = listOf("MUSIC", "VOLUME", "VOICE", "HEAD LOOK", "MINIMAP", "TURN", "DIFFICULTY", "RESET SETTINGS")
+    private val baseMenu = listOf("MUSIC", "VOLUME", "VOICE", "HEAD LOOK", "MINIMAP", "TURN", "DIFFICULTY", "RESET SETTINGS")
+    /**
+     * QUIT exists only when there is no run to abandon — the attract screen or the game-over card.
+     * Mid-game it is not merely hidden but absent, so a player reaching for RESET SETTINGS in the
+     * dark can never overshoot into an exit, and the row indices above it never move under them.
+     */
+    val canQuit: Boolean get() = state == State.TITLE || state == State.GAME_OVER
+    val menuItems: List<String> get() = if (canQuit) baseMenu + "QUIT" else baseMenu
     var menuSel = 0; private set
     var resetArmed = false; private set
-    fun menuValue(i: Int): String = when (i) {
-        0 -> if (store.music) "ON" else "OFF"
-        1 -> store.volume.toString()
-        2 -> if (store.voice) "ON" else "OFF"
-        3 -> if (store.headLook) "ON" else "OFF"
-        4 -> if (store.minimap) "ON" else "OFF"
-        5 -> if (store.turnReversed) "REVERSED" else "NORMAL"
-        6 -> when (store.difficulty) { 0 -> "EASY"; 2 -> "HARD"; else -> "NORMAL" }
-        else -> if (resetArmed) "TAP AGAIN TO CONFIRM" else ""
+    var quitArmed = false; private set
+    fun menuValue(i: Int): String = when (menuItems.getOrNull(i)) {
+        "MUSIC" -> if (store.music) "ON" else "OFF"
+        "VOLUME" -> store.volume.toString()
+        "VOICE" -> if (store.voice) "ON" else "OFF"
+        "HEAD LOOK" -> if (store.headLook) "ON" else "OFF"
+        "MINIMAP" -> if (store.minimap) "ON" else "OFF"
+        "TURN" -> if (store.turnReversed) "REVERSED" else "NORMAL"
+        "DIFFICULTY" -> when (store.difficulty) { 0 -> "EASY"; 2 -> "HARD"; else -> "NORMAL" }
+        "RESET SETTINGS" -> if (resetArmed) "TAP AGAIN TO CONFIRM" else ""
+        "QUIT" -> if (quitArmed) "TAP AGAIN TO CONFIRM" else "END OF LINE"
+        else -> ""
     }
 
     // ------------------------------------------------------------------ [THE THREE SETTINGS]
@@ -1840,42 +1852,55 @@ class Game(val store: SettingsStore, private val host: GameHost) {
     }
 
     // ------------------------------------------------------------------ menu
-    private fun openMenu() { menuOpen = true; menuSel = 0; resetArmed = false; host.say("paused", urgent = true); host.sfx(com.x3paranoids.audio.Sfx.SELECT) }
-    private fun closeMenu() { menuOpen = false; resetArmed = false; if (state == State.PLAY) host.say("resumed", urgent = true); host.sfx(com.x3paranoids.audio.Sfx.TICK) }
+    private fun openMenu() { menuOpen = true; menuSel = 0; resetArmed = false; quitArmed = false; host.say("paused", urgent = true); host.sfx(com.x3paranoids.audio.Sfx.SELECT) }
+    private fun closeMenu() { menuOpen = false; resetArmed = false; quitArmed = false; if (state == State.PLAY) host.say("resumed", urgent = true); host.sfx(com.x3paranoids.audio.Sfx.TICK) }
 
     private fun menuSwipe(dir: Swipe) {
         when (dir) {
-            Swipe.UP -> { menuSel = (menuSel + menuItems.size - 1) % menuItems.size; resetArmed = false; host.sfx(com.x3paranoids.audio.Sfx.TICK) }
-            Swipe.DOWN -> { menuSel = (menuSel + 1) % menuItems.size; resetArmed = false; host.sfx(com.x3paranoids.audio.Sfx.TICK) }
+            Swipe.UP -> { menuSel = (menuSel + menuItems.size - 1) % menuItems.size; resetArmed = false; quitArmed = false; host.sfx(com.x3paranoids.audio.Sfx.TICK) }
+            Swipe.DOWN -> { menuSel = (menuSel + 1) % menuItems.size; resetArmed = false; quitArmed = false; host.sfx(com.x3paranoids.audio.Sfx.TICK) }
             Swipe.FORWARD, Swipe.RIGHT -> adjust(+1)
             Swipe.BACK, Swipe.LEFT -> adjust(-1)
         }
     }
 
     private fun adjust(d: Int) {
-        when (menuSel) {
-            0 -> { store.music = !store.music; host.musicEnabled(store.music) }
-            1 -> { store.volume = store.volume + d; host.applyVolume(store.volume) }
-            2 -> { store.voice = !store.voice; host.voiceEnabled(store.voice) }
-            3 -> { store.headLook = !store.headLook; host.headEnabled(store.headLook) }
-            4 -> store.minimap = !store.minimap
-            5 -> store.turnReversed = !store.turnReversed
+        when (menuItems.getOrNull(menuSel)) {
+            "MUSIC" -> { store.music = !store.music; host.musicEnabled(store.music) }
+            "VOLUME" -> { store.volume = store.volume + d; host.applyVolume(store.volume) }
+            "VOICE" -> { store.voice = !store.voice; host.voiceEnabled(store.voice) }
+            "HEAD LOOK" -> { store.headLook = !store.headLook; host.headEnabled(store.headLook) }
+            "MINIMAP" -> store.minimap = !store.minimap
+            "TURN" -> store.turnReversed = !store.turnReversed
             // three settings now, so it STEPS rather than toggles — one swipe, one notch, and it
             // wraps at the top so EASY is never more than a swipe away from wherever you are
-            6 -> store.difficulty = (store.difficulty + (if (d >= 0) 1 else 2)) % 3
-            else -> {}
+            "DIFFICULTY" -> store.difficulty = (store.difficulty + (if (d >= 0) 1 else 2)) % 3
+            // RESET SETTINGS and QUIT are committed with a tap, never nudged with a swipe: a
+            // sideways gesture must not be able to fire something irreversible.
+            else -> return
         }
         host.sfx(com.x3paranoids.audio.Sfx.TICK, 1.15f)
     }
 
     private fun menuActivate() {
-        if (menuSel == menuItems.size - 1) {
-            if (!resetArmed) { resetArmed = true; host.sfx(com.x3paranoids.audio.Sfx.LOCK); return }
-            store.resetSettings(); resetArmed = false
-            host.musicEnabled(store.music); host.voiceEnabled(store.voice); host.headEnabled(store.headLook); host.applyVolume(store.volume)
-            host.sfx(com.x3paranoids.audio.Sfx.SELECT); return
+        when (menuItems.getOrNull(menuSel)) {
+            "RESET SETTINGS" -> {
+                if (!resetArmed) { resetArmed = true; quitArmed = false; host.sfx(com.x3paranoids.audio.Sfx.LOCK); return }
+                store.resetSettings(); resetArmed = false
+                host.musicEnabled(store.music); host.voiceEnabled(store.voice); host.headEnabled(store.headLook); host.applyVolume(store.volume)
+                host.sfx(com.x3paranoids.audio.Sfx.SELECT)
+            }
+            // Leaving is confirmed twice for the same reason resetting is: the temple pad is not a
+            // precise instrument, and no single tap should be able to end the session.
+            "QUIT" -> {
+                if (!quitArmed) { quitArmed = true; resetArmed = false; host.sfx(com.x3paranoids.audio.Sfx.LOCK); return }
+                quitArmed = false
+                host.sfx(com.x3paranoids.audio.Sfx.SELECT)
+                host.say("end_of_line", urgent = true)
+                host.quitGame()
+            }
+            else -> adjust(+1)
         }
-        adjust(+1)
     }
 
     // ------------------------------------------------------------------ game flow

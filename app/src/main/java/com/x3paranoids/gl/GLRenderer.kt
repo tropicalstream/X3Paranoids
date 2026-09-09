@@ -2738,8 +2738,14 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         color(0f, 0f, 0f, 0f)
         color(GREEN[0], GREEN[1], GREEN[2], 0.9f); rect(150f, 86f, 490f, 404f); rect(154f, 90f, 486f, 400f)
         textC("SETTINGS", 320f, 122f, 3f)
+        // Nine rows do not fit the eight-row pitch: at 30 px the last baseline lands on the panel's
+        // own bottom edge. The list tightens instead of the panel growing, so the frame the player
+        // has learned stays exactly where it was.
+        val many = game.menuItems.size > 8
+        val y0 = if (many) 154f else 162f
+        val pitch = if (many) 27f else 30f
         for ((i, item) in game.menuItems.withIndex()) {
-            val y = 162f + i * 30f
+            val y = y0 + i * pitch
             val sel = i == game.menuSel
             color(GREEN[0], GREEN[1], GREEN[2], if (sel) 1f else 0.55f)
             if (sel) text(">", 162f, y, 2.2f)
