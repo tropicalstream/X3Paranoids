@@ -1164,6 +1164,18 @@ class Game(val store: SettingsStore, private val host: GameHost) {
      * the old way — once, on finger-up — so a hold cannot walk the menu.
      */
     val holdDriveArmed: Boolean get() = state == State.PLAY && !menuOpen && !caught
+    /**
+     * May a tap be acted on the INSTANT the finger lifts, with no wait to see whether a second tap
+     * is coming? True exactly where a late tap would be worse than a wrong one: firing the cannon,
+     * and mashing to break a Recognizer's clamp — [caught] is deliberately NOT excluded here,
+     * because that struggle is the one moment in the game where every tap is life or death.
+     *
+     * Everywhere else — title, game over, and the settings menu — a tap can afford to wait a beat
+     * to find out whether it was really the first half of a double-tap, and MUST wait, because off
+     * the arena a stray tap starts a game you did not ask for or changes a setting you did not
+     * touch. Read from the input thread; [state] and [menuOpen] are volatile for that reason.
+     */
+    val tapsAreUrgent: Boolean get() = state == State.PLAY && !menuOpen
     var lives = 3; private set
     var score = 0; private set
     var wave = 0; private set

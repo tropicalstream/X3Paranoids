@@ -89,17 +89,24 @@ class MainActivity : Activity(), GameHost {
     /** When the pad last delivered a CLASSIFIED gesture (a tap or a double-tap) as a key. */
     private var lastKeyGestureMs = -10_000L
     /**
-     * Latched the first time the pad hands us a gesture it has ALREADY classified into a key. It
-     * never unlatches, because hardware does not change its mind halfway through a session.
+     * Latched the first time a TAP arrives already classified into a key (KEYCODE_BUTTON_A). From
+     * then on the raw touch stream underneath a tap is only ever an echo and never becomes a tap.
      *
-     * A time window is not enough on its own. The pad cannot know a double-tap is a double-tap
-     * until the second tap lands, so the FIRST touch of one arrives before the BACK does: no BACK
-     * is pending yet and the last key is ancient, so a purely time-based guard waves that touch
-     * through and it actions the highlighted menu row. That is the "it just switches the menu
-     * item" the owner saw. Once we know the pad classifies, the raw touch stream underneath is
-     * only ever an echo and must never become a tap.
+     * Read the name literally: this is "the pad delivers TAPS as keys", and nothing else. An
+     * earlier version latched this on KEYCODE_BACK too, on the reasoning that a BACK proves the
+     * pad classifies. It proves the pad classifies DOUBLE-taps. It says nothing whatsoever about
+     * single taps — and if single taps are in fact only reaching us as touches, latching here on a
+     * BACK switches the app's only working tap source off for the rest of the session, one
+     * double-tap in. The game went deaf on the title screen and the owner could not start a run.
+     * The lesson is cheap to state and was expensive to learn: only evidence about taps may be
+     * used to make decisions about taps.
      */
-    private var padClassifies = false
+    private var padTapsAreKeys = false
+    /** The burst of touch-taps being counted right now, off the arena. See [touchTap]. */
+    private var burstN = 0
+    private var burstR: Runnable? = null
+    /** Did the pad's own classifier speak up mid-burst? Then it owns the outcome, not us. */
+    private var burstHadBack = false
     private var pendingDouble: Runnable? = null
     private var downX = 0f; private var downY = 0f; private var downT = 0L
     /** 0 = not yet classified, [AXIS_UP] = settle it on finger-up as before, [AXIS_DRIVE] = driving. */
@@ -227,7 +234,10 @@ class MainActivity : Activity(), GameHost {
         // a tap right after a BACK = the third tap of a triple-tap — but ONLY if the pad said so.
         // A touch here is the second half of the double-tap that produced the BACK.
         if (backPendingMs != 0L && now - backPendingMs < 350) {
-            if (!fromKey) return
+            // A touch this soon after the BACK is that double-tap's own second finger-lift, which
+            // the pad reports at essentially the same instant it emits the BACK. A human going for
+            // a third tap cannot get there that fast, so the gap tells the two apart.
+            if (!fromKey && now - backPendingMs < 140) return
             pendingDouble?.let { ui.removeCallbacks(it) }; pendingDouble = null; backPendingMs = 0L
             lastTapMs = now
             glView.queueEvent { game.tripleTap() }
@@ -237,9 +247,48 @@ class MainActivity : Activity(), GameHost {
         glView.queueEvent { game.tap() }
     }
 
+    /**
+     * A TOUCH-DERIVED TAP OFF THE ARENA, counted into a burst instead of acted on immediately.
+     *
+     * The pad reports one physical gesture twice — once classified into a key, once as the raw
+     * touch underneath — and the classification cannot arrive until the gesture is over. So the
+     * first touch of a double-tap always lands while the app still has no idea a second one is
+     * coming. Acting on it at once is what made a double-tap change a settings row on its way to
+     * closing the menu. Waiting a beat costs nothing here: off the arena there is no shot to miss.
+     *
+     * If the pad's own BACK turns up mid-burst it has already told us this was a double-tap and it
+     * owns the toggle, so the burst resolves to nothing. If it never turns up — hardware that
+     * reports touch and nothing else — the burst does the job itself. Three taps cancel the
+     * pending toggle the moment the third lands rather than at the end of the burst, because the
+     * BACK's own 350 ms runnable would otherwise fire first and open the menu under the re-centre.
+     */
+    private fun touchTap() {
+        burstN++
+        burstR?.let { ui.removeCallbacks(it) }
+        if (burstN >= 3) { pendingDouble?.let { ui.removeCallbacks(it) }; pendingDouble = null; backPendingMs = 0L }
+        val r = Runnable {
+            val n = burstN; val hadBack = burstHadBack
+            burstN = 0; burstR = null; burstHadBack = false
+            when {
+                n >= 3 -> glView.queueEvent { game.tripleTap() }
+                n == 2 -> if (!hadBack) glView.queueEvent { game.doubleTap() }
+                else -> if (!hadBack) { lastTapMs = SystemClock.uptimeMillis(); glView.queueEvent { game.tap() } }
+            }
+        }
+        burstR = r
+        ui.postDelayed(r, 300)
+    }
+
+    /** Drop a burst in flight: a classified key has superseded it, so the touches were echoes. */
+    private fun cancelBurst() {
+        burstR?.let { ui.removeCallbacks(it) }
+        burstR = null; burstN = 0; burstHadBack = false
+    }
+
     private fun onBack() {
         val now = SystemClock.uptimeMillis()
         lastKeyGestureMs = now
+        if (burstR != null) burstHadBack = true
         if (backPendingMs != 0L && now - backPendingMs < 350) return
         backPendingMs = now
         val r = Runnable { backPendingMs = 0L; pendingDouble = null; glView.queueEvent { game.doubleTap() } }
@@ -274,12 +323,12 @@ class MainActivity : Activity(), GameHost {
         when (event.keyCode) {
             KeyEvent.KEYCODE_BUTTON_A, KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_SPACE -> {
                 if (event.action == KeyEvent.ACTION_UP && !event.isCanceled && event.eventTime - event.downTime < 450) {
-                    padClassifies = true
+                    padTapsAreKeys = true; cancelBurst()
                     lastKeyGestureMs = SystemClock.uptimeMillis(); onTap(true)
                 }
                 return true
             }
-            KeyEvent.KEYCODE_BACK -> { padClassifies = true; if (event.action == KeyEvent.ACTION_UP) onBack(); return true }
+            KeyEvent.KEYCODE_BACK -> { if (event.action == KeyEvent.ACTION_UP) onBack(); return true }
             // The D-pad path is the same two gears as the pad: a key held down drives, a key tapped
             // is a dash and nothing else, because a drive that starts and ends inside one short
             // press has only ever applied [Game.IMPULSE]. Off the arena it stays a single discrete
@@ -355,10 +404,15 @@ class MainActivity : Activity(), GameHost {
                     if (abs(dx) >= abs(dy)) onSwipe(turnDir(if (dx < 0) -1 else 1))
                     else onSwipe(if (dy < 0) Swipe.UP else Swipe.DOWN)
                 } else if (SystemClock.uptimeMillis() - downT < 400) {
-                    // Only when the pad is NOT classifying for us. On these glasses it always is,
-                    // so this is a fallback for hardware that reports touch and nothing else — it
-                    // must never fire alongside the key path or it re-creates the echo above.
-                    if (!padClassifies && SystemClock.uptimeMillis() - lastKeyGestureMs > 600) onTap(false)
+                    // Once taps are known to arrive as keys this is pure echo and is dropped. Until
+                    // then the touch IS the tap, and where it goes depends on what a late tap would
+                    // cost: in the arena, instantly, because a shot that arrives 300 ms after you
+                    // asked for it is not the shot you asked for — and because breaking a capture
+                    // is a mashing contest. Off the arena, into a burst that can still turn out to
+                    // have been half of a double-tap.
+                    if (!padTapsAreKeys && SystemClock.uptimeMillis() - lastKeyGestureMs > 600) {
+                        if (game.tapsAreUrgent) onTap(false) else touchTap()
+                    }
                 }
             }
         }
