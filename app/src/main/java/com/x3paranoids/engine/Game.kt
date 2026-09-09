@@ -20,12 +20,18 @@ interface GameHost {
     fun say(id: String, urgent: Boolean = false)
     fun sayAll(ids: List<String>)
     fun stopVoice()
+    /** The PILOT track (assets/voice_hero). [patienceMs] is how long the line will wait for the floor. */
+    fun hero(id: String, patienceMs: Long = 1500L)
+    fun stopHero()
     fun musicEnabled(on: Boolean)
     fun voiceEnabled(on: Boolean)
     fun headEnabled(on: Boolean)
     fun recentreHead()
     fun applyVolume(v0to10: Int)
     fun voiceDurationMs(id: String): Int
+    fun heroDurationMs(id: String): Int
+    /** True while EITHER voice is speaking — ambient chatter stands aside rather than ducking under it. */
+    fun voiceBusy(): Boolean
 }
 
 enum class State { TITLE, PLAY, WAVE_CLEAR, DYING, GAME_OVER }
@@ -68,6 +74,14 @@ class Recognizer(var x: Float, var z: Float) {
     var hp = 1
     var alert = 0f          // 0 patrol green … 1 hunting red
     var hunting = false
+    /**
+     * How much of this machine the periscope can actually see, 0..1 — the renderer's alpha, and its
+     * whole occlusion test (see GLRenderer's OCCLUSION note). It ramps rather than switching so a
+     * Recognizer crossing a doorway de-rezzes over about a tenth of a second instead of strobing on
+     * the wall edge. Starts at 0: a machine spawns hidden and fades in only if it is genuinely in
+     * sight, which is cheaper to reason about than spawning it lit and hoping.
+     */
+    var vis = 0f
     /** True on the frames this Recognizer actually has the tank in its sights — it can shoot you NOW. */
     var hasLos = false
     var seenT = -99f        // last time the player was in sight
@@ -113,6 +127,19 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         const val RAM_D = 2.3f
         /** How hard a ram throws the pair apart — spent on the Recognizer first, then on the tank. */
         const val RAM_PUSH = 2.5f
+        /**
+         * How fast a thing fades in or out of sight as a wall clears or closes, in units of alpha
+         * per second — about a tenth of a second end to end. Fast enough that nothing is ever
+         * meaningfully drawn through a wall, slow enough that a machine hunting you along a row of
+         * doorways de-rezzes and re-rezzes instead of flickering.
+         */
+        const val VIS_RATE = 9f
+        /** How many derezzes may be coming apart at once. Four × 60 segments is the whole budget. */
+        const val MAX_DEREZ = 4
+        /** Gravity on a falling fragment — heavier than real, so debris settles inside its own life. */
+        const val FRAG_G = 13f
+        /** How long the tank's death runs before GAME OVER. The sight has to fail visibly first. */
+        const val DYING_T = 3.4f
         val INTRO = listOf("intro_1", "intro_2", "intro_3", "intro_4", "intro_5", "intro_6", "intro_7", "intro_8")
         val INTRO_TEXT = listOf(
             "GREETINGS, PROGRAM.",
@@ -160,8 +187,14 @@ class Game(val store: SettingsStore, private val host: GameHost) {
     val recognizers = ArrayList<Recognizer>()
     val shots = ArrayList<Shot>()
     val sparks = ArrayList<Spark>()
+    /** Everything currently coming apart — see [Derez]. Drained by [updateDerez]. */
+    val derezzes = ArrayList<Derez>()
+    /** How far the periscope has sunk through the tank's own death, 0 … ~1.15 units. */
+    var deathSink = 0f; private set
     var bitX = 0f; var bitZ = 0f; var bitActive = false; private set
     var bitT = 0f; private set
+    /** The Bit's share of the same sight ramp. It does not move, so it only ever changes as you do. */
+    var bitVis = 0f; private set
 
     // title / intro
     var introLine = -1; private set      // index of the lore line being spoken; -1 none yet; 8 = done
@@ -185,9 +218,101 @@ class Game(val store: SettingsStore, private val host: GameHost) {
     }
 
     private val rng = Random(System.nanoTime())
+    private val rnd: () -> Float = { rng.nextFloat() }
     private val tmp = FloatArray(2)
     private var lastKillSay = -99f
     private var humLevel = 0f
+
+    // ------------------------------------------------------------------ timed beats
+    /**
+     * A one-shot scheduled on the GL thread. It is how the two voices ANSWER each other: the system
+     * states a fact, and the pilot's retort is posted for the moment the system finishes saying it.
+     * Doing it here rather than off the voice thread's completion callback keeps every decision the
+     * game makes on one thread, and lets a beat be cancelled wholesale when the state changes.
+     */
+    private class Cue(var t: Float, val run: () -> Unit)
+    private val cues = ArrayList<Cue>()
+    private fun cue(t: Float, run: () -> Unit) { cues += Cue(t, run) }
+    private fun clearCues() { cues.clear() }
+    private fun runCues(dt: Float) {
+        if (cues.isEmpty()) return
+        var i = 0
+        while (i < cues.size) {
+            val c = cues[i]
+            c.t -= dt
+            if (c.t <= 0f) { cues.removeAt(i); c.run() } else i++
+        }
+    }
+
+    // ------------------------------------------------------------------ the pilot's voice
+    /**
+     * RESTRAINT IS THE WHOLE CRAFT HERE. Twenty-one lines will not survive a game that fires them
+     * whenever their trigger happens: a pilot who comments on every kill is wallpaper by the end of
+     * wave one, and the second time you hear the same quip it stops being a person and becomes a
+     * sound effect. So every pilot line passes four gates before it is allowed to exist:
+     *
+     *  - [gap]    seconds since ANY pilot line. The floor is [PILOT_GAP]; nothing beats it. This is
+     *             the single most important number in the mix — it is what makes the pilot someone
+     *             who occasionally speaks rather than a commentary track.
+     *  - [cd]     seconds since THIS line. Repetition is what kills a small script, so the same
+     *             clip is locked out far longer than the gap.
+     *  - [chance] a coin. Two identical situations giving different results is what makes a voice
+     *             feel like it CHOSE to speak.
+     *  - [once]   for the lines that only land the first time: the opening, the last life, the end.
+     *
+     * [delay] is the conversation. The system's line is queued the instant the event happens; the
+     * pilot's answer is scheduled for when that line has FINISHED, and carries enough patience
+     * ([VoiceBus]) to wait out any overrun. The alternative — firing both at once and letting the
+     * bus arbitrate — produces the same words in an accidental order, which is not a conversation.
+     */
+    private val pilotLast = HashMap<String, Float>()
+    private val pilotOnce = HashSet<String>()
+    private var pilotLastAny = -99f
+    private var pilotStreak = 0
+    private var pilotKillIdx = 0
+    private var lastKillT = -99f
+    private var hitsRecent = 0
+    private var lastHitT = -99f
+
+    // the Bit's own clocks
+    private var bitChirpCd = 0f
+    private var bitNoCd = 0f
+    private var bitNearSaid = false
+
+    /** No two pilot lines closer together than this, ever. */
+    private val PILOT_GAP = 7f
+
+    private fun pilot(id: String, gap: Float = PILOT_GAP, cd: Float = 24f, chance: Float = 1f,
+                      once: Boolean = false, delay: Float = 0f, patience: Long = 1500L): Boolean {
+        if (!store.voice) return false
+        if (once && id in pilotOnce) return false
+        if (time - pilotLastAny < gap) return false
+        if (time - (pilotLast[id] ?: -999f) < cd) return false
+        if (chance < 1f && rng.nextFloat() > chance) return false
+        pilotLastAny = time; pilotLast[id] = time
+        if (once) pilotOnce += id
+        if (delay > 0f) cue(delay) { host.hero(id, patience) } else host.hero(id, patience)
+        return true
+    }
+
+    /** How long the system voice will be busy saying these, plus a beat of air. */
+    private fun after(vararg ids: String): Float {
+        var ms = 0
+        for (id in ids) ms += max(400, host.voiceDurationMs(id))
+        return ms / 1000f + 0.3f
+    }
+
+    /** The same, for a pilot line. */
+    private fun afterHero(id: String): Float = max(400, host.heroDurationMs(id)) / 1000f + 0.3f
+
+    /**
+     * SHIELD BOOSTERS are a later phase; these are the hooks their three pilot lines hang on, wired
+     * to the same rate limiter as everything else so that phase has nothing to invent. Call them
+     * when the pickup lands, when a shield eats a bolt, and when the last of it goes.
+     */
+    fun onShieldUp() { host.sfx(com.x3paranoids.audio.Sfx.BIT_YES, 0.8f, 0.7f); pilot("hero_shield_up", cd = 40f, chance = 0.8f) }
+    fun onShieldHit() { pilot("hero_shield_hit", cd = 25f, chance = 0.45f) }
+    fun onShieldDown() { pilot("hero_shield_down", cd = 30f, chance = 0.9f) }
 
     // ------------------------------------------------------------------ boot / title
     fun boot() { enterTitle() }
@@ -195,8 +320,10 @@ class Game(val store: SettingsStore, private val host: GameHost) {
     private fun enterTitle() {
         state = State.TITLE; stateT = 0f
         introLine = -1; showTap = false; introFallback = 0f
-        recognizers.clear(); shots.clear(); sparks.clear(); bitActive = false
-        host.stopVoice()
+        recognizers.clear(); shots.clear(); sparks.clear(); derezzes.clear(); bitActive = false
+        deathSink = 0f
+        clearCues()
+        host.stopHero(); host.stopVoice()
         if (store.voice) host.sayAll(INTRO) else introLine = 0
     }
 
@@ -305,10 +432,15 @@ class Game(val store: SettingsStore, private val host: GameHost) {
 
     // ------------------------------------------------------------------ game flow
     private fun startGame() {
-        host.stopVoice()
+        host.stopHero(); host.stopVoice()
+        clearCues()
         mazeSeed = System.nanoTime(); maze = Maze(8, 8, mazeSeed)
         lives = 3; score = 0; wave = 0; elapsed = 0f; kills = 0; invuln = 0f; damageFlash = 0f
         vx = 0f; vz = 0f; hullYaw = 0f; hullTarget = 0f; turnBlend = 0f; newHigh = false
+        derezzes.clear(); deathSink = 0f
+        pilotLast.clear(); pilotOnce.clear(); pilotLastAny = -99f; pilotStreak = 0; pilotKillIdx = 0
+        lastKillT = -99f; lastKillSay = -99f
+        hitsRecent = 0; lastHitT = -99f; bitNearSaid = false; bitChirpCd = 1.4f; bitNoCd = 0f
         store.games = store.games + 1
         placePlayer(maze.cols / 2, maze.rows / 2)
         host.recentreHead()
@@ -350,9 +482,23 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         val bitCells = far.filter { dist[it[0]][it[1]] >= 3 }
         val bc = if (bitCells.isNotEmpty()) bitCells[rng.nextInt(bitCells.size)] else far[0]
         bitX = maze.cellX(bc[0]); bitZ = maze.cellZ(bc[1]); bitActive = true; bitT = 0f
+        bitNearSaid = false; bitChirpCd = 2.2f; bitNoCd = 3f
         host.sfx(com.x3paranoids.audio.Sfx.WAVE)
-        host.say(if (wave <= 12) "wave_$wave" else "wave_more", urgent = true)
+        val waveId = if (wave <= 12) "wave_$wave" else "wave_more"
+        host.say(waveId, urgent = true)
         host.say("incoming")
+        // THE FIRST CONVERSATION. The system announces the wave and says INCOMING; the pilot answers
+        // it once the machine has finished talking. Wave one is the opening statement and always
+        // lands; after that the answer is occasional, and from wave six it is the tired one.
+        val answerAt = after(waveId, "incoming")
+        val answered = when {
+            wave == 1 -> pilot("hero_start", gap = 0f, once = true, delay = answerAt, patience = 6000L)
+            wave >= 6 -> pilot("hero_wave_late", gap = 0f, cd = 50f, chance = 0.55f, delay = answerAt, patience = 5000L)
+            else -> pilot("hero_wave", gap = 0f, cd = 45f, chance = 0.40f, delay = answerAt, patience = 5000L)
+        }
+        // Only when the wave line did NOT fire: the villain gets named out loud, once a game and
+        // never early. A flourish stops being one the moment it is on a schedule.
+        if (!answered && wave >= 4) pilot("hero_mcp", gap = 0f, chance = 0.22f, once = true, delay = answerAt, patience = 5000L)
     }
 
     private fun waveCleared() {
@@ -362,68 +508,70 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         store.bestWave = wave
         host.sfx(com.x3paranoids.audio.Sfx.CLEAR)
         host.say("wave_clear", urgent = true)
+        // THE BIT WAS LEFT BEHIND. It has been chirping at you for a whole wave; if you never came,
+        // it says so — the one reaction that makes it a character with an opinion about you rather
+        // than a pickup you happened not to collect.
+        if (bitActive) {
+            bitActive = false
+            cue(after("wave_clear") - 0.15f) { host.sfx(com.x3paranoids.audio.Sfx.BIT_LOSE, 1f, 0.75f) }
+        }
+        // The pilot answers the clear; failing that, it sometimes just thinks out loud in the quiet.
+        val at = after("wave_clear")
+        pilot("hero_wave_clear", gap = 5f, cd = 40f, chance = 0.70f, delay = at, patience = 4000L) ||
+            pilot("hero_quiet", gap = 5f, cd = 90f, chance = 0.45f, delay = at, patience = 4000L)
     }
 
-    // ===== TEMPORARY VERIFICATION HARNESS — REMOVE BEFORE HANDING BACK =====
-    private val DBG = true
-    /** Hold the Recognizers in patrol so they wander past walls instead of gluing to the standoff. */
-    private val DBG_PASSIVE = false
-    /** Nail them to the spot, so a screenshot and a log line describe exactly the same world. */
-    private val DBG_FREEZE = false
-    private var dbgT = 0f
-    /** Closest any Recognizer centre has come to a wall PLANE all run: must never fall below HALF_W. */
-    private var dbgMinWall = 99f
-    private fun wallDist(x: Float, z: Float): Float {
-        var best = 99f
-        for (w in maze.walls) {
-            val dx = w.x1 - w.x0; val dz = w.z1 - w.z0
-            val ll = dx * dx + dz * dz
-            val t = if (ll < 1e-6f) 0f else (((x - w.x0) * dx + (z - w.z0) * dz) / ll).coerceIn(0f, 1f)
-            val d = hypot(x - (w.x0 + dx * t), z - (w.z0 + dz * t))
-            if (d < best) best = d
-        }
-        return best
-    }
-    private fun dbg(dt: Float) {
-        if (!DBG) return
-        dbgT += dt
-        if (dbgT < 0.5f || state != State.PLAY) return
-        dbgT = 0f
-        val sb = StringBuilder("P(%.1f,%.1f) yaw=%.0f pitch=%.0f".format(px, pz, yaw * 180f / PI.toFloat(), pitch * 180f / PI.toFloat()))
-        for ((i, r) in recognizers.withIndex()) {
-            val dx = r.x - px; val dz = r.z - pz
-            val dd = hypot(dx, dz)
-            // bearing off the periscope's centreline, degrees; |b| < 38 is roughly on screen
-            var b = (atan2(dx, -dz) - yaw) * 180f / PI.toFloat()
-            while (b > 180f) b -= 360f
-            while (b < -180f) b += 360f
-            val wd = wallDist(r.x, r.z)
-            if (wd < dbgMinWall) dbgMinWall = wd
-            sb.append(" | R$i(%.1f,%.1f) d=%.1f bear=%.0f los=%b fire=%b wall=%.2f".format(
-                r.x, r.z, dd, b, maze.lineOfSight(r.x, r.z, px, pz), r.hasLos, wd))
-        }
-        sb.append(" || MINWALL=%.2f (need >= %.2f)".format(dbgMinWall, Recognizer.HALF_W))
-        android.util.Log.i("X3Paranoids", "DBG $sb")
-    }
-    // ===== END TEMPORARY HARNESS =====
 
     private fun damagePlayer() {
-        if (DBG) return
         if (invuln > 0f || state != State.PLAY) return
         lives--
         damageFlash = 1f; invuln = 2.6f
         vx *= 0.3f; vz *= 0.3f
+        hitsRecent = if (time - lastHitT < 20f) hitsRecent + 1 else 1
+        lastHitT = time
         if (lives <= 0) {
-            state = State.DYING; stateT = 0f
+            state = State.DYING; stateT = 0f; deathSink = 0f
+            // NOTHING THE PILOT HAD LINED UP STILL APPLIES. Watched on the glasses: a hero_last_life
+            // queued four seconds earlier, held off the floor all that time by the system's LOCKON
+            // chatter, finally landed ON the death — and then ran long enough that the urgent GAME
+            // OVER cut off the derez retort behind it. The death is one of three beats in this game
+            // that are deliberately timed, so it clears the decks first: pending cues go, and
+            // anything the pilot is mid-way through stops.
+            clearCues()
+            host.stopHero()
             host.sfx(com.x3paranoids.audio.Sfx.DIE)
             host.say("derezzed", urgent = true)
-            burst(px, EYE_H, pz, 40, 1f, 0.35f, 0.3f)
+            // THE PLAYER'S OWN DEREZ. The hull comes apart around the periscope (see Derez.seedPlayer)
+            // and the sight fails on top of it in the renderer. The sparks are only grit now — the
+            // structure leaving you is what the moment is made of.
+            derezzes += Derez(px, EYE_H, pz, yaw, 1f, 1f, true).also { it.seedPlayer(rnd) }
+            burst(px, EYE_H, pz, 26, 1f, 0.35f, 0.3f)
+            // "DEREZZED," says the machine. The pilot has the last word over its own death.
+            pilot("hero_derez", gap = 0f, cd = 0f, delay = after("derezzed"), patience = 3000L)
         } else {
             host.sfx(com.x3paranoids.audio.Sfx.HIT)
-            host.say(if (lives == 1) "last_life" else "hit", urgent = true)
+            val sysId = if (lives == 1) "last_life" else "hit"
+            host.say(sysId, urgent = true)
+            val at = after(sysId)
+            when {
+                // The last life is the one damage beat that always gets an answer — but it is a
+                // REACTION, so it does not loiter. If the machine is still talking two and a half
+                // seconds later the moment has gone, and the line is better dropped than delivered
+                // over whatever happened next.
+                lives == 1 -> pilot("hero_last_life", gap = 0f, once = true, delay = at, patience = 2500L)
+                hitsRecent >= 2 -> pilot("hero_hit_bad", gap = 9f, cd = 26f, chance = 0.60f, delay = at, patience = 2500L)
+                else -> pilot("hero_hit", gap = 9f, cd = 22f, chance = 0.35f, delay = at, patience = 2000L)
+            }
         }
     }
 
+    /**
+     * THE LAST CONVERSATION, and the one worth timing by hand. The machine pronounces the ending;
+     * the pilot answers it; and only then does the machine get its END OF LINE. A new high score
+     * opens the exchange out to five beats, alternating, which is the closest the two of them ever
+     * come to actually talking. Everything after the first line is scheduled rather than queued, so
+     * the order is authored and not an accident of who reached the bus first.
+     */
     private fun gameOver() {
         state = State.GAME_OVER; stateT = 0f
         host.hum(0f, 1f)
@@ -431,8 +579,16 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         store.highScore = score
         host.sfx(com.x3paranoids.audio.Sfx.GAMEOVER)
         host.say("game_over", urgent = true)
-        if (newHigh) { host.say("high_score"); host.sfx(com.x3paranoids.audio.Sfx.HISCORE) }
-        host.say("end_of_line")
+        var t = after("game_over")
+        cue(t) { host.hero("hero_game_over", 4000L) }
+        t += afterHero("hero_game_over")
+        if (newHigh) {
+            cue(t) { host.sfx(com.x3paranoids.audio.Sfx.HISCORE); host.say("high_score") }
+            t += after("high_score")
+            cue(t) { host.hero("hero_high_score", 4000L) }
+            t += afterHero("hero_high_score")
+        }
+        cue(t) { host.say("end_of_line") }
     }
     val isNewHigh get() = newHigh
 
@@ -451,6 +607,10 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         stateT += dt
         muzzle = max(0f, muzzle - dt * 9f)
         damageFlash = max(0f, damageFlash - dt * 1.6f)
+        runCues(dt)
+        // Derez runs outside the state machine: a machine that broke apart a moment before the wave
+        // cleared, or the tank's own hull leaving the seat, has to finish falling wherever it is.
+        if (state != State.TITLE) updateDerez(dt)
         when (state) {
             State.TITLE -> {
                 // voice off (or missing clips): advance the crawl on the manifest's own timing
@@ -463,13 +623,19 @@ class Game(val store: SettingsStore, private val host: GameHost) {
             }
             State.PLAY -> updatePlay(dt)
             State.WAVE_CLEAR -> { updateWorld(dt, false); if (stateT > 3.2f) nextWave() }
-            State.DYING -> { updateWorld(dt, false); if (stateT > 2.4f) gameOver() }
+            State.DYING -> {
+                updateWorld(dt, false)
+                // The periscope sinks as the hull goes: an eased 1.15 units over about two seconds.
+                // Slow and monotonic on purpose — this is a head-worn display, and the one thing a
+                // death must not do is throw the horizon around.
+                deathSink = 1.15f * (1f - exp(-stateT * 1.3f))
+                if (stateT > DYING_T) gameOver()
+            }
             State.GAME_OVER -> {}
         }
     }
 
     private fun updatePlay(dt: Float) {
-        dbg(dt)
         elapsed += dt
         fireCd = max(0f, fireCd - dt)
         invuln = max(0f, invuln - dt)
@@ -482,15 +648,29 @@ class Game(val store: SettingsStore, private val host: GameHost) {
             px = tmp[0]; pz = tmp[1]
             if (bumped && speed > 3f) { host.sfx(com.x3paranoids.audio.Sfx.BUMP, 0.9f + rng.nextFloat() * 0.2f, min(1f, speed / 9f)); vx *= 0.35f; vz *= 0.35f }
         }
-        updateWorld(dt, !DBG_PASSIVE)
+        updateWorld(dt, true)
         if (bitActive) {
             bitT += dt
-            if (hypot(px - bitX, pz - bitZ) < 1.9f) {
+            val bitSeen = maze.lineOfSight(bitX, bitZ, px, pz)
+            val step = dt * VIS_RATE
+            bitVis = if (bitSeen) min(1f, bitVis + step) else max(0f, bitVis - step)
+            val bd = hypot(px - bitX, pz - bitZ)
+            updateBitVoice(dt, bd)
+            // once per wave, and only when you can actually SEE it — the line is a confirmation,
+            // not a hint, and a hint from behind a wall would undercut the chirps that are the hint
+            if (!bitNearSaid && bd < 13f && bitSeen) {
+                bitNearSaid = true
+                pilot("hero_bit_near", cd = 35f, chance = 0.7f)
+            }
+            if (bd < 1.9f) {
                 bitActive = false
                 score += 500; lives = min(lives + 1, 5)
                 burst(bitX, 1.4f, bitZ, 30, 0.4f, 1f, 1f)
-                host.sfx(com.x3paranoids.audio.Sfx.BIT)
+                host.sfx(com.x3paranoids.audio.Sfx.BIT_GET)
+                // it says YES on the way out — the Bit's one unambiguous word, on its one good day
+                cue(0.24f) { host.sfx(com.x3paranoids.audio.Sfx.BIT_YES, 1f, 0.9f) }
                 host.say("bit", urgent = true)
+                pilot("hero_bit_get", gap = 4f, cd = 30f, chance = 0.6f, delay = after("bit"), patience = 3000L)
             }
         }
         if (recognizersLeft == 0) waveCleared()
@@ -507,10 +687,22 @@ class Game(val store: SettingsStore, private val host: GameHost) {
             val r = it.next()
             if (r.hp <= 0) { it.remove(); continue }
             r.hitFlash = max(0f, r.hitFlash - dt * 6f)
-            r.y = if (DBG_FREEZE) 1.6f else 1.6f + 0.3f * sin(time * 2.1f + r.phase)
+            r.y = 1.6f + 0.3f * sin(time * 2.1f + r.phase)
             val ddx = px - r.x; val ddz = pz - r.z
             val d = hypot(ddx, ddz)
             nearest = min(nearest, d)
+            // CAN THE PERISCOPE SEE IT? The renderer draws nothing it cannot, so this is the whole of
+            // the wall occlusion for entities. Three samples across the machine's own width — axle
+            // and both ends of the cross-bar in its current heading — because it is 3.7 units wide
+            // and a test on the axle alone would blink the thing out while a third of it is still
+            // round the corner in plain sight. The local +x axis maps to world (cos yaw, -sin yaw),
+            // matching GLRenderer.buildRecognizer exactly, so the samples sit on the drawn bar.
+            val ec = cos(r.yaw) * Recognizer.HALF_W; val es = -sin(r.yaw) * Recognizer.HALF_W
+            val seen = maze.lineOfSight(r.x, r.z, px, pz) ||
+                maze.lineOfSight(r.x + ec, r.z + es, px, pz) ||
+                maze.lineOfSight(r.x - ec, r.z - es, px, pz)
+            val visStep = dt * VIS_RATE
+            r.vis = if (seen) min(1f, r.vis + visStep) else max(0f, r.vis - visStep)
             val los = d < 34f && maze.lineOfSight(r.x, r.z, px, pz)
             if (los) r.seenT = time
             // SEEING YOU AND HAVING THE SHOT ARE TWO DIFFERENT TESTS. Sight is measured axle to
@@ -568,7 +760,7 @@ class Game(val store: SettingsStore, private val host: GameHost) {
                 } else { r.targetC = -1 }
             }
             val sp = speedBase * (if (chasing) 1.15f else 0.8f)
-            if (!DBG_FREEZE && (mx != 0f || mz != 0f)) {
+            if (mx != 0f || mz != 0f) {
                 maze.move(r.x, r.z, mx * sp * dt, mz * sp * dt, Recognizer.RADIUS, tmp); r.x = tmp[0]; r.z = tmp[1]
             }
             // RAMMING. The recoil used to be written straight into r.x/r.z — a raw 2.5-unit
@@ -623,9 +815,14 @@ class Game(val store: SettingsStore, private val host: GameHost) {
                     if (r.hp <= 0) {
                         kills++
                         score += 100 * wave * (if (hard) 3 else 2) / 2
-                        burst(r.x, r.y + 1.2f, r.z, 36, 0.5f, 1f, 0.6f)
-                        host.sfx(com.x3paranoids.audio.Sfx.EXPLODE, 0.9f + rng.nextFloat() * 0.2f)
-                        if (time - lastKillSay > 4f) { lastKillSay = time; host.say("destroyed") }
+                        spawnDerez(r)
+                        // A handful of sparks at the break, no more. The fragments carry the death now;
+                        // the old 36-dot puff on top of them was just a second, worse explosion.
+                        burst(r.x, r.y + 1.2f, r.z, 12, 0.9f, 1f, 0.85f)
+                        host.sfx(com.x3paranoids.audio.Sfx.DEREZ, 0.92f + rng.nextFloat() * 0.16f)
+                        val said = time - lastKillSay > 4f
+                        if (said) { lastKillSay = time; host.say("destroyed") }
+                        onKill(said)
                     } else host.sfx(com.x3paranoids.audio.Sfx.RICOCHET, 0.7f)
                     si.remove(); break
                 }
@@ -641,6 +838,145 @@ class Game(val store: SettingsStore, private val host: GameHost) {
             if (p.life <= 0f) { pi.remove(); continue }
             p.x += p.vx * dt; p.y += p.vy * dt; p.z += p.vz * dt
             p.vy -= 9f * dt
+        }
+    }
+
+    // ------------------------------------------------------------------ derez
+    /**
+     * Overload, then fracture, then the grid. See [Derez] for the shape of the sequence; this is
+     * only its physics.
+     *
+     * FRAGMENTS OBEY THE WALLS, like everything else in this game: the centre goes through
+     * [Maze.move] on a small radius, so a Recognizer that derezzes against a wall throws its pieces
+     * back off it instead of through it, and the debris of a death round a corner stays round the
+     * corner. The renderer runs its own sight test per fragment, so it is never DRAWN through one
+     * either.
+     *
+     * The landing is the part that ties the death to the room. A piece bounces once or twice with
+     * most of its energy gone, and from the first touch it is [Frag.down]: its own length rotates
+     * down into the horizontal (at constant length — it lies flat, it does not shrink), its spin
+     * bleeds off, and it slides to a stop on the floor grid it will fade into.
+     */
+    private fun updateDerez(dt: Float) {
+        if (derezzes.isEmpty()) return
+        val di = derezzes.iterator()
+        while (di.hasNext()) {
+            val d = di.next()
+            d.t += dt
+            if (!d.broken) {
+                if (d.t >= d.overload) { if (d.player) d.seedPlayer(rnd) else d.seedRecognizer(rnd) }
+                continue
+            }
+            val fi = d.frags.iterator()
+            while (fi.hasNext()) {
+                val f = fi.next()
+                f.life -= dt
+                if (f.life <= 0f) { fi.remove(); continue }
+                f.vy -= FRAG_G * dt
+                // tumble: Rodrigues about the fragment's own axis
+                if (abs(f.w) > 0.01f) {
+                    val th = f.w * dt
+                    val ct = cos(th); val st = sin(th)
+                    val dot = f.ax * f.ex + f.ay * f.ey + f.az * f.ez
+                    val crx = f.ay * f.ez - f.az * f.ey
+                    val cry = f.az * f.ex - f.ax * f.ez
+                    val crz = f.ax * f.ey - f.ay * f.ex
+                    f.ex = f.ex * ct + crx * st + f.ax * dot * (1f - ct)
+                    f.ey = f.ey * ct + cry * st + f.ay * dot * (1f - ct)
+                    f.ez = f.ez * ct + crz * st + f.az * dot * (1f - ct)
+                }
+                // walls, on the same slide-and-stop the tank uses
+                val bumped = maze.move(f.cx, f.cz, f.vx * dt, f.vz * dt, 0.14f, tmp)
+                f.cx = tmp[0]; f.cz = tmp[1]
+                if (bumped) { f.vx *= -0.30f; f.vz *= -0.30f; f.w *= 1.35f }
+                f.cy += f.vy * dt
+                val low = f.cy - abs(f.ey)
+                if (low < 0.05f) {
+                    f.cy += 0.05f - low
+                    if (f.vy < 0f) { f.vy = -f.vy * 0.30f; f.vx *= 0.62f; f.vz *= 0.62f; f.w *= 0.5f }
+                    if (abs(f.vy) < 0.7f) f.vy = 0f
+                    f.down = true
+                }
+                if (f.down) {
+                    // settle flat onto the grid, at constant length
+                    val l0 = sqrt(f.ex * f.ex + f.ey * f.ey + f.ez * f.ez)
+                    f.ey *= max(0f, 1f - dt * 3.4f)
+                    val l1 = sqrt(f.ex * f.ex + f.ey * f.ey + f.ez * f.ez).coerceAtLeast(1e-4f)
+                    val k = l0 / l1
+                    f.ex *= k; f.ey *= k; f.ez *= k
+                    val fr = max(0f, 1f - dt * 1.7f)
+                    f.vx *= fr; f.vz *= fr; f.w *= max(0f, 1f - dt * 2.4f)
+                }
+            }
+            if (d.frags.isEmpty()) di.remove()
+        }
+    }
+
+    /**
+     * The pilot on a kill. THREE kill lines and one streak line will not survive being spoken every
+     * time something dies — a wave is up to nine machines, and a voice that marks every one of them
+     * is a laugh track. So: they ROTATE (never the same line twice running), they fire about a
+     * third of the time, and the global gap means a burst of kills yields at most one remark.
+     *
+     * A STREAK IS DIFFERENT and gets its own line at a much higher rate: three inside nine seconds
+     * is a thing you actually did, and the one moment where being told so is earned.
+     *
+     * [systemSpoke] delays the answer past the machine's own DESTROYED, so when both fire it reads
+     * as a retort rather than a collision.
+     */
+    private fun onKill(systemSpoke: Boolean) {
+        pilotStreak = if (time - lastKillT < 9f) pilotStreak + 1 else 1
+        lastKillT = time
+        val at = if (systemSpoke) after("destroyed") else 0.35f
+        if (pilotStreak >= 3 && pilot("hero_kill_streak", gap = 6f, cd = 55f, chance = 0.85f, delay = at, patience = 2500L)) {
+            pilotStreak = 0
+            return
+        }
+        val ids = arrayOf("hero_kill_1", "hero_kill_2", "hero_kill_3")
+        val id = ids[pilotKillIdx % ids.size]
+        if (pilot(id, gap = 10f, cd = 40f, chance = 0.32f, delay = at, patience = 2000L)) pilotKillIdx++
+    }
+
+    private fun spawnDerez(r: Recognizer) {
+        // Oldest first: a wave that dies all at once should show you the DEATHS IN FRONT OF YOU, and
+        // the one still coming apart is always the newest.
+        while (derezzes.size >= MAX_DEREZ) derezzes.removeAt(0)
+        derezzes += Derez(r.x, r.y, r.z, r.yaw, 1f, r.alert, false)
+    }
+
+    // ------------------------------------------------------------------ the Bit's voice
+    /**
+     * The Bit is DEFINED by its voice: it says yes and no and nothing else, and that is its entire
+     * character. Silent, it was a waypoint. Given a voice it becomes the only thing in the arena
+     * that is on your side, and — because the chatter tightens as you close — it is also the answer
+     * to the one objective the game states out loud and then refuses to help with.
+     *
+     * THE MIX IS THE HARD PART. Three rules keep it from becoming a metronome:
+     *  - the interval is a smooth function of range, from 4.6 s across the arena down to a floor of
+     *    0.75 s at arm's length, with a random tail so it never locks to a beat;
+     *  - a chirp is SKIPPED, not ducked, while either voice has the floor — it is ambience, and
+     *    ambience waits;
+     *  - close in, roughly one chirp in three becomes an actual YES, quietly. That is the Bit
+     *    getting excited, and it is the cue that says "you are nearly on it" without a HUD element.
+     *
+     * And it reacts. A Recognizer within seven units of the Bit gets a NO — the Bit is frightened
+     * of them, which tells you where one is AND makes the Bit a character with a stake in this.
+     */
+    private fun updateBitVoice(dt: Float, d: Float) {
+        bitChirpCd -= dt
+        bitNoCd -= dt
+        if (bitChirpCd <= 0f) {
+            val near = (1f - (d - 3f) / 28f).coerceIn(0f, 1f)      // 0 across the arena … 1 on top of it
+            bitChirpCd = 4.6f - 3.85f * near + rng.nextFloat() * 0.6f
+            if (!host.voiceBusy()) {
+                if (near > 0.55f && rng.nextFloat() < 0.32f) host.sfx(com.x3paranoids.audio.Sfx.BIT_YES, 0.95f + 0.15f * near, 0.22f + 0.26f * near)
+                else host.sfx(com.x3paranoids.audio.Sfx.BIT_CHIRP, 0.82f + 0.62f * near, 0.20f + 0.40f * near)
+            }
+        }
+        if (bitNoCd <= 0f) {
+            var nr = 999f
+            for (r in recognizers) if (r.hp > 0) nr = min(nr, hypot(r.x - bitX, r.z - bitZ))
+            if (nr < 7f) { bitNoCd = 6.5f; if (!host.voiceBusy()) host.sfx(com.x3paranoids.audio.Sfx.BIT_NO, 1f, 0.45f) }
         }
     }
 

@@ -6,7 +6,7 @@ import android.opengl.Matrix
 import com.x3paranoids.SettingsStore
 import com.x3paranoids.engine.Game
 import com.x3paranoids.engine.Maze
-import com.x3paranoids.engine.Recognizer
+import com.x3paranoids.engine.RecognizerModel
 import com.x3paranoids.engine.State
 import com.x3paranoids.head.HeadTracker
 import java.nio.ByteBuffer
@@ -39,7 +39,7 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
     private var width = 1; private var height = 1
     private var lastNanos = 0L
     private var maxLine = 1f
-    /** 0 until the surface reports in; if it ever comes back 0 there is no occlusion to be had. */
+    /** Reported once at surface creation. Nothing depends on it any more — see [OCCLUSION]. */
     private var depthBits = 0
 
     private val proj = FloatArray(16); private val view = FloatArray(16); private val mvp = FloatArray(16); private val ortho = FloatArray(16)
@@ -47,14 +47,27 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
     private val mesh = Batch(30000)
     private val tris = Batch(3000)
     private val pts = Batch(6000)
-    private val hud = Batch(12000)
-    /** The invisible solids: wall panels (and the floor) as triangles, drawn to depth only. */
-    private val occl = Batch(4000)
+    // The HUD batch has room for three times what the sight normally draws, because a failing sight
+    // breaks every stroke into three pieces before it starts dropping them.
+    private val hud = Batch(30000)
     private val rnd = Random(3)
     private var statT = 0f; private var statFrames = 0
 
     private var camX = 0f; private var camY = Game.EYE_H; private var camZ = 0f
     private var fogFar = 62f
+    /**
+     * Per-frame world trace, OFF. Flip it to true for one line per frame naming the periscope's own
+     * position and heading, every Recognizer's range, bearing off the centreline, `vis` and its fire
+     * gate, and the Bit's range and bearing.
+     *
+     * It is how the occlusion cull was verified on the glasses — `vis` and `hasLos` agree on every
+     * line, so a machine you cannot see is a machine that is not shooting at you — and it is also
+     * the only practical way to DRIVE this game over adb, which is what the derez frames and the
+     * Bit's proximity chatter were captured with. Bearings are what let a script aim a hull that
+     * only turns in quarter steps, and the Bit's range is what lets one navigate to a thing the HUD
+     * deliberately refuses to point at.
+     */
+    private val VERIFY = false
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         GLES30.glClearColor(0f, 0f, 0f, 1f)
@@ -65,12 +78,11 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         uPointSize = GLES30.glGetUniformLocation(program, "uPointSize")
         uPoint = GLES30.glGetUniformLocation(program, "uPoint")
         uAlpha = GLES30.glGetUniformLocation(program, "uAlpha")
-        // Depth is LEQUAL, not LESS, because a wall's own strokes are drawn at exactly the depth of
-        // the invisible solid that stands in for it; the occluder is biased back by [OCCL_UNITS] so
-        // they win, and LEQUAL means a stroke that lands on the bias boundary still draws instead of
-        // flickering out. Nothing here ever writes depth except the occluder pass itself.
-        GLES30.glEnable(GLES30.GL_DEPTH_TEST)
-        GLES30.glDepthFunc(GLES30.GL_LEQUAL)
+        // NO DEPTH TEST, EVER. See [OCCLUSION] — hiding is decided on the CPU, per object, before a
+        // vertex is written. Every pass is pure additive phosphor, exactly as a vector monitor sums
+        // one beam over another, and no stroke is ever discarded by a buffer.
+        GLES30.glDisable(GLES30.GL_DEPTH_TEST)
+        GLES30.glDepthMask(false)
         GLES30.glEnable(GLES30.GL_BLEND)
         GLES30.glBlendFunc(GLES30.GL_SRC_ALPHA, GLES30.GL_ONE)
         val range = FloatArray(2); GLES30.glGetFloatv(GLES30.GL_ALIASED_LINE_WIDTH_RANGE, range, 0)
@@ -79,7 +91,7 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         depthBits = bits[0]
         android.util.Log.i("X3Paranoids", "surface: depthBits=${bits[0]} maxLine=$maxLine")
         lastNanos = 0L
-        for (b in arrayOf(lines, mesh, tris, pts, hud, occl)) b.contextLost()
+        for (b in arrayOf(lines, mesh, tris, pts, hud)) b.contextLost()
     }
 
     override fun onSurfaceChanged(gl: GL10?, w: Int, h: Int) {
@@ -103,16 +115,15 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         val aspect = vw.toFloat() / height.toFloat()
 
         GLES30.glViewport(0, 0, width, height)
-        // glClear obeys the depth mask, and the mask is left OFF at the end of every eye's pass, so
-        // it has to be turned back on here or the depth clear is silently a no-op and the second
-        // frame inherits the first one's solids.
-        GLES30.glDepthMask(true)
-        GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT or GLES30.GL_DEPTH_BUFFER_BIT)
+        GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
         GLES30.glUseProgram(program)
 
         // periscope
         val title = game.state == State.TITLE
-        val shake = game.damageFlash * 0.25f
+        // The tank's death carries its own judder on top of the damage shake — decaying, so the
+        // world steadies as the sight fails, rather than both of them going at once.
+        val shake = game.damageFlash * 0.25f +
+            (if (game.state == State.DYING) 0.16f * kotlin.math.exp(-game.stateT * 0.9f) else 0f)
         val sx = (rnd.nextFloat() - 0.5f) * shake; val sy = (rnd.nextFloat() - 0.5f) * shake
         val yaw = if (title) 0f else game.yaw; val pitch = if (title) 0.04f else game.pitch
         val cp = cos(pitch)
@@ -122,8 +133,24 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         Matrix.multiplyMM(mvp, 0, proj, 0, view, 0)
 
         statFrames++; statT += dt
+        if (VERIFY && game.state == State.PLAY) {
+            val sb = StringBuilder("VIS p(%.1f,%.1f) yaw=%.0f".format(game.px, game.pz, game.yaw * 57.2958f))
+            for ((i, r) in game.recognizers.withIndex()) {
+                var b = (kotlin.math.atan2(r.x - game.px, -(r.z - game.pz)) - game.yaw) * 57.2958f
+                while (b > 180f) b -= 360f
+                while (b < -180f) b += 360f
+                sb.append(" | R$i d=%.1f bear=%.0f vis=%.2f hasLos=%b".format(hypot(r.x - game.px, r.z - game.pz), b, r.vis, r.hasLos))
+            }
+            var bb = (kotlin.math.atan2(game.bitX - game.px, -(game.bitZ - game.pz)) - game.yaw) * 57.2958f
+            while (bb > 180f) bb -= 360f
+            while (bb < -180f) bb += 360f
+            sb.append(" || BIT d=%.1f bear=%.0f act=%b".format(hypot(game.bitX - game.px, game.bitZ - game.pz), bb, game.bitActive))
+            sb.append(" || lock=%b bolts=%d".format(game.lockedOn, game.shots.count { !it.friendly }))
+            android.util.Log.i("X3Paranoids", sb.toString())
+        }
         if (statT >= 2f) {
-            android.util.Log.i("X3Paranoids", "fps=%.1f world=%d infill=%d fill=%d occl=%d hud=%d depth=%d".format(statFrames / statT, lines.count, mesh.count, tris.count, occl.count, hud.count, depthBits))
+            android.util.Log.i("X3Paranoids", "fps=%.1f world=%d infill=%d fill=%d hud=%d hidden=%d/%d".format(
+                statFrames / statT, lines.count, mesh.count, tris.count, hud.count, culled, game.recognizers.size))
             statFrames = 0; statT = 0f
         }
 
@@ -132,21 +159,6 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
             GLES30.glViewport(e * vw, 0, vw, height)
             GLES30.glUniformMatrix4fv(uMVP, 1, false, mvp, 0)
             GLES30.glUniform1f(uPoint, 0f)
-            // THE INVISIBLE SOLIDS. Every wall panel and the floor, as filled triangles, with colour
-            // writes masked off and depth writes on: they put the arena's geometry into the depth
-            // buffer and not one photon onto the waveguide. Everything after this is depth-TESTED
-            // and depth-write-free, so a stroke behind a wall is discarded while the strokes that
-            // survive still sum additively with each other exactly as they always did. It is the
-            // only way to have occlusion on a see-through display: you cannot paint an occluder,
-            // because black is the one colour this glass renders as "not there".
-            GLES30.glDepthMask(true)
-            GLES30.glColorMask(false, false, false, false)
-            GLES30.glEnable(GLES30.GL_POLYGON_OFFSET_FILL)
-            GLES30.glPolygonOffset(OCCL_FACTOR, OCCL_UNITS)
-            occl.draw(GLES30.GL_TRIANGLES)
-            GLES30.glDisable(GLES30.GL_POLYGON_OFFSET_FILL)
-            GLES30.glColorMask(true, true, true, true)
-            GLES30.glDepthMask(false)
             // the near-wall wash first: a body for the surface the strokes then draw the frame of
             GLES30.glUniform1f(uAlpha, 1f); tris.draw(GLES30.GL_TRIANGLES)
             // the wall infill: a single fine stroke and NO glow pass. A hundred rungs' halos merge
@@ -158,34 +170,80 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
             GLES30.glLineWidth(1.5f.coerceAtMost(maxLine)); GLES30.glUniform1f(uAlpha, 1f); lines.draw(GLES30.GL_LINES)
             GLES30.glUniform1f(uPoint, 1f); GLES30.glUniform1f(uPointSize, 9f); GLES30.glUniform1f(uAlpha, 1f); pts.draw(GLES30.GL_POINTS)
             clearPlate(e, vw)
-            // The sight is bolted to the glass, not standing in the arena: the HUD and the nav plate
-            // are drawn with the depth test OFF so no wall can ever eat a bracket or a readout.
-            GLES30.glDisable(GLES30.GL_DEPTH_TEST)
+            // The sight is bolted to the glass, not standing in the arena: the ortho pass draws last
+            // and unconditionally, so no wall can ever eat a bracket or a readout.
             GLES30.glUniformMatrix4fv(uMVP, 1, false, ortho, 0)
             GLES30.glUniform1f(uPoint, 0f)
             GLES30.glLineWidth(min(3f, maxLine)); GLES30.glUniform1f(uAlpha, 0.28f); hud.draw(GLES30.GL_LINES)
             GLES30.glLineWidth(1.2f.coerceAtMost(maxLine)); GLES30.glUniform1f(uAlpha, 1f); hud.draw(GLES30.GL_LINES)
-            GLES30.glEnable(GLES30.GL_DEPTH_TEST)   // the other eye's occluder pass needs it back
         }
     }
 
     // ------------------------------------------------------------------ scene
 
     private fun buildScene() {
-        lines.reset(); pts.reset(); tris.reset(); mesh.reset(); occl.reset()
+        lines.reset(); pts.reset(); tris.reset(); mesh.reset()
         if (game.state == State.TITLE) { buildTitleScene(); return }
-        camX = game.px; camY = Game.EYE_H; camZ = game.pz
+        camX = game.px; camY = Game.EYE_H - game.deathSink; camZ = game.pz
         fogFar = 62f
         val tint = game.wallTint()
-        buildOccluders(game.maze)
         buildFloor(game.maze, tint)
         buildWalls(game.maze, tint)
-        for (r in game.recognizers) buildRecognizer(r.x, r.y, r.z, r.yaw, 1f, r.alert, r.hitFlash)
-        if (game.bitActive) buildBit(game.bitX, 1.4f + 0.25f * sin(game.time * 3f), game.bitZ, game.bitT)
+        culled = 0
+        for (r in game.recognizers) {
+            if (r.vis <= 0.001f) { culled++; continue }
+            buildRecognizer(r.x, r.y, r.z, r.yaw, 1f, r.alert, r.hitFlash, r.vis)
+        }
+        if (game.bitActive && game.bitVis > 0.001f) {
+            buildBit(game.bitX, 1.4f + 0.25f * sin(game.time * 3f), game.bitZ, game.bitT, game.bitVis)
+        }
         buildShots()
         buildSparks()
+        buildDerez()
         buildMuzzle()
     }
+
+    // ------------------------------------------------------------------ [OCCLUSION]
+    /**
+     * A WALL HIDES WHAT IS BEHIND IT — and the hiding is decided here, on the CPU, one object at a
+     * time, before a single vertex is written.
+     *
+     * The alternative was tried and is what this replaces: a depth-only prepass that drew every wall
+     * panel and the whole floor as invisible colour-masked solids, then depth-TESTED the strokes
+     * against them. On paper that is true hidden-line removal, walls hiding walls included. On this
+     * hardware it ate the world. The failure is a coplanarity problem the prepass cannot win: the
+     * arena's floor grid lies at y=0 and the invisible floor slab lies at y=0 UNDER ALL OF IT, and
+     * every wall's base and top strokes lie exactly on the wall's own invisible panel. Nothing
+     * separates them but glPolygonOffset, on a 16-bit depth buffer stretched over a 0.25–240 frustum
+     * where a floor cell seen from eye height is very nearly edge-on and the offset's slope term is
+     * both largest and least predictable. When the tie-break lost, it lost for the entire y=0 plane
+     * at once. The evidence frames say exactly that: the wall the tank happened to be facing drew
+     * its full ladder — head-on, zero depth slope, the offset behaves — and every stroke on the
+     * floor in front of it was gone, which read as "the world vanished, leaving flat bands".
+     *
+     * So: no depth buffer in the render path at all. The renderer is back to the pure additive one
+     * the cabinet wants, and a Recognizer standing behind a wall is simply NOT DRAWN. [Maze.lineOfSight]
+     * is exact, it is the same test the Recognizers' own AI has run every frame since the first
+     * commit, and it cannot half-work: there is no precision to lose and no driver to disagree with.
+     *
+     * What this deliberately does NOT do is hide a wall behind a wall. That is a real loss and a
+     * small one — a 1982 vector cabinet drew every edge of every wall it knew about, so the arena
+     * showing its own far corridors through the near ones is the idiom rather than a bug, and the
+     * near-wall solidity work (density, [nearGain], the wash) is what tells you which wall is the
+     * one you are about to hit. The owner's complaint was a Recognizer painted OVER the wall it was
+     * standing behind, and that is now impossible.
+     *
+     * A CENTRE POINT IS NOT ENOUGH. A Recognizer is 3.7 units across the feet, so a test against its
+     * axle alone pops the whole machine out while a third of it is still in plain sight round the
+     * corner. Visibility is sampled at three points — the axle and both ends of the cross-bar, in
+     * its current heading — and the machine counts as seen if ANY of them is. The remaining
+     * transition is honest, and [Recognizer.vis] ramps it over about a tenth of a second so a
+     * machine crossing a doorway de-rezzes rather than strobing. Shots and sparks are point-sized
+     * and short-lived, so they take the bare test with no ramp.
+     */
+    private var culled = 0
+
+    private fun visible(x: Float, z: Float) = game.maze.lineOfSight(camX, camZ, x, z)
 
     private fun buildTitleScene() {
         camX = 0f; camY = 1.3f; camZ = 0f
@@ -201,57 +259,9 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         while (x <= 39f) { wline(x, 0f, -66f, x, 0f, 1f, 0.25f, 1f, 0.45f, 0.35f); x += 3f }
         // the Recognizer, turning slowly, mood drifting between patrol green and hunting red
         val alert = 0.5f + 0.5f * sin(t * 0.55f)
-        buildRecognizer(0f, 0.35f + 0.2f * sin(t * 1.7f), -11f, t * 0.5f, 1.7f, alert, 0f)
+        buildRecognizer(0f, 0.35f + 0.2f * sin(t * 1.7f), -11f, t * 0.5f, 1.7f, alert, 0f, 1f)
         // a Bit chattering at its side
-        buildBit(3.4f, 1.6f + 0.2f * sin(t * 2.3f), -8f, t)
-    }
-
-    // -------------------------------------------------------------- invisible solids
-    /**
-     * WALLS OCCLUDE. This is the geometry that makes them do it, and it is never seen: the same wall
-     * panels the strokes outline, as filled triangles, drawn with the colour mask closed. They write
-     * depth and no light, so the waveguide behind a wall stays as transparent as it ever was while
-     * the depth buffer knows the wall is there — and the additive stroke passes that follow are
-     * depth-tested against them. A Recognizer on the far side is discarded per fragment instead of
-     * being painted over the wall it is standing behind, which is the whole of the "it flew over the
-     * wall" bug. It cost one extra pass of ~1,100 vertices with no shading and no fill.
-     *
-     * The panels are the walls' own zero-thickness planes — the wall's collision box is 0.7 units
-     * thick, but what you SEE is a plane and what must occlude is what you see. No face culling:
-     * a wall has to block from both sides.
-     *
-     * THE BIAS. A wall's outline strokes lie exactly on its occluder, and coincident geometry in a
-     * depth buffer is a coin toss per fragment that lands differently as you move — the wall's own
-     * edges would crawl and sparkle. glPolygonOffset pushes the occluder a hair further from the eye
-     * (always further, whichever side you view it from, which is why this and not a world-space
-     * inset), so the surface's own strokes sit in front of it and win cleanly. [OCCL_UNITS] is in
-     * depth-buffer LSBs: at 16 bits over this 0.25–240 frustum that is about 6 mm of bias at ten
-     * units and 20 cm at sixty, far under the depth of anything that could hide behind a wall.
-     *
-     * THE FLOOR is tessellated per cell rather than laid down as one 72-unit slab, because polygon
-     * offset scales with a primitive's depth SLOPE: a single quad running from underfoot to the
-     * horizon is nearly edge-on, its slope is enormous, and the bias computed from it would be too.
-     * Per cell the slope stays bounded and the grid lines drawn on top of it stay put.
-     */
-    private val OCCL_FACTOR = 1.0f
-    private val OCCL_UNITS = 2.0f
-
-    private fun ov(x: Float, y: Float, z: Float) = occl.v(x, y, z, 0f, 0f, 0f, 0f)
-
-    private fun oquad(ax: Float, ay: Float, az: Float, bx: Float, by: Float, bz: Float,
-                      cx: Float, cy: Float, cz: Float, dx: Float, dy: Float, dz: Float) {
-        ov(ax, ay, az); ov(bx, by, bz); ov(cx, cy, cz)
-        ov(ax, ay, az); ov(cx, cy, cz); ov(dx, dy, dz)
-    }
-
-    private fun buildOccluders(m: Maze) {
-        val h = Maze.WALL_H
-        for (w in m.walls) oquad(w.x0, 0f, w.z0, w.x1, 0f, w.z1, w.x1, h, w.z1, w.x0, h, w.z0)
-        val s = Maze.CELL
-        for (c in 0 until m.cols) for (r in 0 until m.rows) {
-            val x = c * s; val z = r * s
-            oquad(x, 0f, z, x + s, 0f, z, x + s, 0f, z + s, x, 0f, z + s)
-        }
+        buildBit(3.4f, 1.6f + 0.2f * sin(t * 2.3f), -8f, t, 1f)
     }
 
     private fun fog(x: Float, y: Float, z: Float): Float {
@@ -437,65 +447,117 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         }
     }
 
-    /** A wire box rotated about y by yaw, centred at (cx,cy,cz), half-extents (hx,hy,hz). */
-    private fun wireBox(cx: Float, cy: Float, cz: Float, hx: Float, hy: Float, hz: Float, yaw: Float, r: Float, g: Float, b: Float, a: Float) {
-        val c = cos(yaw); val s = sin(yaw)
-        fun px(x: Float, z: Float) = cx + x * c + z * s
-        fun pz(x: Float, z: Float) = cz - x * s + z * c
-        val xs = floatArrayOf(-hx, hx); val zs = floatArrayOf(-hz, hz); val ys = floatArrayOf(cy - hy, cy + hy)
-        for (y in ys) { // horizontal rectangles
-            wline(px(xs[0], zs[0]), y, pz(xs[0], zs[0]), px(xs[1], zs[0]), y, pz(xs[1], zs[0]), r, g, b, a)
-            wline(px(xs[1], zs[0]), y, pz(xs[1], zs[0]), px(xs[1], zs[1]), y, pz(xs[1], zs[1]), r, g, b, a)
-            wline(px(xs[1], zs[1]), y, pz(xs[1], zs[1]), px(xs[0], zs[1]), y, pz(xs[0], zs[1]), r, g, b, a)
-            wline(px(xs[0], zs[1]), y, pz(xs[0], zs[1]), px(xs[0], zs[0]), y, pz(xs[0], zs[0]), r, g, b, a)
-        }
-        for (x in xs) for (z in zs) wline(px(x, z), ys[0], pz(x, z), px(x, z), ys[1], pz(x, z), r, g, b, a)
-    }
-
     /**
      * The Recognizer: cross-bar, raised cab with a red eye, two hanging legs with flared feet.
      *
-     * Its width comes from [Recognizer]'s own constants, not from numbers typed here, because the
-     * engine moves it on a circle derived from those same constants. When the two were written out
+     * Every stroke of it comes out of [RecognizerModel], which is derived in turn from the same
+     * constants the ENGINE moves the machine on. When the drawing and the collider were written out
      * separately they disagreed — a bar drawn 1.65 out either side, a collider of 1.2 — and every
-     * Recognizer that hugged a wall put 45 cm of cross-bar inside it. Change the silhouette and the
-     * collider follows; there is no longer a way to change one alone.
+     * Recognizer that hugged a wall put 45 cm of cross-bar inside it. Now the derez is a third
+     * reader of the same numbers, and there is still no way to change one of them alone.
      */
-    private fun buildRecognizer(x: Float, y: Float, z: Float, yaw: Float, sc: Float, alert: Float, flash: Float) {
+    private fun buildRecognizer(x: Float, y: Float, z: Float, yaw: Float, sc: Float, alert: Float, flash: Float, vis: Float,
+                                gain: Float = 1f, whiten: Float = 0f) {
         var r = 0.25f + 0.75f * alert; var g = 1f - 0.75f * alert; var b = 0.45f - 0.25f * alert
         r += (1f - r) * flash; g += (1f - g) * flash; b += (1f - b) * flash
-        val a = 0.95f
+        // THE OVERLOAD wash: colour drains toward white before the shape gives way, and the alpha
+        // gain drives it past its own colour into a hot core (the shader emits rgb·a, so a > 1 is
+        // the beam dwelling — the same trick nearGain uses on a wall you are about to hit).
+        r += (1f - r) * whiten; g += (1f - g) * whiten; b += (1f - b) * whiten
+        val a = 0.95f * vis * gain
         val c = cos(yaw); val s = sin(yaw)
         fun lx(ox: Float, oz: Float) = x + (ox * c + oz * s) * sc
         fun lz(ox: Float, oz: Float) = z + (-ox * s + oz * c) * sc
-        // bar
-        wireBox(x, y + 2.0f * sc, z, Recognizer.BAR_HW * sc, 0.3f * sc, Recognizer.HALF_D * sc, yaw, r, g, b, a)
-        // ribs on the bar
-        for (i in -1..1) wline(lx(i * 0.8f, -0.5f), y + 1.7f * sc, lz(i * 0.8f, -0.5f), lx(i * 0.8f, -0.5f), y + 2.3f * sc, lz(i * 0.8f, -0.5f), r, g, b, 0.6f)
-        // cab
-        wireBox(x, y + 2.62f * sc, z, 0.52f * sc, 0.32f * sc, 0.45f * sc, yaw, r, g, b, a)
-        // eye slit: red, brighter when hunting
-        val ea = 0.55f + 0.45f * alert
-        wline(lx(-0.3f, -0.46f), y + 2.66f * sc, lz(-0.3f, -0.46f), lx(0.3f, -0.46f), y + 2.66f * sc, lz(0.3f, -0.46f), 1f, 0.25f + 0.2f * (1f - alert), 0.2f, ea)
-        pts.v(lx(0f, -0.48f), y + 2.66f * sc, lz(0f, -0.48f), 1f, 0.3f, 0.25f, ea * fog(x, y, z))
-        // legs
-        val lg = Recognizer.LEG_X
-        wireBox(lx(-lg, 0f), y + 0.85f * sc, lz(-lg, 0f), 0.3f * sc, 0.85f * sc, 0.42f * sc, yaw, r, g, b, a)
-        wireBox(lx(lg, 0f), y + 0.85f * sc, lz(lg, 0f), 0.3f * sc, 0.85f * sc, 0.42f * sc, yaw, r, g, b, a)
-        // feet flare — the outboard corner of a foot is the furthest point on the whole machine from
-        // its axle, and therefore the point Recognizer.RADIUS is sized to contain.
-        val fl = Recognizer.FOOT_FLARE; val fd = Recognizer.HALF_D
-        for (side in intArrayOf(-1, 1)) {
-            val ox = side * lg
-            wline(lx(ox - 0.3f, -0.42f), y, lz(ox - 0.3f, -0.42f), lx(ox - fl, -fd), y - 0.28f * sc, lz(ox - fl, -fd), r, g, b, a)
-            wline(lx(ox + 0.3f, -0.42f), y, lz(ox + 0.3f, -0.42f), lx(ox + fl, -fd), y - 0.28f * sc, lz(ox + fl, -fd), r, g, b, a)
-            wline(lx(ox - fl, -fd), y - 0.28f * sc, lz(ox - fl, -fd), lx(ox + fl, -fd), y - 0.28f * sc, lz(ox + fl, -fd), r, g, b, a)
-            wline(lx(ox - fl, fd), y - 0.28f * sc, lz(ox - fl, fd), lx(ox + fl, fd), y - 0.28f * sc, lz(ox + fl, fd), r, g, b, a)
+        // The silhouette comes from RecognizerModel, which is also what the derez takes apart — the
+        // machine you watch break is made of exactly the segments you were looking at a frame before.
+        val eyeR = 1f; val eyeG = 0.25f + 0.2f * (1f - alert) + (1f - 0.25f) * whiten; val eyeB = 0.2f + 0.8f * whiten
+        val ea = (0.55f + 0.45f * alert) * vis * gain
+        val m = RecognizerModel
+        for (i in 0 until m.count) {
+            val k = i * 6
+            val ax = lx(m.seg[k], m.seg[k + 2]); val ay = y + m.seg[k + 1] * sc; val az = lz(m.seg[k], m.seg[k + 2])
+            val bx = lx(m.seg[k + 3], m.seg[k + 5]); val by = y + m.seg[k + 4] * sc; val bz = lz(m.seg[k + 3], m.seg[k + 5])
+            when (m.kind[i]) {
+                RecognizerModel.RIB -> wline(ax, ay, az, bx, by, bz, r, g, b, 0.6f * vis * gain)
+                RecognizerModel.EYE -> wline(ax, ay, az, bx, by, bz, eyeR, eyeG, eyeB, ea)
+                else -> wline(ax, ay, az, bx, by, bz, r, g, b, a)
+            }
+        }
+        pts.v(lx(RecognizerModel.EYE_PT_X, RecognizerModel.EYE_PT_Z), y + RecognizerModel.EYE_PT_Y * sc,
+            lz(RecognizerModel.EYE_PT_X, RecognizerModel.EYE_PT_Z), eyeR, 0.3f + 0.7f * whiten, 0.25f + 0.75f * whiten, ea * fog(x, y, z))
+    }
+
+    // ------------------------------------------------------------------ [DEREZ]
+    /**
+     * A program losing cohesion, drawn. [com.x3paranoids.engine.Derez] owns the sequence and its
+     * physics; this owns what it LOOKS like, and the whole look is one idea: the thing never stops
+     * being made of the lines it was always made of.
+     *
+     * OVERLOAD. The machine is still whole and still drawn by [buildRecognizer], but pushed through
+     * two extra knobs it already had — `whiten` drains the hunting red toward white, and `gain`
+     * lifts every stroke's alpha above 1 so the phosphor blows out into a white-hot core. On top,
+     * a JUDDER: the whole body is displaced by a few centimetres, re-rolled about 45 times a second
+     * from a hash of the frame index, so it stutters rather than shimmers. The three together are
+     * about 160 ms of "this is about to fail", which is what makes the break read as authored.
+     *
+     * FRACTURE. Each fragment is one of the model's own segments, still glowing, tumbling on its own
+     * axis. Colour is derived entirely from age, so the drain lives in one place: white at the break,
+     * washing back through the machine's own mood colour, then toward the arena's phosphor green as
+     * it falls, and the last third of a fragment's life is a fade to nothing. A grounded fragment is
+     * pulled the rest of the way to the floor grid's exact colour — the death dissolves into the room.
+     *
+     * The eye slit keeps its red the whole way down. It is the one part of a Recognizer that was
+     * never structure, and watching it fall still lit is the detail that sells the rest.
+     *
+     * A DEREZ BEHIND A WALL STAYS BEHIND IT. Every fragment takes the same per-object sight test as
+     * its Recognizer did (see [OCCLUSION]) — a machine you could not see does not get to explain
+     * where it was by scattering through the wall.
+     */
+    private fun buildDerez() {
+        if (game.derezzes.isEmpty()) return
+        val tint = game.wallTint()
+        for (d in game.derezzes) {
+            if (!d.broken) {
+                if (d.player) continue                       // there is no hull model to flare
+                if (!visible(d.ox, d.oz)) continue
+                val f = d.flare
+                // ~45 Hz stutter, held for the whole frame so it judders instead of buzzing
+                val step = (d.t * 45f).toInt()
+                val jx = (hash01(step * 7 + 1) - 0.5f) * 0.20f * f
+                val jy = (hash01(step * 7 + 3) - 0.5f) * 0.16f * f
+                val jz = (hash01(step * 7 + 5) - 0.5f) * 0.20f * f
+                buildRecognizer(d.ox + jx, d.oy + jy, d.oz + jz, d.yaw, d.sc * (1f + 0.07f * f),
+                    d.alert, 0f, 1f, gain = 1f + 2.4f * f, whiten = f)
+                continue
+            }
+            for (p in d.frags) {
+                if (!visible(p.cx, p.cz)) continue
+                val u = 1f - (p.life / p.maxLife).coerceIn(0f, 1f)          // 0 fresh … 1 gone
+                // white at the break → the mood it died in → the arena's own green as it settles
+                val hot = (1f - u * 4.5f).coerceIn(0f, 1f)
+                val cool = (u * 1.5f).coerceIn(0f, 1f)
+                var r = 0.25f + 0.75f * d.alert; var g = 1f - 0.75f * d.alert; var b = 0.45f - 0.25f * d.alert
+                if (p.kind == RecognizerModel.EYE) { r = 1f; g = 0.28f; b = 0.22f }
+                r += (tint[0] - r) * cool; g += (tint[1] - g) * cool; b += (tint[2] - b) * cool
+                r += (1f - r) * hot; g += (1f - g) * hot; b += (1f - b) * hot
+                // the last third of a life is the fade; a grounded piece also dims into the grid
+                var a = (p.life / (p.maxLife * 0.34f)).coerceIn(0f, 1f) * (0.95f + 0.85f * hot)
+                if (p.down) a *= 0.72f
+                if (a < 0.01f) continue
+                wline(p.cx - p.ex, p.cy - p.ey, p.cz - p.ez, p.cx + p.ex, p.cy + p.ey, p.cz + p.ez, r, g, b, a)
+            }
         }
     }
 
+    /** A cheap deterministic 0..1 — the judder has to HOLD for a frame, so it cannot come from rnd. */
+    private fun hash01(k: Int): Float {
+        var h = k * -0x61c88647
+        h = h xor (h ushr 15); h *= -0x7a143595; h = h xor (h ushr 13)
+        return ((h ushr 8) and 0xFFFF) / 65535f
+    }
+
     /** The Bit: a spinning octahedron, cyan when idle, swelling yellow when it says "yes". */
-    private fun buildBit(x: Float, y: Float, z: Float, t: Float) {
+    private fun buildBit(x: Float, y: Float, z: Float, t: Float, vis: Float) {
         val yes = ((t % 2.6f) > 2.1f)
         val rad = if (yes) 0.95f else 0.7f
         val r = if (yes) 1f else 0.4f; val g = if (yes) 0.95f else 0.85f; val b = if (yes) 0.35f else 1f
@@ -509,13 +571,20 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         val v = arrayOf(tx(1f, 0f, 0f), tx(-1f, 0f, 0f), tx(0f, 1f, 0f), tx(0f, -1f, 0f), tx(0f, 0f, 1f), tx(0f, 0f, -1f))
         val edges = intArrayOf(0, 2, 0, 3, 0, 4, 0, 5, 1, 2, 1, 3, 1, 4, 1, 5, 2, 4, 2, 5, 3, 4, 3, 5)
         var i = 0
-        while (i < edges.size) { val p = v[edges[i]]; val q = v[edges[i + 1]]; wline(p[0], p[1], p[2], q[0], q[1], q[2], r, g, b, 0.95f); i += 2 }
-        pts.v(x, y, z, r, g, b, 0.8f * fog(x, y, z))
-        if (yes) for (k in 0 until 6) { val p = v[k]; pts.v(p[0], p[1], p[2], 1f, 1f, 0.6f, 0.9f * fog(x, y, z)) }
+        while (i < edges.size) { val p = v[edges[i]]; val q = v[edges[i + 1]]; wline(p[0], p[1], p[2], q[0], q[1], q[2], r, g, b, 0.95f * vis); i += 2 }
+        pts.v(x, y, z, r, g, b, 0.8f * vis * fog(x, y, z))
+        if (yes) for (k in 0 until 6) { val p = v[k]; pts.v(p[0], p[1], p[2], 1f, 1f, 0.6f, 0.9f * vis * fog(x, y, z)) }
     }
 
+    /**
+     * A bolt is hidden by a wall exactly as its Recognizer is, so a machine you cannot see cannot
+     * appear to shoot at you through the maze. The tail is drawn from the head, so the head's own
+     * sight line governs the whole streak — a shell crossing a doorway is briefly half-length rather
+     * than half-through a wall, which is the right way for a stroke that lives a few frames to end.
+     */
     private fun buildShots() {
         for (s in game.shots) {
+            if (!visible(s.x, s.z)) continue
             val l = sqrt(s.vx * s.vx + s.vy * s.vy + s.vz * s.vz).coerceAtLeast(0.01f)
             val k = if (s.friendly) 1.6f / l else 1.1f / l
             val r = if (s.friendly) 1f else 1f; val g = if (s.friendly) 0.88f else 0.28f; val b = if (s.friendly) 0.3f else 0.22f
@@ -524,8 +593,12 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         }
     }
 
+    /** A derez behind a wall stays behind it: sparks take the same sight test, per particle. */
     private fun buildSparks() {
-        for (p in game.sparks) pts.v(p.x, p.y, p.z, p.r, p.g, p.b, p.life.coerceIn(0f, 1f) * fog(p.x, p.y, p.z))
+        for (p in game.sparks) {
+            if (!visible(p.x, p.z)) continue
+            pts.v(p.x, p.y, p.z, p.r, p.g, p.b, p.life.coerceIn(0f, 1f) * fog(p.x, p.y, p.z))
+        }
     }
 
     /** The cannon's beam flares from below the periscope toward the sight, like the cabinet's shot. */
@@ -543,14 +616,77 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
     // ------------------------------------------------------------------ HUD
 
     private val sink = object : StrokeFont.LineSink {
-        override fun line(x0: Float, y0: Float, x1: Float, y1: Float) { hud.v(x0, y0, 0f, cr, cg, cb, ca); hud.v(x1, y1, 0f, cr, cg, cb, ca) }
+        override fun line(x0: Float, y0: Float, x1: Float, y1: Float) = hl(x0, y0, x1, y1)
     }
     private var cr = 1f; private var cg = 1f; private var cb = 1f; private var ca = 1f
     private fun color(r: Float, g: Float, b: Float, a: Float = 1f) { cr = r; cg = g; cb = b; ca = a }
-    private fun text(s: String, x: Float, y: Float, sc: Float) = StrokeFont.draw(s, x, y, sc, sink)
-    private fun textC(s: String, cx: Float, y: Float, sc: Float) = StrokeFont.draw(s, cx - StrokeFont.width(s, sc) / 2f, y, sc, sink)
-    private fun textR(s: String, rx: Float, y: Float, sc: Float) = StrokeFont.draw(s, rx - StrokeFont.width(s, sc), y, sc, sink)
-    private fun hl(x0: Float, y0: Float, x1: Float, y1: Float) { hud.v(x0, y0, 0f, cr, cg, cb, ca); hud.v(x1, y1, 0f, cr, cg, cb, ca) }
+    private fun text(s: String, x: Float, y: Float, sc: Float) = StrokeFont.draw(corrupt(s), x, y, sc, sink)
+    private fun textC(s: String, cx: Float, y: Float, sc: Float) = StrokeFont.draw(corrupt(s), cx - StrokeFont.width(s, sc) / 2f, y, sc, sink)
+    private fun textR(s: String, rx: Float, y: Float, sc: Float) = StrokeFont.draw(corrupt(s), rx - StrokeFont.width(s, sc), y, sc, sink)
+
+    // ------------------------------------------------------------------ [THE SIGHT FAILING]
+    /**
+     * 0 while the sight is an instrument; 1 when it has stopped being one. Only the tank's own derez
+     * raises it — and when it does, EVERY hud stroke in the file goes through here without a single
+     * call site knowing about it, because [hl] is the one door they all use and the stroke font's
+     * sink now goes through it too. That is the whole reason this works: the brackets, the chevrons,
+     * the bezel dials, the readouts, the nav plate and its wall traces all break up together, as one
+     * failing display, and nothing had to be hand-authored to make them.
+     *
+     * A stroke breaks into three pieces; each piece can DROP OUT (increasingly likely), each is
+     * offset a little, and each is dragged sideways by a TEAR shared with every other stroke on its
+     * screen row — which is what makes it read as a raster giving up rather than as noise. All of it
+     * is driven by an integer hash of the stroke's own coordinates and a seed that ticks about 14
+     * times a second, so the corruption HOLDS for a few frames and stutters, the way real broken
+     * hardware does; re-rolled every frame it would shimmer, which reads as an effect, not a fault.
+     *
+     * By the end the sight is gone entirely, and GAME OVER arrives on a clean screen. The player
+     * should feel derezzed, not be told they died.
+     */
+    private var glitch = 0f
+    private var glitchSeed = 0
+    /** Substitutions the stroke font can actually draw. */
+    private val GARBLE = charArrayOf('/', '?', '!', '<', '>', 'X', 'Z', '-')
+
+    private fun gnoise(k: Int): Float {
+        var h = (k * -0x61c88647) xor (glitchSeed * -0x7a143595)
+        h = h xor (h ushr 15); h *= 0x2c1b3c6d; h = h xor (h ushr 12)
+        return ((h ushr 8) and 0xFFFF) / 65535f
+    }
+
+    /** Readouts lose characters before they lose their strokes — text fails first, and legibly so. */
+    private fun corrupt(s: String): String {
+        if (glitch < 0.28f) return s
+        val p = (glitch - 0.28f) * 1.25f
+        val sb = StringBuilder(s.length)
+        for (i in s.indices) {
+            val n = gnoise(s.length * 7919 + i * 31 + s[i].code)
+            sb.append(if (n < p) GARBLE[(n * 977f).toInt() % GARBLE.size] else s[i])
+        }
+        return sb.toString()
+    }
+
+    private fun rawHl(x0: Float, y0: Float, x1: Float, y1: Float) { hud.v(x0, y0, 0f, cr, cg, cb, ca); hud.v(x1, y1, 0f, cr, cg, cb, ca) }
+
+    private fun hl(x0: Float, y0: Float, x1: Float, y1: Float) {
+        if (glitch <= 0.001f) { rawHl(x0, y0, x1, y1); return }
+        val g = glitch
+        val key = (x0 * 3.1f + y0 * 7.7f + x1 * 1.9f + y1 * 0.7f).toInt()
+        for (i in 0 until 3) {
+            val k = key * 31 + i
+            // dropout accelerates, so a fully failed sight is actually EMPTY rather than 40% there
+            if (gnoise(k) < g * 0.44f + g * g * 0.55f) continue
+            val t0 = i / 3f; val t1 = (i + 1) / 3f
+            var ax = x0 + (x1 - x0) * t0; var ay = y0 + (y1 - y0) * t0
+            var bx = x0 + (x1 - x0) * t1; var by = y0 + (y1 - y0) * t1
+            val row = (((ay + by) * 0.5f) / 26f).toInt()
+            val tear = (gnoise(row * 977 + 11) - 0.5f) * 66f * g * g
+            val ox = tear + (gnoise(k + 5) - 0.5f) * 11f * g
+            val oy = (gnoise(k + 9) - 0.5f) * 7f * g
+            ax += ox; bx += ox; ay += oy; by += oy
+            rawHl(ax, ay, bx, by)
+        }
+    }
     private fun rect(x0: Float, y0: Float, x1: Float, y1: Float) { hl(x0, y0, x1, y0); hl(x1, y0, x1, y1); hl(x1, y1, x0, y1); hl(x0, y1, x0, y0) }
     private fun circle(cx: Float, cy: Float, rad: Float, n: Int) {
         for (i in 0 until n) { val a0 = 6.2832f * i / n; val a1 = 6.2832f * (i + 1) / n; hl(cx + cos(a0) * rad, cy + sin(a0) * rad, cx + cos(a1) * rad, cy + sin(a1) * rad) }
@@ -613,6 +749,11 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
     private fun buildHud() {
         hud.reset()
         mapDrawn = false
+        // The sight only fails during the tank's own derez, and it fails on a curve: a quarter of a
+        // second of nothing (the beat where you register what happened), then a steady collapse that
+        // is total well before GAME OVER, so the ending arrives on a clean screen.
+        glitch = if (game.state == State.DYING) ((game.stateT - 0.25f) / 2.35f).coerceIn(0f, 1f) else 0f
+        glitchSeed = (game.stateT * 14f).toInt()
         buildBezel()
         when (game.state) {
             State.TITLE -> buildTitleHud()

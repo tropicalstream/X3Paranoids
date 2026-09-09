@@ -13,7 +13,19 @@ class Music(private val context: Context) {
     companion object { private const val TAG = "X3Paranoids"; private const val TRACK = "music/io_tower.mp3" }
 
     @Volatile var volume = 0.5f
-        set(v) { field = v; handler?.post { runCatching { player?.setVolume(v, v) } } }
+        set(v) { field = v; applyGain() }
+    /**
+     * Held down while either voice has the floor. The suite's sound effects already duck under
+     * speech (Sfx.duckProvider); the music was the one thing that did not, and it is the loudest
+     * continuous source in the mix — with two voices now trading lines, a track running at full
+     * level under them is what turns a conversation into a wash.
+     */
+    @Volatile var duck = false
+        set(v) { if (field != v) { field = v; applyGain() } }
+    private fun applyGain() {
+        val g = volume * (if (duck) 0.42f else 1f)
+        handler?.post { runCatching { player?.setVolume(g, g) } }
+    }
     @Volatile var enabled = true
         set(v) { field = v; handler?.post { if (v) startOnThread() else stopOnThread() } }
     private var thread: HandlerThread? = null
@@ -37,7 +49,8 @@ class Music(private val context: Context) {
             val mp = MediaPlayer()
             mp.setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_GAME).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
             mp.setDataSource(fd.fileDescriptor, fd.startOffset, fd.length)
-            mp.isLooping = true; mp.setVolume(volume, volume); mp.prepare(); mp.start()
+            val g = volume * (if (duck) 0.42f else 1f)
+            mp.isLooping = true; mp.setVolume(g, g); mp.prepare(); mp.start()
             player = mp
         }.onFailure { Log.w(TAG, "music start", it) }
     }

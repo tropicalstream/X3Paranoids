@@ -16,6 +16,7 @@ import android.view.WindowManager
 import com.x3paranoids.audio.Music
 import com.x3paranoids.audio.Sfx
 import com.x3paranoids.audio.Voice
+import com.x3paranoids.audio.VoiceBus
 import com.x3paranoids.engine.Game
 import com.x3paranoids.engine.GameHost
 import com.x3paranoids.engine.Swipe
@@ -38,7 +39,12 @@ class MainActivity : Activity(), GameHost {
 
     private lateinit var store: SettingsStore
     private lateinit var sfx: Sfx
+    /** The SYSTEM: the assets `voice` directory, Zarvox through a crusher. The game itself, talking. */
     private lateinit var voice: Voice
+    /** The PILOT: the assets `voice_hero` directory, the owner's fish.audio model. Talking back. */
+    private lateinit var hero: Voice
+    /** The floor the two of them share — see [VoiceBus]. They never speak at once. */
+    private val voiceBus = VoiceBus()
     private lateinit var music: Music
     private lateinit var head: HeadTracker
     private lateinit var game: Game
@@ -55,26 +61,35 @@ class MainActivity : Activity(), GameHost {
         super.onCreate(savedInstanceState)
         store = SettingsStore(this)
         sfx = Sfx(this).also { it.loadAsync() }
-        voice = Voice(this).also { it.load() }
+        voice = Voice(this, "voice", "m4a", voiceBus).also { it.load() }
+        hero = Voice(this, "voice_hero", "mp3", voiceBus).also { it.load() }
         music = Music(this).also { it.load() }
         head = HeadTracker(this)
-        sfx.duckProvider = { voice.isSpeaking }
+        // Effects duck under EITHER voice, and now so does the music: with two speakers trading
+        // lines, the track underneath them is the difference between a conversation and a wash.
+        sfx.duckProvider = { voice.isSpeaking || hero.isSpeaking }
         game = Game(store, this)
-        voice.onLineStart = { id -> glView.queueEvent { game.onVoiceLineStart(id) } }
-        voice.onLineEnd = { id -> glView.queueEvent { game.onVoiceLineEnd(id) } }
+        voice.onLineStart = { id -> refreshDuck(); glView.queueEvent { game.onVoiceLineStart(id) } }
+        voice.onLineEnd = { id -> refreshDuck(); glView.queueEvent { game.onVoiceLineEnd(id) } }
+        hero.onLineStart = { refreshDuck() }
+        hero.onLineEnd = { refreshDuck() }
         renderer = GLRenderer(game, head, store).also { it.sbs = store.sbs }
         glView = object : GLSurfaceView(this) {}.apply {
             setEGLContextClientVersion(3)
             preserveEGLContextOnPause = true
-            // A DEPTH BUFFER, asked for out loud. The renderer needs one: walls are drawn into depth
-            // as invisible solids so a Recognizer behind one is hidden (see GLRenderer's occluder
-            // prepass). GLSurfaceView's default chooser happens to request depth 16 already, but the
-            // whole occlusion pass silently degrades to "everything draws over everything" if a
-            // device ever hands back a config without one, which is the exact bug being fixed here.
+            // EIGHT BITS PER CHANNEL, asked for out loud. GLSurfaceView's own default chooser asks
+            // for 5-6-5, and this renderer spends most of its light in the bottom of the range: the
+            // fog floor, the far walls and the rung ladder all live at alphas that land on values
+            // like (0,4,1) and (1,6,2). In 565 those quantise to a handful of steps and the arena's
+            // distance cue turns into banding, so the strokes that say "far away" stop saying it.
             // ALPHA STAYS 0, deliberately: that is what the default chooser asks for and what this
             // waveguide is already composited with. On a see-through display the window's alpha
             // channel is not a free parameter — black is transparency here, and asking for an 8-bit
             // alpha invites the compositor to blend the surface differently.
+            // The 16 is a depth buffer the renderer no longer uses (see GLRenderer's OCCLUSION note:
+            // hiding is decided on the CPU now). It is left in the request because this is the exact
+            // config verified on the glasses, and a depth attachment that is never cleared, tested
+            // or read costs a tile buffer nobody touches.
             setEGLConfigChooser(8, 8, 8, 0, 16, 0)
             setRenderer(renderer)
             renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
@@ -84,7 +99,7 @@ class MainActivity : Activity(), GameHost {
         hideSystemBars()
         applyVolume(store.volume)
         music.enabled = store.music
-        voice.enabled = store.voice
+        voice.enabled = store.voice; hero.enabled = store.voice
         game.boot()
         music.play()
     }
@@ -95,16 +110,27 @@ class MainActivity : Activity(), GameHost {
     override fun hum(level: Float, rate: Float) = sfx.hum(level, rate)
     override fun say(id: String, urgent: Boolean) = voice.say(id, urgent)
     override fun sayAll(ids: List<String>) = voice.sayAll(ids)
-    override fun stopVoice() = voice.stop()
+    override fun stopVoice() { voice.stop(); refreshDuck() }
+    override fun hero(id: String, patienceMs: Long) = hero.say(id, false, patienceMs)
+    override fun stopHero() { hero.stop(); refreshDuck() }
     override fun musicEnabled(on: Boolean) { music.enabled = on }
-    override fun voiceEnabled(on: Boolean) { voice.enabled = on; if (!on) voice.stop() }
+    override fun voiceEnabled(on: Boolean) {
+        voice.enabled = on; hero.enabled = on
+        if (!on) { voice.stop(); hero.stop(); refreshDuck() }
+    }
     override fun headEnabled(on: Boolean) { ui.post { if (on) head.start() else head.stop() } }
     override fun recentreHead() { head.recentre() }
     override fun applyVolume(v0to10: Int) {
         val v = v0to10 / 10f
-        music.volume = 0.55f * v; sfx.volume = 0.9f * v; voice.volume = 1f * v
+        // The pilot sits a shade under the system voice: the machine is loud because it does not
+        // care, and the program talking back over its own stolen code is the quieter of the two.
+        music.volume = 0.55f * v; sfx.volume = 0.9f * v; voice.volume = 1f * v; hero.volume = 0.92f * v
     }
     override fun voiceDurationMs(id: String): Int = voice.durations[id] ?: 0
+    override fun heroDurationMs(id: String): Int = hero.durations[id] ?: 0
+    override fun voiceBusy(): Boolean = voice.isSpeaking || hero.isSpeaking
+
+    private fun refreshDuck() { music.duck = voice.isSpeaking || hero.isSpeaking }
 
     // --------------------------------------------------------------- input
 
@@ -189,7 +215,7 @@ class MainActivity : Activity(), GameHost {
     }
 
     override fun onDestroy() {
-        sfx.release(); voice.release(); music.release()
+        sfx.release(); voice.release(); hero.release(); music.release()
         super.onDestroy()
     }
 
