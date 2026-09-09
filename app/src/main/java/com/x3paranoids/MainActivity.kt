@@ -108,7 +108,7 @@ class MainActivity : Activity(), GameHost {
 
     override fun sfx(id: Int, pitch: Float, vol: Float) = sfx.play(id, pitch, vol)
     override fun hum(level: Float, rate: Float) = sfx.hum(level, rate)
-    override fun say(id: String, urgent: Boolean) = voice.say(id, urgent)
+    override fun say(id: String, urgent: Boolean, patienceMs: Long) = voice.say(id, urgent, patienceMs)
     override fun sayAll(ids: List<String>) = voice.sayAll(ids)
     override fun stopVoice() { voice.stop(); refreshDuck() }
     override fun hero(id: String, patienceMs: Long) = hero.say(id, false, patienceMs)

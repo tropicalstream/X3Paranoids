@@ -157,6 +157,11 @@ class Voice(private val context: Context, private val dir: String, private val e
             }
             mp.setOnErrorListener { p, _, _ -> handler?.post { if (player === p) { runCatching { p.release() }; player = null; isSpeaking = false; pump() } }; true }
             mp.prepare(); player = mp; isSpeaking = true
+            // The one log line that makes the two-voice mix auditable from a terminal: who took the
+            // floor, when, and how long they will hold it. Verifying "the voices never collide" by
+            // ear on a head-worn display is guesswork; verifying it from a timestamped transcript
+            // is not. Cheap — one line per utterance, a few dozen a game.
+            Log.i(TAG, "say[$dir] $id (${durations[id] ?: -1}ms)")
             onLineStart?.invoke(id)
             mp.start()
         }.onFailure { Log.w(TAG, "voice $dir/$id", it); player = null; isSpeaking = false; pump() }

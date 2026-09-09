@@ -59,6 +59,8 @@ class Derez(
     /** The mood it died in, 0 patrol green … 1 hunting red — the colour the white drains back toward. */
     val alert: Float,
     val player: Boolean,
+    /** The SHIELD bursting rather than a machine dying — see [seedShield]. Drawn cyan, not green. */
+    val shield: Boolean = false,
 ) {
     var t = 0f
     var broken = false
@@ -70,8 +72,13 @@ class Derez(
      * The tank comes apart on the frame you die ([Game.damagePlayer] seeds it immediately) and the
      * slowness of that death lives where it can be seen — in the fragments' much longer life, in
      * the periscope sinking, and in the sight failing on top of both.
+     *
+     * THE SHIELD HAS NONE EITHER, for the opposite reason: a Recognizer's overload is anticipation
+     * you watch happen to somebody else, and there is no watching a thing that is wrapped around
+     * your own head. The bolt lands and the shell is gone on that frame. Its drama is in the
+     * fragments rushing OUTWARD past the periscope.
      */
-    val overload get() = if (player) 0f else 0.16f
+    val overload get() = if (player || shield) 0f else 0.16f
     /** 0..1 across the overload — the flare, the judder and the swell all ride this. */
     val flare get() = if (broken) 1f else (t / overload).coerceIn(0f, 1f)
 
@@ -136,6 +143,44 @@ class Derez(
         }
     }
 
+    /**
+     * THE SHELL BURSTS. The last charge goes and the bubble comes apart into the very segments it
+     * was drawn from a frame earlier — [ShieldModel]'s equator and its meridians, the bands that
+     * were still lit at one charge — scaled to [radius] about the periscope and thrown RADIALLY
+     * OUTWARD, hard.
+     *
+     * Outward is the whole difference between this and every other derez in the game. A Recognizer
+     * opens along its own shape and falls; the tank's hull leaves you at walking pace so you can
+     * watch it go. The shield is a thing you are INSIDE, so it fails by rushing past your head and
+     * out into the arena — fast (5–11 u/s against the Recognizer's 2.4–5.8) and short-lived (under
+     * a second and a half), because a shell that lingers is a shell you might still be behind.
+     *
+     * There is deliberately no upward bias in the throw: the hull's derez adds one so the pieces
+     * arc and you read the gravity, but a shield that popped upward would read as a bubble rising
+     * away rather than as cohesion failing all at once.
+     */
+    fun seedShield(rnd: () -> Float) {
+        broken = true
+        val radius = sc
+        val m = ShieldModel
+        for (i in 0 until m.count) {
+            val b = i * 6
+            if (m.band[i] > 0) continue          // only what was still drawn at the last charge
+            val ax0 = ox + m.seg[b] * radius; val ay0 = oy + m.seg[b + 1] * radius; val az0 = oz + m.seg[b + 2] * radius
+            val bx0 = ox + m.seg[b + 3] * radius; val by0 = oy + m.seg[b + 4] * radius; val bz0 = oz + m.seg[b + 5] * radius
+            val cx = (ax0 + bx0) * 0.5f; val cy = (ay0 + by0) * 0.5f; val cz = (az0 + bz0) * 0.5f
+            var dx = cx - ox; var dy = cy - oy; var dz = cz - oz
+            val dl = kotlin.math.sqrt(dx * dx + dy * dy + dz * dz).coerceAtLeast(0.01f)
+            dx /= dl; dy /= dl; dz /= dl
+            val sp = 5f + rnd() * 6f
+            add(cx, cy, cz, ax0 - cx, ay0 - cy, az0 - cz,
+                dx * sp + (rnd() - 0.5f) * 1.2f,
+                dy * sp * 0.55f + (rnd() - 0.5f) * 1.2f,
+                dz * sp + (rnd() - 0.5f) * 1.2f,
+                0.75f + rnd() * 0.65f, RecognizerModel.BODY, rnd)
+        }
+    }
+
     private fun add(cx: Float, cy: Float, cz: Float, ex: Float, ey: Float, ez: Float,
                     vx: Float, vy: Float, vz: Float, life: Float, kind: Int, rnd: () -> Float) {
         var ax = rnd() * 2f - 1f; var ay = rnd() * 2f - 1f; var az = rnd() * 2f - 1f
@@ -143,5 +188,79 @@ class Derez(
         ax /= al; ay /= al; az /= al
         val w = (3f + rnd() * 11f) * (if (rnd() < 0.5f) -1f else 1f)
         frags += Frag(cx, cy, cz, ex, ey, ez, vx, vy, vz, ax, ay, az, w, life, life, kind)
+    }
+}
+
+/**
+ * Overload, then fracture, then the grid. [Derez] describes the shape of the sequence; this is only
+ * its physics, and it lives out here rather than inside [Game] because the ATTRACT LOOP kills a
+ * Recognizer too. A death that looked subtly different in the demo than in the game would be a
+ * lie told by the poster, so both arenas run this exact function over their own list and their own
+ * maze — there is no second copy to drift.
+ *
+ * FRAGMENTS OBEY THE WALLS, like everything else in this game: the centre goes through [Maze.move]
+ * on a small radius, so a Recognizer that derezzes against a wall throws its pieces back off it
+ * instead of through it, and the debris of a death round a corner stays round the corner. The
+ * renderer runs its own sight test per fragment, so it is never DRAWN through one either.
+ *
+ * The landing is the part that ties the death to the room. A piece bounces once or twice with most
+ * of its energy gone, and from the first touch it is [Frag.down]: its own length rotates down into
+ * the horizontal (at constant length — it lies flat, it does not shrink), its spin bleeds off, and
+ * it slides to a stop on the floor grid it will fade into.
+ */
+fun updateDerezList(list: ArrayList<Derez>, maze: Maze, dt: Float, tmp: FloatArray, gravity: Float, rnd: () -> Float) {
+    if (list.isEmpty()) return
+    val di = list.iterator()
+    while (di.hasNext()) {
+        val d = di.next()
+        d.t += dt
+        if (!d.broken) {
+            if (d.t >= d.overload) {
+                if (d.shield) d.seedShield(rnd) else if (d.player) d.seedPlayer(rnd) else d.seedRecognizer(rnd)
+            }
+            continue
+        }
+        val fi = d.frags.iterator()
+        while (fi.hasNext()) {
+            val f = fi.next()
+            f.life -= dt
+            if (f.life <= 0f) { fi.remove(); continue }
+            f.vy -= gravity * dt
+            // tumble: Rodrigues about the fragment's own axis
+            if (kotlin.math.abs(f.w) > 0.01f) {
+                val th = f.w * dt
+                val ct = kotlin.math.cos(th); val st = kotlin.math.sin(th)
+                val dot = f.ax * f.ex + f.ay * f.ey + f.az * f.ez
+                val crx = f.ay * f.ez - f.az * f.ey
+                val cry = f.az * f.ex - f.ax * f.ez
+                val crz = f.ax * f.ey - f.ay * f.ex
+                f.ex = f.ex * ct + crx * st + f.ax * dot * (1f - ct)
+                f.ey = f.ey * ct + cry * st + f.ay * dot * (1f - ct)
+                f.ez = f.ez * ct + crz * st + f.az * dot * (1f - ct)
+            }
+            // walls, on the same slide-and-stop the tank uses
+            val bumped = maze.move(f.cx, f.cz, f.vx * dt, f.vz * dt, 0.14f, tmp)
+            f.cx = tmp[0]; f.cz = tmp[1]
+            if (bumped) { f.vx *= -0.30f; f.vz *= -0.30f; f.w *= 1.35f }
+            f.cy += f.vy * dt
+            val low = f.cy - kotlin.math.abs(f.ey)
+            if (low < 0.05f) {
+                f.cy += 0.05f - low
+                if (f.vy < 0f) { f.vy = -f.vy * 0.30f; f.vx *= 0.62f; f.vz *= 0.62f; f.w *= 0.5f }
+                if (kotlin.math.abs(f.vy) < 0.7f) f.vy = 0f
+                f.down = true
+            }
+            if (f.down) {
+                // settle flat onto the grid, at constant length
+                val l0 = kotlin.math.sqrt(f.ex * f.ex + f.ey * f.ey + f.ez * f.ez)
+                f.ey *= kotlin.math.max(0f, 1f - dt * 3.4f)
+                val l1 = kotlin.math.sqrt(f.ex * f.ex + f.ey * f.ey + f.ez * f.ez).coerceAtLeast(1e-4f)
+                val k = l0 / l1
+                f.ex *= k; f.ey *= k; f.ez *= k
+                val fr = kotlin.math.max(0f, 1f - dt * 1.7f)
+                f.vx *= fr; f.vz *= fr; f.w *= kotlin.math.max(0f, 1f - dt * 2.4f)
+            }
+        }
+        if (d.frags.isEmpty()) di.remove()
     }
 }

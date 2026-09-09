@@ -49,7 +49,12 @@ class Sfx(private val context: Context) {
         const val BIT_CHIRP = 22    // idle chatter — pitched and paced by how close you are
         const val BIT_GET = 23      // taken
         const val BIT_LOSE = 24     // lost: the same shapes falling instead of rising
-        private const val COUNT = 25
+        // ---- the energy pool and the shield it buys
+        const val POOL_SIP = 25     // one pull of energy while the tank stands in the pool
+        const val SHIELD_UP = 26    // the draw completes and the shell seals
+        const val SHIELD_HIT = 27   // the shell eats a bolt
+        const val SHIELD_DOWN = 28  // the last charge goes — the DEREZ, an octave up and half as long
+        private const val COUNT = 29
         private const val RATE = 22050
     }
 
@@ -157,6 +162,60 @@ class Sfx(private val context: Context) {
                     val q = max(3f, 18f * exp(-t * 1.6f))
                     v = (v * q).toInt() / q
                     v * 0.6f
+                })
+                // ------------------------------------------------- the pool, and what it buys
+                // A PULL OF ENERGY. One short blip per 0.3 s of dwell, played at a pitch the caller
+                // raises with the draw — three of them, climbing, is the whole "it is working"
+                // signal, and it STOPS the instant you leave the pool. A single long clip started
+                // on entry would keep promising a draw you had already abandoned.
+                ids[POOL_SIP] = load(dir, "poolsip", buf(170) { t ->
+                    (sine(520f + 880f * t, t) * 0.50f + sine(1040f + 1760f * t, t) * 0.16f) * exp(-t * 22f)
+                })
+                // THE SHELL SEALS. Energy rushes in — a tone climbing out of nothing under a band of
+                // noise that swells and dies — and at 0.55 s a bright fifth-stacked chord lands on
+                // top of it: the dome closing. The 6 Hz shimmer on everything is what keeps it
+                // reading as light rather than as a machine starting up.
+                ids[SHIELD_UP] = load(dir, "shieldup", buf(950) { t ->
+                    val f = 180f + 900f * (1f - exp(-t * 3.2f))
+                    var v = sine(f, t) * 0.30f + sine(f * 1.5f, t) * 0.17f + sine(f * 2f, t) * 0.11f
+                    v += noise() * 0.20f * (1f - exp(-t * 5f)) * exp(-t * 2.4f)
+                    if (t > 0.55f) {
+                        val lt = t - 0.55f
+                        v += (sine(784f, lt) * 0.34f + sine(1176f, lt) * 0.21f + sine(1568f, lt) * 0.13f) * exp(-lt * 4.5f)
+                    }
+                    v *= 0.58f + 0.42f * sine(6f, t)
+                    // exp(-1.1t) is still at a third of full when a 950 ms clip runs out, and a
+                    // clip that stops rather than ends CLICKS. The last 150 ms is a ramp to zero.
+                    v * (1f - exp(-t * 14f)) * exp(-t * 1.1f) * (1f - ((t - 0.80f) / 0.15f).coerceIn(0f, 1f))
+                })
+                // THE SHELL EATS ONE. Glass, not meat: a high tone falling a little, ring-modulated
+                // at 150 Hz so it is glassy rather than tonal, with a hard strike transient on the
+                // front. Short — 300 ms — because it must land inside the bolt's own impact and get
+                // out of the way of whatever is still shooting at you.
+                ids[SHIELD_HIT] = load(dir, "shieldhit", buf(320) { t ->
+                    var v = sine(1760f - 520f * t, t) * 0.44f + sine(2640f, t) * 0.21f + sq(880f, t) * 0.11f
+                    v *= 0.66f + 0.34f * sine(150f, t)
+                    v += noise() * 0.30f * exp(-t * 42f)
+                    v * exp(-t * 13f)
+                })
+                // THE SHELL DEREZZES, and it is deliberately the SAME SOUND as a Recognizer coming
+                // apart, transposed: the tone falls, the grain gate slows continuous sound into
+                // discrete chunks, the crusher opens up, and it is cut to silence before the clip
+                // ends. Only the register and the pace differ — an octave up and less than half as
+                // long, because a shield is a smaller, thinner thing than a machine. The game says
+                // "derez" with one vocabulary; a novel noise here would have said this was a
+                // different kind of loss.
+                ids[SHIELD_DOWN] = load(dir, "shielddown", buf(560) { t ->
+                    if (t > 0.44f) 0f else {
+                        val f = 220f + 1320f * exp(-t * 6.4f)
+                        var v = saw(f, t) * 0.42f + sq(f * 0.5f, t) * 0.23f + sine(f * 2f, t) * 0.19f
+                        v += noise() * 0.48f * exp(-t * 30f)
+                        val gr = 10f + 150f * exp(-t * 4.2f)
+                        val gate = if ((t * gr).toInt() % 2 == 0) 1f else 0.14f
+                        val q = max(2f, 24f * exp(-t * 3.4f))
+                        v = (v * q).toInt() / q
+                        v * gate * exp(-t * 3.4f)
+                    }
                 })
                 ids[BIT] = load(dir, "bit", arpeggio(intArrayOf(880, 1174, 1568, 2093, 2637), 60, 0.75f))
                 ids[BUMP] = load(dir, "bump", buf(180) { t -> (sine(70f, t) * 0.8f + noise() * 0.2f * exp(-t * 60f)) * exp(-t * 16f) })

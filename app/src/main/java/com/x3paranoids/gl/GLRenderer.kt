@@ -7,6 +7,7 @@ import com.x3paranoids.SettingsStore
 import com.x3paranoids.engine.Game
 import com.x3paranoids.engine.Maze
 import com.x3paranoids.engine.RecognizerModel
+import com.x3paranoids.engine.ShieldModel
 import com.x3paranoids.engine.State
 import com.x3paranoids.head.HeadTracker
 import java.nio.ByteBuffer
@@ -16,6 +17,7 @@ import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.abs
 import kotlin.math.cos
+import kotlin.math.exp
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
@@ -52,9 +54,28 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
     private val hud = Batch(30000)
     private val rnd = Random(3)
     private var statT = 0f; private var statFrames = 0
+    /** The [VERIFY] trace is throttled to 5 Hz: a 60 Hz one fills the log buffer faster than adb drains it. */
+    private var verifyT = 0f
+    /** Which maze the [VERIFY] connectivity dump has already been written for. */
+    private var mazeDumped: Maze? = null
 
     private var camX = 0f; private var camY = Game.EYE_H; private var camZ = 0f
     private var fogFar = 62f
+    /**
+     * The maze the scene is being drawn IN — the arena's, or the attract loop's. Every sight test in
+     * the file goes through [visible], so pointing this at the demo's maze is the whole of what it
+     * takes to give the attract loop real occlusion: the Recognizer that slips behind a wall in the
+     * demo is hidden by the same test that hides one in the game.
+     */
+    private var sceneMaze: Maze = game.maze
+    /**
+     * The world's own brightness, folded into [fog] so it reaches every stroke, wash and point in
+     * one place. The arena keeps it at 1; the attract loop opens out of black on it and falls back
+     * into black on it at the end of each pass.
+     */
+    private var sceneGain = 1f
+    /** Wave one's phosphor: the colour the demo is always in, whatever wave the last game reached. */
+    private val ATTRACT_TINT = floatArrayOf(0.25f, 1f, 0.45f)
     /**
      * Per-frame world trace, OFF. Flip it to true for one line per frame naming the periscope's own
      * position and heading, every Recognizer's range, bearing off the centreline, `vis` and its fire
@@ -66,6 +87,11 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
      * Bit's proximity chatter were captured with. Bearings are what let a script aim a hull that
      * only turns in quarter steps, and the Bit's range is what lets one navigate to a thing the HUD
      * deliberately refuses to point at.
+     *
+     * It also carries the ENERGY POOL's range and bearing and the shield's state, for the same
+     * reason: the pool is deliberately hidden at the far end of the maze from the Bit, and driving
+     * a hull that only turns in quarter steps to a thing you cannot see is not something you can do
+     * from screenshots.
      */
     private val VERIFY = false
 
@@ -125,7 +151,11 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         val shake = game.damageFlash * 0.25f +
             (if (game.state == State.DYING) 0.16f * kotlin.math.exp(-game.stateT * 0.9f) else 0f)
         val sx = (rnd.nextFloat() - 0.5f) * shake; val sy = (rnd.nextFloat() - 0.5f) * shake
-        val yaw = if (title) 0f else game.yaw; val pitch = if (title) 0.04f else game.pitch
+        // On the title the periscope belongs to the ATTRACT LOOP, which is flying its own route and
+        // taking its own corners; in play it is the head plus the hull.
+        val att = game.attract
+        val yaw = if (title) att?.yaw ?: 0f else game.yaw
+        val pitch = if (title) att?.pitch ?: 0.04f else game.pitch
         val cp = cos(pitch)
         val fx = sin(yaw) * cp; val fy = sin(pitch); val fz = -cos(yaw) * cp
         Matrix.setLookAtM(view, 0, camX + sx, camY + sy, camZ, camX + sx + fx, camY + sy + fy, camZ + fz, 0f, 1f, 0f)
@@ -133,7 +163,12 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         Matrix.multiplyMM(mvp, 0, proj, 0, view, 0)
 
         statFrames++; statT += dt
-        if (VERIFY && game.state == State.PLAY) {
+        verifyT += dt
+        // ...and not while the settings menu has the arena frozen: the trace describes a RUNNING
+        // arena, and a script driving this over adb uses the menu as its clock — it needs the line
+        // to stop arriving as the proof that nothing is moving while it thinks.
+        if (VERIFY && game.state == State.PLAY && !game.menuOpen && verifyT >= 0.2f) {
+            verifyT = 0f
             val sb = StringBuilder("VIS p(%.1f,%.1f) yaw=%.0f".format(game.px, game.pz, game.yaw * 57.2958f))
             for ((i, r) in game.recognizers.withIndex()) {
                 var b = (kotlin.math.atan2(r.x - game.px, -(r.z - game.pz)) - game.yaw) * 57.2958f
@@ -145,7 +180,13 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
             while (bb > 180f) bb -= 360f
             while (bb < -180f) bb += 360f
             sb.append(" || BIT d=%.1f bear=%.0f act=%b".format(hypot(game.bitX - game.px, game.bitZ - game.pz), bb, game.bitActive))
-            sb.append(" || lock=%b bolts=%d".format(game.lockedOn, game.shots.count { !it.friendly }))
+            var pb = (kotlin.math.atan2(game.poolX - game.px, -(game.poolZ - game.pz)) - game.yaw) * 57.2958f
+            while (pb > 180f) pb -= 360f
+            while (pb < -180f) pb += 360f
+            sb.append(" || POOL d=%.1f bear=%.0f act=%b draw=%.2f".format(
+                hypot(game.poolX - game.px, game.poolZ - game.pz), pb, game.poolActive, game.poolDraw))
+            sb.append(" || SHIELD %d flash=%.2f".format(game.shield, game.shieldFlash))
+            sb.append(" || lock=%b bolts=%d lives=%d wave=%d".format(game.lockedOn, game.shots.count { !it.friendly }, game.lives, game.wave))
             android.util.Log.i("X3Paranoids", sb.toString())
         }
         if (statT >= 2f) {
@@ -183,7 +224,28 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
 
     private fun buildScene() {
         lines.reset(); pts.reset(); tris.reset(); mesh.reset()
-        if (game.state == State.TITLE) { buildTitleScene(); return }
+        sceneGain = 1f
+        if (game.state == State.TITLE) { buildAttractScene(); return }
+        sceneMaze = game.maze
+        // Under VERIFY, the arena's connectivity is dumped once per maze: one hex digit per cell,
+        // bit 0 = east open, bit 1 = south open. A bearing tells a script which way the pool is; only
+        // the graph tells it which way round the wall in between, and every attempt to drive this
+        // game over adb without it turned into a tank oscillating against the same corner.
+        if (VERIFY && mazeDumped !== game.maze) {
+            mazeDumped = game.maze
+            val m = game.maze
+            val sb = StringBuilder("MAZE ${m.cols}x${m.rows} ")
+            for (r in 0 until m.rows) {
+                for (c in 0 until m.cols) {
+                    var v = 0
+                    if (m.passable(c, r, 1, 0)) v = v or 1
+                    if (m.passable(c, r, 0, 1)) v = v or 2
+                    sb.append("0123456789abcdef"[v])
+                }
+                sb.append('/')
+            }
+            android.util.Log.i("X3Paranoids", sb.toString())
+        }
         camX = game.px; camY = Game.EYE_H - game.deathSink; camZ = game.pz
         fogFar = 62f
         val tint = game.wallTint()
@@ -197,10 +259,50 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         if (game.bitActive && game.bitVis > 0.001f) {
             buildBit(game.bitX, 1.4f + 0.25f * sin(game.time * 3f), game.bitZ, game.bitT, game.bitVis)
         }
-        buildShots()
-        buildSparks()
-        buildDerez()
-        buildMuzzle()
+        if (game.poolActive && game.poolVis > 0.001f) {
+            buildPool(game.poolX, game.poolZ, game.poolT, game.poolVis, game.poolDraw)
+        }
+        if (game.poolCollapse > 0f) buildPoolCollapse(game.poolX, game.poolZ, game.poolCollapse)
+        buildShots(game.shots)
+        buildSparks(game.sparks)
+        buildDerez(game.derezzes, game.wallTint())
+        buildMuzzle(game.muzzle, game.yaw, game.pitch)
+        // The shell last of all: it is the nearest thing in the world and it is drawn OVER
+        // everything, which is exactly where a bubble wrapped round your own head belongs.
+        if (game.shield > 0) buildShield(game.shield, game.shieldFlash, game.yaw, game.pitch)
+    }
+
+    /**
+     * THE ATTRACT LOOP'S WORLD, drawn by exactly the same code as the arena's.
+     *
+     * There is deliberately nothing special in here: the same floor, the same walls with the same
+     * near-field solidity, the same Recognizers under the same per-object occlusion, the same Bit
+     * and the same derez. That identity is the point of the demo — a title screen that showed a
+     * prettier or simpler version of the game would be advertising something the player cannot buy.
+     * The only two things the loop adds are [Attract.gain], which lets the whole world fade up out
+     * of black and back into it, and a fog that closes a few units earlier, because the camera is
+     * on rails down corridors and the extra depth only ever showed it the far side of the maze.
+     */
+    private fun buildAttractScene() {
+        val a = game.attract ?: return
+        sceneMaze = a.maze
+        sceneGain = a.gain
+        camX = a.camX; camY = a.camY; camZ = a.camZ
+        fogFar = 58f
+        if (sceneGain <= 0.003f) return
+        val tint = ATTRACT_TINT
+        buildFloor(a.maze, tint)
+        buildWalls(a.maze, tint)
+        culled = 0
+        for (r in a.recognizers) {
+            if (r.vis <= 0.001f) { culled++; continue }
+            buildRecognizer(r.x, r.y, r.z, r.yaw, 1f, r.alert, r.hitFlash, r.vis)
+        }
+        if (a.bitOn && a.bitVis > 0.001f) buildBit(a.bitX, 1.4f + 0.25f * sin(a.t * 3f), a.bitZ, a.bitT, a.bitVis)
+        buildShots(a.shots)
+        buildSparks(a.sparks)
+        buildDerez(a.derezzes, tint)
+        buildMuzzle(a.muzzle, a.yaw, a.pitch)
     }
 
     // ------------------------------------------------------------------ [OCCLUSION]
@@ -243,31 +345,12 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
      */
     private var culled = 0
 
-    private fun visible(x: Float, z: Float) = game.maze.lineOfSight(camX, camZ, x, z)
-
-    private fun buildTitleScene() {
-        camX = 0f; camY = 1.3f; camZ = 0f
-        fogFar = 55f
-        val t = game.time
-        // a floor of light rolling toward the viewer
-        val off = (t * 3.5f) % 3f
-        for (i in 0..22) {
-            val z = -66f + i * 3f + off
-            wline(-40f, 0f, z, 40f, 0f, z, 0.25f, 1f, 0.45f, 0.5f)
-        }
-        var x = -39f
-        while (x <= 39f) { wline(x, 0f, -66f, x, 0f, 1f, 0.25f, 1f, 0.45f, 0.35f); x += 3f }
-        // the Recognizer, turning slowly, mood drifting between patrol green and hunting red
-        val alert = 0.5f + 0.5f * sin(t * 0.55f)
-        buildRecognizer(0f, 0.35f + 0.2f * sin(t * 1.7f), -11f, t * 0.5f, 1.7f, alert, 0f, 1f)
-        // a Bit chattering at its side
-        buildBit(3.4f, 1.6f + 0.2f * sin(t * 2.3f), -8f, t, 1f)
-    }
+    private fun visible(x: Float, z: Float) = sceneMaze.lineOfSight(camX, camZ, x, z)
 
     private fun fog(x: Float, y: Float, z: Float): Float {
         val dx = x - camX; val dy = y - camY; val dz = z - camZ
         val d = sqrt(dx * dx + dy * dy + dz * dz)
-        return (1f - d / fogFar).coerceIn(0.06f, 1f)
+        return (1f - d / fogFar).coerceIn(0.06f, 1f) * sceneGain
     }
 
     /** A world line with per-vertex fog. */
@@ -513,12 +596,11 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
      * its Recognizer did (see [OCCLUSION]) — a machine you could not see does not get to explain
      * where it was by scattering through the wall.
      */
-    private fun buildDerez() {
-        if (game.derezzes.isEmpty()) return
-        val tint = game.wallTint()
-        for (d in game.derezzes) {
+    private fun buildDerez(list: List<com.x3paranoids.engine.Derez>, tint: FloatArray) {
+        if (list.isEmpty()) return
+        for (d in list) {
             if (!d.broken) {
-                if (d.player) continue                       // there is no hull model to flare
+                if (d.player || d.shield) continue           // no hull and no shell out there to flare
                 if (!visible(d.ox, d.oz)) continue
                 val f = d.flare
                 // ~45 Hz stutter, held for the whole frame so it judders instead of buzzing
@@ -537,6 +619,10 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
                 val hot = (1f - u * 4.5f).coerceIn(0f, 1f)
                 val cool = (u * 1.5f).coerceIn(0f, 1f)
                 var r = 0.25f + 0.75f * d.alert; var g = 1f - 0.75f * d.alert; var b = 0.45f - 0.25f * d.alert
+                // The shell keeps its own hue all the way down. It runs the same white → own colour
+                // → floor grid drain every other derez runs; only the middle term is cyan, because
+                // what broke was energy and not a machine.
+                if (d.shield) { r = POOL_C[0]; g = POOL_C[1]; b = POOL_C[2] }
                 if (p.kind == RecognizerModel.EYE) { r = 1f; g = 0.28f; b = 0.22f }
                 r += (tint[0] - r) * cool; g += (tint[1] - g) * cool; b += (tint[2] - b) * cool
                 r += (1f - r) * hot; g += (1f - g) * hot; b += (1f - b) * hot
@@ -576,17 +662,217 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         if (yes) for (k in 0 until 6) { val p = v[k]; pts.v(p[0], p[1], p[2], 1f, 1f, 0.6f, 0.9f * vis * fog(x, y, z)) }
     }
 
+    // ------------------------------------------------------------------ [THE ENERGY POOL]
+    /**
+     * A CONDUIT TAP, OPEN. On the Grid a program drinks energy from a pool, and this is one: a set
+     * of rings cut into the floor with a column of light standing out of them, in cyan-white against
+     * an arena that is entirely green.
+     *
+     * IT IS BUILT TO BE SEEN FROM THE FAR END OF A CORRIDOR, because that is the only way it can be
+     * worth crossing an arena for. The column is what does that — five and a half units of light
+     * rising to well above eye height, so it clears the near walls' tops in a way nothing else in
+     * the game does, and it is the one thing here that reads at a hundred units. The rings do the
+     * close work: the outermost is drawn at exactly [Game.POOL_R], so the circle you can see is
+     * literally the circle you have to be standing in.
+     *
+     * THE BIT IS HEARD AND NOT SEEN; THE POOL IS SEEN AND NOT HEARD. The Bit is a small thing hidden
+     * in a maze and its whole cue is the chatter that tightens as you close; giving the pool an
+     * ambient voice too would put two proximity signals in one mix and ruin the one that matters.
+     * So the pool is silent until you are actually drinking from it. The split is deliberate and it
+     * is what keeps the two objectives from feeling like one objective twice.
+     *
+     * DRINKING. The column DRAINS as [draw] fills — it shortens, the dashes on it run downward
+     * instead of up, and a bright tether springs from the cap to just under the periscope. Energy
+     * visibly leaves the pool and enters the tank, which is the entire fiction stated in two
+     * strokes, and it means the dwell is never a progress bar you have to look away to read.
+     */
+    private val POOL_C = floatArrayOf(0.55f, 0.95f, 1f)
+
+    /** A horizontal ring in the XZ plane — the pool's whole vocabulary. */
+    private fun ringXZ(cx: Float, cy: Float, cz: Float, rad: Float, n: Int, r: Float, g: Float, b: Float, a: Float) {
+        if (a < 0.004f) return
+        for (i in 0 until n) {
+            val a0 = 6.2832f * i / n; val a1 = 6.2832f * (i + 1) / n
+            wline(cx + cos(a0) * rad, cy, cz + sin(a0) * rad, cx + cos(a1) * rad, cy, cz + sin(a1) * rad, r, g, b, a)
+        }
+    }
+
+    private fun buildPool(x: Float, z: Float, t: Float, vis: Float, draw: Float) {
+        val c = POOL_C
+        val a0 = vis
+        // the surface: three rings, brightness travelling outward, the outer one AT the draw radius
+        val radii = floatArrayOf(0.8f, 1.5f, Game.POOL_R)
+        for (k in radii.indices) {
+            val ph = t * 0.75f - k * 0.3f
+            val pulse = 0.42f + 0.58f * (0.5f + 0.5f * sin(ph * 6.2832f))
+            ringXZ(x, 0.06f, z, radii[k], 20, c[0], c[1], c[2], a0 * (0.30f + 0.45f * pulse))
+        }
+        // the aperture you drink from: a slowly turning hexagon with spokes out to the first ring
+        val spin = t * 0.55f
+        for (i in 0 until 6) {
+            val b0 = spin + 6.2832f * i / 6f; val b1 = spin + 6.2832f * (i + 1) / 6f
+            wline(x + cos(b0) * 0.42f, 0.1f, z + sin(b0) * 0.42f, x + cos(b1) * 0.42f, 0.1f, z + sin(b1) * 0.42f,
+                1f, 1f, 1f, a0 * 0.85f)
+            wline(x + cos(b0) * 0.42f, 0.1f, z + sin(b0) * 0.42f, x + cos(b0) * 0.8f, 0.06f, z + sin(b0) * 0.8f,
+                c[0], c[1], c[2], a0 * 0.45f)
+        }
+        // the column. Six faint strands carry the silhouette at range; the travelling dashes on them
+        // are the energy itself, climbing — or, once you are drinking, falling back into the pool.
+        val top = 5.4f - 3.6f * draw
+        val strandR = 0.62f
+        for (i in 0 until 6) {
+            val b = spin * 0.4f + 6.2832f * i / 6f
+            val sx = x + cos(b) * strandR; val sz = z + sin(b) * strandR
+            wline(sx, 0.15f, sz, sx, top, sz, c[0], c[1], c[2], a0 * 0.22f)
+            for (j in 0 until 3) {
+                val flow = if (draw > 0.02f) -1f else 1f
+                val u = (((t * 0.6f * flow + j / 3f + i * 0.11f) % 1f) + 1f) % 1f
+                val y0 = 0.15f + u * (top - 0.15f)
+                val y1 = min(top, y0 + (top - 0.15f) * 0.16f)
+                wline(sx, y0, sz, sx, y1, sz, 1f, 1f, 1f, a0 * 0.9f)
+            }
+        }
+        ringXZ(x, top, z, 0.3f, 12, 1f, 1f, 1f, a0 * 0.8f)
+        pts.v(x, top, z, 1f, 1f, 1f, a0 * fog(x, top, z))
+        pts.v(x, 0.1f, z, c[0], c[1], c[2], a0 * fog(x, 0.1f, z))
+        // THE TETHER. Energy leaving the pool for the tank, ended a metre and a bit short of the eye
+        // — a vertex at the periscope itself would sit on the near plane and slash across the frame
+        // (the same trap the shell tail fell into; see buildShots).
+        if (draw > 0.02f) {
+            var dx = x - camX; var dz = z - camZ
+            val dl = hypot(dx, dz).coerceAtLeast(0.01f); dx /= dl; dz /= dl
+            val ex = camX + dx * 1.3f; val ez = camZ + dz * 1.3f
+            val ey = camY - 0.35f
+            val wob = 0.10f * sin(t * 21f)
+            wline(x, top, z, (x + ex) * 0.5f + wob, (top + ey) * 0.5f + 0.35f, (z + ez) * 0.5f, 1f, 1f, 1f, 0.5f + 0.5f * draw)
+            wline((x + ex) * 0.5f + wob, (top + ey) * 0.5f + 0.35f, (z + ez) * 0.5f, ex, ey, ez, 1f, 1f, 1f, 0.6f + 0.4f * draw)
+        }
+    }
+
+    /** The pool folding away once it has been drunk: a shock ring outward and the column firing up. */
+    private fun buildPoolCollapse(x: Float, z: Float, k: Float) {
+        val u = 1f - k
+        ringXZ(x, 0.08f, z, 0.6f + u * 7f, 26, 0.7f, 1f, 1f, k * 0.85f)
+        ringXZ(x, 0.08f + u * 2.2f, z, 0.4f + u * 3f, 20, 0.85f, 1f, 1f, k * 0.6f)
+        wline(x, 0f, z, x, 2f + u * 13f, z, 0.9f, 1f, 1f, k)
+    }
+
+    // ------------------------------------------------------------------ [THE SHELL]
+    /**
+     * THE SHIELD, FROM INSIDE IT — a cage of cyan light around the periscope, built from
+     * [ShieldModel] and therefore from exactly the segments [com.x3paranoids.engine.Derez.seedShield]
+     * will throw outward when the last charge goes.
+     *
+     * "AM I SHIELDED?" MUST NEVER REQUIRE THINKING, and this is the first of the two answers (the
+     * sight's pip row is the other): there are cyan arcs sweeping across your view, anchored to the
+     * hull rather than to your head, so they SWING as you look about. That motion is what makes it
+     * a thing around the tank rather than a filter on the lens. How MUCH shield is answered by the
+     * same object — [ShieldModel]'s latitude bands drop away one per spent charge, so three charges
+     * is a full cage, one is a single ring at your waist.
+     *
+     * IT MUST NOT COST YOU THE SHOT. Two rules keep it out of the way of the thing you are aiming
+     * with. Every vertex is faded by its angle off the view axis — brightest at the periphery, all
+     * but gone dead ahead — which is a Fresnel rim in everything but name and leaves the sight's
+     * centre clean. And any segment with an endpoint less than about 85 degrees off forward is
+     * dropped entirely: it is off screen anyway, and a vertex behind the eye in a pipeline with no
+     * near-plane guard is the mirrored-slash bug the shell tails already taught this file once.
+     *
+     * A HIT IS DIRECTIONAL. [Game.shieldHitX] is the unit vector back toward whatever landed it, and
+     * segments facing that way brighten hardest, so a bolt out of a side corridor lights the shell
+     * on that side. The whole cage flares white on top of it, so you cannot miss the fact of it —
+     * but you can also see where it came from without looking at the plate.
+     */
+    /**
+     * TWO THINGS STOP THE SHELL READING AS MORE WALL, and the first frame of it on the glasses
+     * needed both.
+     *
+     * IT IS NOT CENTRED ON THE EYE. A sphere drawn about the periscope puts the viewer at its exact
+     * centre, and from the centre of a sphere EVERY great circle projects to a straight line — so
+     * the meridians came out as vertical strokes and the equator as a horizontal one, which on a
+     * screen already full of vertical wall posts and a horizon is indistinguishable from the arena.
+     * The shell is centred on the HULL instead, [SHELL_DROP] below the eye, which is also where it
+     * belongs: the bubble wraps the tank and the periscope stands up inside it, off-axis. Being
+     * off-centre is what puts CURVATURE back — the rings come out as arcs, and an arc is a thing no
+     * wall in this game can draw.
+     *
+     * IT IS DASHED. Each segment is drawn as the middle [DASH] of itself, so the cage is stippled
+     * rather than solid. Nothing else in the arena is dashed except the pool's own rising energy,
+     * which is exactly the association wanted, and a broken line cannot be mistaken for structure.
+     */
+    private val SHELL_DROP = Game.SHIELD_DROP
+    private val DASH = 0.62f
+
+    private fun buildShield(n: Int, flash: Float, yaw: Float, pitch: Float) {
+        val cp = cos(pitch)
+        val fx = sin(yaw) * cp; val fy = sin(pitch); val fz = -cos(yaw) * cp
+        val m = ShieldModel
+        val k = n / Game.SHIELD_MAX.toFloat()
+        val breathe = 1f + 0.018f * sin(game.time * 2.3f)
+        val rad = Game.SHIELD_R * breathe * (1f + 0.10f * flash)
+        val r = 0.45f + 0.55f * flash; val g = 0.92f + 0.08f * flash; val b = 1f
+        // ALPHA IS A GAMMA HERE, NOT A DIMMER. The shader emits rgb·a and the blend is
+        // (SRC_ALPHA, ONE), so what lands on the waveguide is rgb·a SQUARED — the same fact the
+        // wall wash note records. A shell at 0.2 alpha is 4% of a wall's light, which measured as
+        // "drawn, and invisible" twice before these numbers were right. At full charge the rim
+        // lands near a wall's own brightness and the crosshair sits at about one percent of it.
+        val base = 0.90f + 0.70f * k + 1.2f * flash * flash
+        val hx = game.shieldHitX; val hy = game.shieldHitY; val hz = game.shieldHitZ
+        val directed = flash > 0.01f && (hx != 0f || hy != 0f || hz != 0f)
+        val t0 = (1f - DASH) * 0.5f; val t1 = 1f - t0
+        for (i in 0 until m.count) {
+            if (m.band[i] >= n) continue
+            val q = i * 6
+            // the dash: the middle of the arc, in the shell's own frame
+            val ax = m.seg[q] + (m.seg[q + 3] - m.seg[q]) * t0
+            val ay = m.seg[q + 1] + (m.seg[q + 4] - m.seg[q + 1]) * t0
+            val az = m.seg[q + 2] + (m.seg[q + 5] - m.seg[q + 2]) * t0
+            val bx = m.seg[q] + (m.seg[q + 3] - m.seg[q]) * t1
+            val by = m.seg[q + 1] + (m.seg[q + 4] - m.seg[q + 1]) * t1
+            val bz = m.seg[q + 2] + (m.seg[q + 5] - m.seg[q + 2]) * t1
+            // eye-relative direction: the shell is off-centre, so this is NOT the unit vector above
+            val pax = ax * rad; val pay = ay * rad - SHELL_DROP; val paz = az * rad
+            val pbx = bx * rad; val pby = by * rad - SHELL_DROP; val pbz = bz * rad
+            val la = sqrt(pax * pax + pay * pay + paz * paz).coerceAtLeast(0.01f)
+            val lb = sqrt(pbx * pbx + pby * pby + pbz * pbz).coerceAtLeast(0.01f)
+            val da = (pax * fx + pay * fy + paz * fz) / la
+            val db = (pbx * fx + pby * fy + pbz * fz) / lb
+            if (da < 0.08f || db < 0.08f) continue
+            // The rim fade is the SINE of the angle off the view axis, not (1 − dot). A dot product
+            // barely moves over the first twenty degrees, so a (1 − dot) ramp left the whole shell
+            // at a few percent alpha and it measured 287 cyan pixels in a 640×480 frame — drawn,
+            // and invisible. sqrt(1 − dot²) is sin(angle): it is 0.61 at the screen's own edge and
+            // still ~0.1 at the crosshair, which is the curve the eye expects from a rim.
+            var aa = base * (0.10f + 0.90f * sqrt(max(0f, 1f - da * da)))
+            var ab = base * (0.10f + 0.90f * sqrt(max(0f, 1f - db * db)))
+            if (directed) {
+                aa *= 1f + 2.4f * flash * max(0f, (pax * hx + pay * hy + paz * hz) / la)
+                ab *= 1f + 2.4f * flash * max(0f, (pbx * hx + pby * hy + pbz * hz) / lb)
+            }
+            lines.v(camX + pax, camY + pay, camZ + paz, r, g, b, aa)
+            lines.v(camX + pbx, camY + pby, camZ + pbz, r, g, b, ab)
+        }
+    }
+
     /**
      * A bolt is hidden by a wall exactly as its Recognizer is, so a machine you cannot see cannot
      * appear to shoot at you through the maze. The tail is drawn from the head, so the head's own
      * sight line governs the whole streak — a shell crossing a doorway is briefly half-length rather
      * than half-through a wall, which is the right way for a stroke that lives a few frames to end.
      */
-    private fun buildShots() {
-        for (s in game.shots) {
+    private fun buildShots(list: List<com.x3paranoids.engine.Shot>) {
+        for (s in list) {
             if (!visible(s.x, s.z)) continue
             val l = sqrt(s.vx * s.vx + s.vy * s.vy + s.vz * s.vz).coerceAtLeast(0.01f)
-            val k = if (s.friendly) 1.6f / l else 1.1f / l
+            // THE TAIL MAY NOT REACH BEHIND THE EYE. Your own shell leaves the barrel 1.2 units out
+            // and trails 1.6 behind its head — which on the frame it is fired puts the tail's vertex
+            // 40 cm BEHIND the periscope, and there is no near-plane clipping in this pipeline: a
+            // vertex behind the eye projects mirrored, and the streak lands as a bright diagonal
+            // slash across an unrelated corner of the screen. Caught in an attract-loop frame as a
+            // red stroke sitting exactly where the sight's bottom-left chevron is; it has been
+            // firing one of those on every shot the game has ever taken. So the tail is cut to the
+            // distance from the eye, and a shell in your lap simply draws short.
+            val head = sqrt((s.x - camX) * (s.x - camX) + (s.y - camY) * (s.y - camY) + (s.z - camZ) * (s.z - camZ))
+            val k = min(if (s.friendly) 1.6f else 1.1f, max(0f, head - 0.45f)) / l
             val r = if (s.friendly) 1f else 1f; val g = if (s.friendly) 0.88f else 0.28f; val b = if (s.friendly) 0.3f else 0.22f
             wline(s.x, s.y, s.z, s.x - s.vx * k, s.y - s.vy * k, s.z - s.vz * k, r, g, b, 1f)
             pts.v(s.x, s.y, s.z, r, g, b, fog(s.x, s.y, s.z))
@@ -594,17 +880,16 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
     }
 
     /** A derez behind a wall stays behind it: sparks take the same sight test, per particle. */
-    private fun buildSparks() {
-        for (p in game.sparks) {
+    private fun buildSparks(list: List<com.x3paranoids.engine.Spark>) {
+        for (p in list) {
             if (!visible(p.x, p.z)) continue
             pts.v(p.x, p.y, p.z, p.r, p.g, p.b, p.life.coerceIn(0f, 1f) * fog(p.x, p.y, p.z))
         }
     }
 
     /** The cannon's beam flares from below the periscope toward the sight, like the cabinet's shot. */
-    private fun buildMuzzle() {
-        val m = game.muzzle; if (m <= 0f) return
-        val yaw = game.yaw; val pitch = game.pitch
+    private fun buildMuzzle(m: Float, yaw: Float, pitch: Float) {
+        if (m <= 0f) return
         val cp = cos(pitch)
         val fx = sin(yaw) * cp; val fy = sin(pitch); val fz = -cos(yaw) * cp
         val rx = cos(yaw); val rz = sin(yaw)
@@ -619,7 +904,9 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         override fun line(x0: Float, y0: Float, x1: Float, y1: Float) = hl(x0, y0, x1, y1)
     }
     private var cr = 1f; private var cg = 1f; private var cb = 1f; private var ca = 1f
-    private fun color(r: Float, g: Float, b: Float, a: Float = 1f) { cr = r; cg = g; cb = b; ca = a }
+    /** Fades a whole screen's worth of HUD at once — the attract loop dips out on it between passes. */
+    private var hudGain = 1f
+    private fun color(r: Float, g: Float, b: Float, a: Float = 1f) { cr = r; cg = g; cb = b; ca = a * hudGain }
     private fun text(s: String, x: Float, y: Float, sc: Float) = StrokeFont.draw(corrupt(s), x, y, sc, sink)
     private fun textC(s: String, cx: Float, y: Float, sc: Float) = StrokeFont.draw(corrupt(s), cx - StrokeFont.width(s, sc) / 2f, y, sc, sink)
     private fun textR(s: String, rx: Float, y: Float, sc: Float) = StrokeFont.draw(corrupt(s), rx - StrokeFont.width(s, sc), y, sc, sink)
@@ -668,7 +955,47 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
 
     private fun rawHl(x0: Float, y0: Float, x1: Float, y1: Float) { hud.v(x0, y0, 0f, cr, cg, cb, ca); hud.v(x1, y1, 0f, cr, cg, cb, ca) }
 
+    // ------------------------------------------------------------------ [THE BEAM]
+    /**
+     * TWO FILTERS THE TITLE DRAWS ITSELF WITH. They sit on [hl] for exactly the reason the sight's
+     * failure does: it is the one door every HUD stroke in this file passes through, so the cabinet
+     * frame, the readouts, the records and the title all obey them without a single call site
+     * knowing they exist.
+     *
+     * [revealY] — THE POWER-ON SWEEP. Nothing below the beam has been drawn yet, and a stroke the
+     * beam is halfway down is CUT at it rather than dropped, so the machine's frame resolves out of
+     * black in one smooth pass instead of appearing in rows.
+     *
+     * [traceLimit] — THE BEAM WRITING. Strokes are handed out in the order the stroke font emits
+     * them, which is left to right, letter by letter, so counting them is enough to make the title
+     * draw ITSELF: everything past the limit is not drawn, and the stroke AT the limit is drawn as
+     * far as the beam has got along it. That last part is what separates this from a wipe — you can
+     * see the beam halfway up the diagonal of an A.
+     */
+    private var revealY = OFF
+    private var traceLimit = -1f
+    private var traceIdx = 0
+
     private fun hl(x0: Float, y0: Float, x1: Float, y1: Float) {
+        var ax = x0; var ay = y0; var bx = x1; var by = y1
+        if (traceLimit >= 0f) {
+            val f = traceLimit - traceIdx++
+            if (f <= 0f) return
+            if (f < 1f) { bx = ax + (bx - ax) * f; by = ay + (by - ay) * f }
+        }
+        if (revealY < OFF) {
+            val aOut = ay > revealY; val bOut = by > revealY
+            if (aOut && bOut) return
+            if (aOut != bOut) {
+                val t = ((revealY - ay) / (by - ay)).coerceIn(0f, 1f)
+                val cx = ax + (bx - ax) * t; val cy = ay + (by - ay) * t
+                if (aOut) { ax = cx; ay = cy } else { bx = cx; by = cy }
+            }
+        }
+        hlGlitch(ax, ay, bx, by)
+    }
+
+    private fun hlGlitch(x0: Float, y0: Float, x1: Float, y1: Float) {
         if (glitch <= 0.001f) { rawHl(x0, y0, x1, y1); return }
         val g = glitch
         val key = (x0 * 3.1f + y0 * 7.7f + x1 * 1.9f + y1 * 0.7f).toInt()
@@ -754,12 +1081,25 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         // is total well before GAME OVER, so the ending arrives on a clean screen.
         glitch = if (game.state == State.DYING) ((game.stateT - 0.25f) / 2.35f).coerceIn(0f, 1f) else 0f
         glitchSeed = (game.stateT * 14f).toInt()
+        revealY = OFF; traceLimit = -1f; hudGain = 1f
+        // On the title the whole sight is the attract loop's: it resolves out of black behind the
+        // power-on beam, and dips back into black with the world at the end of each pass.
+        val att = if (game.state == State.TITLE) game.attract else null
+        if (att != null) {
+            revealY = powerOnBeam(att.t)
+            hudGain = 1f - ((att.t - att.plan.end) / com.x3paranoids.engine.Attract.FADE).coerceIn(0f, 1f)
+        }
         buildBezel()
         when (game.state) {
-            State.TITLE -> buildTitleHud()
+            // THE MENU GETS THE GLASS TO ITSELF. The poster is a full screen of type — a title at
+            // 6.4 scale, a subtitle, a lore line and an invitation — and the settings panel landed
+            // on top of all of it: SETTINGS printed through PARANOIDS, the rows through the crawl.
+            // The demo behind it keeps running as the backdrop; only its lettering stands down.
+            State.TITLE -> if (att != null && !game.menuOpen) buildTitleHud(att)
             State.PLAY, State.WAVE_CLEAR, State.DYING -> { buildPlayHud(); buildMinimap() }
             State.GAME_OVER -> { buildPlayHud(); buildGameOver() }
         }
+        revealY = OFF; traceLimit = -1f; hudGain = 1f
         if (game.menuOpen) buildMenu()
     }
 
@@ -775,40 +1115,171 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         }
     }
 
-    private fun buildTitleHud() {
-        val t = game.time
-        val pulse = 0.8f + 0.2f * sin(t * 2.5f)
-        color(GREEN[0], GREEN[1], GREEN[2], pulse); textC("X3 PARANOIDS", 320f, 92f, 6.4f)
-        color(0.7f, 0.95f, 0.8f, 0.75f); textC("A TANK. A MAZE. THE RECOGNIZERS.", 320f, 122f, 2.0f)
-        color(0.75f, 0.85f, 0.8f, 0.35f); hl(150f, 136f, 490f, 136f)
-        val li = game.introLine
-        if (li in Game.INTRO_TEXT.indices) {
-            val s = Game.INTRO_TEXT[li]
-            color(0.55f, 1f, 0.7f, 0.95f)
-            if (StrokeFont.width(s, 2.2f) > 560f) {
-                val cut = s.lastIndexOf(' ', s.length / 2 + 6).let { if (it < 0) s.length / 2 else it }
-                textC(s.substring(0, cut), 320f, 336f, 2.2f); textC(s.substring(cut + 1), 320f, 362f, 2.2f)
-            } else textC(s, 320f, 348f, 2.2f)
-        } else if (li >= Game.INTRO_TEXT.size) {
-            color(0.55f, 1f, 0.7f, 0.6f); textC("END OF LINE.", 320f, 348f, 2.2f)
-        }
-        val tapA = if (game.showTap) 0.55f + 0.45f * abs(sin(t * 3f)) else 0.25f
-        color(1f, 0.9f, 0.4f, tapA); textC("TAP TO PLAY", 320f, 420f, 3f)
-        color(0.7f, 0.95f, 0.8f, 0.6f)
-        text("HIGH ${store.highScore}", 56f, 452f, 2.2f); textR("BEST WAVE ${store.bestWave}", 584f, 452f, 2.2f)
-        color(0.55f, 0.7f, 0.65f, 0.5f)
-        textC("HEAD LOOKS   SWIPE UP/DOWN DRIVES", 320f, 392f, 1.6f)
-        textC("LEFT/RIGHT TURNS 90   TAP FIRES", 320f, 410f, 1.6f)
+    /** How many strokes the font spends on a string — cached, because a title is a constant. */
+    private val strokeCounts = HashMap<String, Int>()
+    private fun strokes(s: String): Int = strokeCounts.getOrPut(s) {
+        var n = 0
+        StrokeFont.draw(s, 0f, 0f, 1f, object : StrokeFont.LineSink {
+            override fun line(x0: Float, y0: Float, x1: Float, y1: Float) { n++ }
+        })
+        n
     }
 
-    private fun buildPlayHud() {
-        val t = game.time
-        val lock = game.lockedOn
-        val blink = 0.5f + 0.5f * sin(t * 9f)
-        var r = GREEN[0]; var g = GREEN[1]; var b = GREEN[2]
-        if (lock) { r += (1f - r) * blink * 0.9f; g -= g * blink * 0.8f; b -= b * blink * 0.6f }
-        val inv = if (game.invuln > 0f) 0.45f + 0.55f * abs(sin(t * 14f)) else 1f
-        color(r, g, b, 0.9f * inv)
+    /** Centred text the beam is still writing; [u] is 0 at the first stroke and 1 when it is done. */
+    private fun tracedTextC(s: String, cx: Float, y: Float, sc: Float, u: Float) {
+        if (u >= 1f) { textC(s, cx, y, sc); return }
+        traceLimit = strokes(s) * u; traceIdx = 0
+        textC(s, cx, y, sc)
+        traceLimit = -1f
+    }
+
+    /** Where the power-on beam is, or [OFF] once it has run off the bottom of the frame. */
+    private fun powerOnBeam(t: Float): Float {
+        val u = (t - 0.22f) / 0.95f
+        return if (u >= 1f) OFF else 6f + u.coerceAtLeast(0f) * 474f
+    }
+
+    /** A soft in-and-out envelope: up over [rise] from [t0], down over [fall] from [t1]. */
+    private fun window(t: Float, t0: Float, rise: Float, t1: Float, fall: Float) =
+        ((t - t0) / rise).coerceIn(0f, 1f) * (1f - ((t - t1) / fall).coerceIn(0f, 1f))
+
+    // ------------------------------------------------------------------ [THE TITLE]
+    /**
+     * THE POSTER. Five beats, and the film underneath them is the game playing itself (see
+     * [com.x3paranoids.engine.Attract]); this is only the glass in front of it.
+     *
+     *  1. POWER-ON. Black, then a beam sweeps down the frame and the cabinet resolves behind it —
+     *     the machine coming up, not a screen appearing. The system says GREETINGS, PROGRAM into it.
+     *  2. THE TITLE WRITES ITSELF, stroke by stroke, at the speed a vector monitor would draw it,
+     *     and blows out white when the last stroke lands before settling back to phosphor. The rule
+     *     under it opens from the centre; the subtitle arrives after.
+     *  3. THE FLIGHT. The big title cross-fades down to a marquee at the top of the frame and gets
+     *     out of the way, because for the next quarter of a minute the middle of the screen is the
+     *     best argument this game has. The lore runs along the bottom, one line at a time, and the
+     *     PILOT ANSWERS IT in amber under its own tag — the intro's job is to introduce a
+     *     relationship, and two colours in two places is how you see that there are two of them.
+     *  4. THE KILL. The sight itself fades in over the demo — the real brackets, the real WARNING —
+     *     a shell goes down the corridor, and a Recognizer derezzes. Then the sight fades out again.
+     *     It is the one thing the old title screen could not do and the best thirty frames the game
+     *     owns.
+     *  5. THE INVITATION. The title re-lights (a second, smaller bloom), TAP TO PLAY takes the
+     *     middle of the frame, the controls are stated once, and the records sit where they always
+     *     sit. Then the whole thing dips to black and goes round again.
+     *
+     * A SMALL TAP TO PLAY IS ON SCREEN FROM THE MOMENT THE TITLE LANDS, dim, up under the marquee.
+     * Somebody who has seen this film must never have to sit through it to find out they can skip
+     * it — and a tap at any point in any beat starts a game from where they are looking.
+     */
+    private fun buildTitleHud(a: com.x3paranoids.engine.Attract) {
+        val t = a.t
+        val p = a.plan
+        val traceU = ((t - p.trace) / TRACE_T).coerceIn(0f, 1f)
+        val traceEnd = p.trace + TRACE_T
+
+        // ---- the title, big under the beam and again at the end, a marquee in between
+        val big = if (t < p.settle) window(t, p.trace, 0.001f, p.flight + 0.7f, 1.1f)
+                  else ((t - p.settle) / 0.9f).coerceIn(0f, 1f)
+        val marquee = window(t, p.flight + 1.0f, 1.0f, p.settle, 0.7f)
+        if (big > 0.01f) {
+            // THE BLOOM. The beam finishing its last stroke dwells there, and the phosphor goes
+            // past its own colour: alpha above 1 drives rgb·a white-hot in the shader, the same
+            // trick nearGain uses on a wall you are about to hit. It happens twice — once when the
+            // title is written, and again, softer, when it re-lights over the invitation.
+            val since = t - traceEnd
+            val relit = t - p.settle
+            val bloom = (if (since >= 0f) 1.9f * exp(-since * 3.4f) else 0f) +
+                (if (relit >= 0f) 1.4f * exp(-relit * 3.0f) else 0f)
+            color(GREEN[0], GREEN[1], GREEN[2], big * (0.95f + bloom))
+            tracedTextC(TITLE, 320f, 150f, 6.4f, traceU)
+            // and a smear either side of it while it is hot — a beam, not a font
+            if (bloom > 0.06f && traceU >= 1f) {
+                color(GREEN[0], GREEN[1], GREEN[2], big * bloom * 0.4f)
+                textC(TITLE, 318.4f, 150f, 6.4f); textC(TITLE, 321.6f, 150f, 6.4f)
+            }
+            val sub = ((t - traceEnd - 0.15f) / 0.55f).coerceIn(0f, 1f) * big
+            color(0.75f, 0.9f, 0.85f, 0.45f * sub); hl(320f - 172f * sub, 170f, 320f + 172f * sub, 170f)
+            color(0.7f, 0.95f, 0.8f, 0.8f * sub); textC(SUBTITLE, 320f, 196f, 2.0f)
+        }
+        if (marquee > 0.01f) { color(GREEN[0], GREEN[1], GREEN[2], 0.6f * marquee); textC(TITLE, 320f, 46f, 2.2f) }
+
+        // ---- the lore, one line at a time, each fading on its own clip's length
+        val li = game.loreIdx
+        if (li in Game.INTRO_TEXT.indices) {
+            val fade = window(game.loreAge, 0f, 0.28f, game.loreHold, 0.6f)
+            if (fade > 0.01f) {
+                val s = Game.INTRO_TEXT[li]
+                color(0.55f, 1f, 0.7f, 0.95f * fade)
+                val cut = s.indexOf('|')
+                if (cut >= 0) {
+                    textC(s.substring(0, cut), 320f, 388f, 2.2f); textC(s.substring(cut + 1), 320f, 412f, 2.2f)
+                } else textC(s, 320f, 400f, 2.2f)
+            }
+        }
+        // ---- and the pilot answering it, in its own colour, under its own name
+        if (game.pilotText.isNotEmpty()) {
+            val fade = window(game.pilotAge, 0f, 0.22f, game.pilotHold, 0.6f)
+            if (fade > 0.01f) {
+                val s = game.pilotText
+                val x = 320f - StrokeFont.width(s, 1.9f) / 2f
+                color(1f, 0.78f, 0.35f, 0.95f * fade); text(s, x, 438f, 1.9f)
+                color(1f, 0.6f, 0.25f, 0.6f * fade); text("PILOT", x - 44f, 438f, 1.4f)
+            }
+        }
+
+        // ---- the kill: the sight arms over the demo, fires, and stands down
+        val sightA = window(t, p.aim - 0.7f, 0.5f, p.fire + 1.5f, 0.8f)
+        if (sightA > 0.01f) {
+            val blink = 0.5f + 0.5f * sin(t * 9f)
+            var r = GREEN[0]; var g = GREEN[1]; var b = GREEN[2]
+            if (t < p.fire) { r += (1f - r) * blink * 0.9f; g -= g * blink * 0.8f; b -= b * blink * 0.6f }
+            color(r, g, b, 0.9f * sightA); sightBrackets()
+            if (t < p.fire) { color(1f, 0.35f, 0.25f, blink * 0.95f * sightA); textC("WARNING", 320f, 100f, 2.2f) }
+        }
+
+        // ---- TAP TO PLAY: a whisper under the marquee all the way through, the invitation at the end
+        val bigTap = ((t - p.settle) / 0.7f).coerceIn(0f, 1f)
+        // It stands down while the sight is up: the kill beat already stacks a marquee, a WARNING
+        // and a pair of brackets across the top of the frame, and the invitation is the one thing
+        // there that can afford to wait ten seconds.
+        val smallTap = ((t - traceEnd - 0.4f) / 0.8f).coerceIn(0f, 1f) * (1f - bigTap) * (1f - sightA)
+        if (smallTap > 0.01f) {
+            color(1f, 0.9f, 0.4f, (0.50f + 0.18f * sin(t * 2.2f)) * smallTap)
+            textC("TAP TO PLAY", 320f, 68f, 1.7f)
+        }
+        if (bigTap > 0.01f) {
+            color(1f, 0.9f, 0.4f, (0.6f + 0.4f * abs(sin(t * 3f))) * bigTap)
+            textC("TAP TO PLAY", 320f, 300f, 3.2f)
+            color(0.55f, 0.75f, 0.7f, 0.55f * bigTap)
+            textC("HEAD LOOKS   SWIPE UP/DOWN DRIVES", 320f, 338f, 1.6f)
+            textC("LEFT/RIGHT TURNS 90   TAP FIRES", 320f, 356f, 1.6f)
+        }
+
+        // ---- the records, in the corners they keep in every other screen of this game
+        val rec = ((t - 1.5f) / 0.8f).coerceIn(0f, 1f)
+        color(0.7f, 0.95f, 0.8f, 0.55f * rec)
+        text("HIGH ${store.highScore}", 56f, 464f, 2.0f)
+        textR("BEST WAVE ${store.bestWave}", 584f, 464f, 2.0f)
+
+        // ---- the beam itself, drawn last and unclipped: it is what is doing the revealing
+        revealY = OFF
+        val by = powerOnBeam(t)
+        if (by < OFF) {
+            for (k in 0 until 5) {
+                val yy = by - k * 6.5f
+                if (yy < 6f) continue
+                color(0.8f, 1f, 0.9f, if (k == 0) 1.7f else 0.45f * (1f - k / 5f))
+                hl(10f, yy, 630f, yy)
+            }
+        }
+    }
+
+    /**
+     * The tank sight's geometry, colourless — the caller sets the colour. Both the arena and the
+     * attract loop draw it, and it matters that they draw the SAME one: the demo arms this sight
+     * over the corridor, fires, and stands it down again, which is a promise about what the player
+     * gets when they tap. A second, prettier set of brackets for the title screen would be a lie.
+     */
+    private fun sightBrackets() {
         // outer sight brackets
         hl(120f, 70f, 195f, 70f); hl(120f, 70f, 120f, 118f)
         hl(520f, 70f, 445f, 70f); hl(520f, 70f, 520f, 118f)
@@ -821,6 +1292,17 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         // centre box ticks
         hl(288f, 214f, 304f, 214f); hl(288f, 214f, 288f, 226f); hl(352f, 214f, 336f, 214f); hl(352f, 214f, 352f, 226f)
         hl(288f, 266f, 304f, 266f); hl(288f, 266f, 288f, 254f); hl(352f, 266f, 336f, 266f); hl(352f, 266f, 352f, 254f)
+    }
+
+    private fun buildPlayHud() {
+        val t = game.time
+        val lock = game.lockedOn
+        val blink = 0.5f + 0.5f * sin(t * 9f)
+        var r = GREEN[0]; var g = GREEN[1]; var b = GREEN[2]
+        if (lock) { r += (1f - r) * blink * 0.9f; g -= g * blink * 0.8f; b -= b * blink * 0.6f }
+        val inv = if (game.invuln > 0f) 0.45f + 0.55f * abs(sin(t * 14f)) else 1f
+        color(r, g, b, 0.9f * inv)
+        sightBrackets()
         // readouts
         color(GREEN[0], GREEN[1], GREEN[2], 0.95f)
         text("RECOGNIZERS ${game.recognizersLeft}", 52f, 46f, 2.2f)
@@ -836,10 +1318,18 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
             color(GREEN[0], GREEN[1], GREEN[2], if (on) 0.95f else 0.22f); hl(x, 465f, x + 6f, 465f)
         }
         if (lock) { color(1f, 0.35f, 0.25f, blink); textC("WARNING", 320f, 68f, 1.8f) }
+        buildShieldHud()
         // damage: red frame
         if (game.damageFlash > 0f) {
             color(1f, 0.2f, 0.15f, game.damageFlash * 0.85f)
             rect(24f, 24f, 616f, 456f); rect(30f, 30f, 610f, 450f); rect(36f, 36f, 604f, 444f)
+        }
+        // A shield hit gets ONE cyan frame, not three red ones. It has to be unmistakably a
+        // different event from taking damage — same grammar, different colour, a third of the
+        // weight — or the player learns to read a shield absorbing a bolt as a life lost.
+        if (game.shieldFlash > 0f) {
+            color(0.5f, 0.95f, 1f, game.shieldFlash * 0.7f)
+            rect(20f, 20f, 620f, 460f)
         }
         when (game.state) {
             State.WAVE_CLEAR -> {
@@ -848,6 +1338,64 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
             }
             State.DYING -> { color(1f, 0.3f, 0.25f, 0.6f + 0.4f * abs(sin(t * 12f))); textC("DEREZZED", 320f, 215f, 5f) }
             else -> {}
+        }
+    }
+
+    // ------------------------------------------------------------------ [THE SHELL, ON THE GLASS]
+    /**
+     * THE SECOND ANSWER TO "AM I SHIELDED?", and the exact one: a row of charge pips on the sight,
+     * top-centre, directly under the timer where the eye already goes.
+     *
+     * The bubble around your head is the ambient answer — it is impossible to miss and it needs no
+     * looking at — but it is a shell of soft light, and soft light is a bad way to count to three.
+     * So the pips state the number outright: a lit diamond per charge, a hollow one per charge
+     * spent, so the row is always [Game.SHIELD_MAX] wide and "two of three" is a shape rather than
+     * an arithmetic. Cyan, because everything about the energy in this game is.
+     *
+     * The row sits at y=112: below the top-centre sight tick (which ends at 96) and the WARNING
+     * that shares this band during a lock, and well above the inner chevrons at 138. The draw meter
+     * lands under it at 134–148, where the chevrons have already run out to x≈210 and x≈430 and the
+     * meter's own 150 px never reaches either.
+     *
+     * The meter exists because the dwell is the one moment in this game where standing still is
+     * correct, and a player who cannot see the draw filling will assume it is not working and
+     * drive off. It is drawn in the same idiom as the wave-progress bar at the bottom of the sight,
+     * so it is legible the first time without a legend.
+     */
+    private fun buildShieldHud() {
+        val cy = floatArrayOf(0.5f, 0.95f, 1f)
+        if (game.shield > 0) {
+            val lbl = "SHIELD"
+            val lw = StrokeFont.width(lbl, 1.4f)
+            val gap = 19f
+            val pips = Game.SHIELD_MAX
+            val total = lw + 14f + (pips - 1) * gap + 9f
+            val x0 = 320f - total / 2f
+            color(cy[0], cy[1], cy[2], 0.7f)
+            text(lbl, x0, 116f, 1.4f)
+            val px0 = x0 + lw + 14f + 4.5f
+            for (i in 0 until pips) {
+                val cx = px0 + i * gap
+                val on = i < game.shield
+                val h = if (on) 6.5f else 5f
+                color(cy[0], cy[1], cy[2], if (on) 0.95f else 0.25f)
+                hl(cx, 112f - h, cx + h, 112f); hl(cx + h, 112f, cx, 112f + h)
+                hl(cx, 112f + h, cx - h, 112f); hl(cx - h, 112f, cx, 112f - h)
+                if (on) { hl(cx - 2.6f, 112f, cx + 2.6f, 112f); hl(cx, 112f - 2.6f, cx, 112f + 2.6f) }
+            }
+        }
+        val d = game.poolDraw
+        if (d > 0.001f) {
+            color(cy[0], cy[1], cy[2], 0.85f)
+            textC("DRAWING ENERGY", 320f, 132f, 1.5f)
+            val w = 150f; val bx = 320f - w / 2f; val by = 140f
+            color(cy[0], cy[1], cy[2], 0.4f); rect(bx - 3f, by - 3f, bx + w + 3f, by + 9f)
+            val n = (d * 20f + 0.001f).toInt()
+            for (i in 0 until 20) {
+                color(cy[0], cy[1], cy[2], if (i < n) 0.95f else 0.18f)
+                val x = bx + i * 7.5f + 1f
+                hl(x, by, x, by + 6f)
+            }
         }
     }
 
@@ -931,6 +1479,45 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
                 var dx = tx - ex; var dy = ty - ey
                 val dl = hypot(dx, dy).coerceAtLeast(0.001f); dx /= dl; dy /= dl
                 hl(ex + dx * (h + 1.5f), ey + dy * (h + 1.5f), ex + dx * (h + 7f), ey + dy * (h + 7f))
+            }
+        }
+
+        // THE POOL, and why the plate is allowed to point at it when it refuses to point at the Bit.
+        //
+        // The plate's rule is "threat, not omniscience": it never tells you a thing you could not
+        // have found out for yourself. The Bit is a small object hidden in a maze — pointing at it
+        // would hand over the one objective the game states out loud and then makes you work for —
+        // so it gets a bearing and nothing more until you are nearly on it. The POOL is a column of
+        // light five and a half units tall that you can see down any corridor it stands in. A
+        // bearing to it is not omniscience; it is the plate agreeing with the periscope. And a
+        // bearing through a maze of right angles is still a route problem, not an answer.
+        //
+        // A RING, NOT A DIAMOND, and it rides ON the rim where the Bit's caret rides seven pixels
+        // inside it — so on the one bearing where both markers coincide they are still two
+        // different marks at two different radii, rather than one smudge.
+        if (game.poolActive) {
+            color(0.65f, 1f, 1f, 0.85f)
+            val pdx = mx(game.poolX); val pdy = my(game.poolZ)
+            if (hypot(game.px - game.poolX, game.pz - game.poolZ) <= MAP_BIT_NEAR) {
+                for (i in 0 until 6) {
+                    val a0 = 6.2832f * i / 6f; val a1 = 6.2832f * (i + 1) / 6f
+                    hl(pdx + cos(a0) * 3.4f, pdy + sin(a0) * 3.4f, pdx + cos(a1) * 3.4f, pdy + sin(a1) * 3.4f)
+                }
+                hl(pdx - 1.6f, pdy, pdx + 1.6f, pdy)
+            } else {
+                var dx = pdx - tx; var dy = pdy - ty
+                val dl = hypot(dx, dy).coerceAtLeast(0.001f); dx /= dl; dy /= dl
+                val ins = 3.5f
+                val bx0 = MAP_X + ins; val bx1 = x1 - ins
+                val by0 = MAP_Y + ins; val by1 = y1 - ins
+                var tt = MAP_S * 2f
+                if (dx > 1e-4f) tt = min(tt, (bx1 - tx) / dx) else if (dx < -1e-4f) tt = min(tt, (bx0 - tx) / dx)
+                if (dy > 1e-4f) tt = min(tt, (by1 - ty) / dy) else if (dy < -1e-4f) tt = min(tt, (by0 - ty) / dy)
+                val ex = (tx + dx * max(tt, 0f)).coerceIn(bx0, bx1)
+                val ey = (ty + dy * max(tt, 0f)).coerceIn(by0, by1)
+                val nx = -dy; val ny = dx
+                hl(ex - nx * 4f, ey - ny * 4f, ex + nx * 4f, ey + ny * 4f)
+                hl(ex - dx * 3.4f, ey - dy * 3.4f, ex, ey)
             }
         }
 
@@ -1059,6 +1646,12 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
     }
 
     companion object {
+        /** "no clip" / "no trace" — a y beyond any screen, so the filters cost one compare when idle. */
+        private const val OFF = 1e9f
+        private const val TITLE = "X3 PARANOIDS"
+        private const val SUBTITLE = "A TANK. A MAZE. THE RECOGNIZERS."
+        /** How long the beam takes to write the title. */
+        private const val TRACE_T = 2.0f
         private const val VERT = """#version 300 es
             uniform mat4 uMVP; uniform float uPointSize; uniform float uAlpha;
             in vec3 aPos; in vec4 aColor; out vec4 vColor;

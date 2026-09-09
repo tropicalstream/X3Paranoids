@@ -17,7 +17,13 @@ import kotlin.random.Random
 interface GameHost {
     fun sfx(id: Int, pitch: Float = 1f, vol: Float = 1f)
     fun hum(level: Float, rate: Float)
-    fun say(id: String, urgent: Boolean = false)
+    /**
+     * [patienceMs] is how long the line will wait for the floor before it is dropped. The default
+     * suits a reaction — a fact about something that just happened, worthless once it has not. The
+     * intro passes a much longer one: its lines are a recital, and a recital with a sentence
+     * missing out of the middle is worse than one that ran late.
+     */
+    fun say(id: String, urgent: Boolean = false, patienceMs: Long = 1500L)
     fun sayAll(ids: List<String>)
     fun stopVoice()
     /** The PILOT track (assets/voice_hero). [patienceMs] is how long the line will wait for the floor. */
@@ -140,16 +146,129 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         const val FRAG_G = 13f
         /** How long the tank's death runs before GAME OVER. The sight has to fail visibly first. */
         const val DYING_T = 3.4f
+        /** Range at which the Bit counts as "in your lap" — the top of the proximity ramp. */
+        const val BIT_CLOSE = 3f
+
+        // ------------------------------------------------------------------ [THE ENERGY ECONOMY]
+        /**
+         * PROGRAMS ON THE GRID RUN ON ENERGY. They drink it from pools; starved of it they derez.
+         * The arena hides one ENERGY POOL a wave, and a tank that stands in it long enough to DRAW
+         * comes away wearing a shell of light that takes hits so the hull does not.
+         *
+         * Every number below exists to keep that from switching the threat off.
+         *
+         * [SHIELD_MAX] = 3 — one per band of [ShieldModel], so the shell IS the readout. Three is
+         * three hits, which is a whole life more than the tank itself carries between deaths, and
+         * that is deliberate: a pool has to be worth abandoning a corridor and crossing the arena
+         * for, or nobody will ever go and the whole system is decoration.
+         *
+         * [SHIELD_IFRAME] = 0.8 s, against the 2.6 s a real hit buys. THIS IS THE BALANCE. Losing a
+         * life makes you briefly untouchable, which is mercy; the shield does not, which is the
+         * price of it. Stand in a Recognizer's fire lane wearing three charges and they are gone in
+         * two and a half seconds — the shell absorbs MISTAKES, it does not license standing still.
+         *
+         * NO REGENERATION, and no stacking past the cap: drawing again while shielded TOPS UP to
+         * three rather than adding. Energy that came back on its own would stop being worth
+         * crossing for, and energy that banked would let a careful player walk into wave six with
+         * six charges — flattening the difficulty curve at exactly the point it is supposed to bite.
+         * Charges DO survive a wave boundary, because taking them off you for clearing a wave would
+         * be a punishment for winning.
+         *
+         * [POOL_DRAW_T] = 0.9 s of continuous presence. A pickup you drive over is a coin; a pool
+         * you have to STAND IN while the machines close is a decision, and it is also the image the
+         * fiction wants — a program kneeling to drink. Step out and the draw bleeds back at
+         * [POOL_DRAW_DECAY] times the fill rate, which forgives a bump off a wall and does not
+         * forgive fleeing.
+         *
+         * The pool is scored at ZERO on purpose. The Bit is points and a life; the pool is survival.
+         * Pay for both in the same currency and the choice between them collapses into "take the
+         * Bit first, then the pool" — priced differently, they pull you two ways at once, which is
+         * the only reason to have two objectives in one arena.
+         */
+        const val SHIELD_MAX = ShieldModel.BANDS
+        /** The shell's radius about the hull: outside the tank, inside the cannon's reach. */
+        const val SHIELD_R = 2.15f
+        /**
+         * How far BELOW the periscope the shell's centre sits — the hull, not the eye. It is the
+         * whole reason the bubble reads as a bubble (see GLRenderer.buildShield), and the derez has
+         * to burst from the same centre or the shell you were looking at is not the one that broke.
+         */
+        const val SHIELD_DROP = 0.85f
+        /**
+         * Untouchable time bought by a shield charge — deliberately far short of the 2.6 s a real
+         * hit buys, but not as short as it first was. At 0.8 s a RAM ate the whole shell in a
+         * second and a half, measured on the glasses: three flares, three sounds and a derez inside
+         * two seconds, which is not a buffer, it is a shell that evaporates on contact and that the
+         * player never sees the middle state of. At 1.15 s a machine riding you down still strips
+         * three charges in under three and a half seconds — fast enough that closing to ram is the
+         * right answer for THEM — while each charge lasts long enough to register as a thing that
+         * just saved you and to give you time to break away on.
+         */
+        const val SHIELD_IFRAME = 1.15f
+        /** How close the tank must be to the pool's centre to be drinking from it. */
+        const val POOL_R = 2.2f
+        /** Seconds of continuous presence to take a full shell. */
+        const val POOL_DRAW_T = 0.9f
+        /** Leave the pool and progress bleeds back at this multiple of the fill rate. */
+        const val POOL_DRAW_DECAY = 1.5f
+        /** Seconds between the pool's climbing "pull" blips while you drink. */
+        const val POOL_SIP_T = 0.3f
+        /**
+         * THE MACHINES PRESS A SHIELDED TANK. Standing off six units is what a Recognizer does to
+         * something it can kill from there; a program carrying the Protocol's own energy gets
+         * closed on and stripped. So while [shield] is up they hold four units instead of six, fire
+         * on a cooldown scaled by [PRESS_FIRE] and chase [PRESS_SPEED] faster.
+         *
+         * This is what stops the pickup being a rest. The shell does not make the wave quieter, it
+         * changes its SHAPE: the fight comes to close quarters, where their bolts spread less and
+         * their ram is a constant threat, and where your own cannon barely has to lead them. Drink
+         * and push, or leave the pool where it is and keep playing the patient stand-off game — and
+         * the moment the last charge goes the machines fall back to six units again, which is a
+         * shift you can see and hear happen.
+         */
+        const val PRESS_STANDOFF = 4f
+        const val PRESS_FIRE = 0.7f
+        const val PRESS_SPEED = 1.28f
+        /** Above this proximity a chirp may become an actual YES: about two cells out. */
+        const val BIT_EXCITED = 0.72f
         val INTRO = listOf("intro_1", "intro_2", "intro_3", "intro_4", "intro_5", "intro_6", "intro_7", "intro_8")
+        /**
+         * The lore, as it is spoken. A `|` is a HAND-SET LINE BREAK for the two lines too long to
+         * fit the band — set by hand because the villain's name is the thing the owner insisted on
+         * and an automatic wrap put it across two lines ("THE MONOPOLY / CONTROL PROTOCOL"). A
+         * measured break is also free to be a better one: the name stays whole and "ON ITS BONES"
+         * gets the second line to itself, which is where the sentence turns anyway.
+         */
         val INTRO_TEXT = listOf(
             "GREETINGS, PROGRAM.",
             "A PROGRAMMER WROTE A GAME IN A BASEMENT.",
             "THE GAME WAS STOLEN.",
-            "THE THIEF BUILT THE MONOPOLY CONTROL PROTOCOL ON ITS BONES.",
-            "NOW THE RECOGNIZERS HUNT WHOEVER REMEMBERS THE ORIGINAL CODE.",
+            "THE THIEF BUILT THE MONOPOLY CONTROL PROTOCOL|ON ITS BONES.",
+            "NOW THE RECOGNIZERS HUNT|WHOEVER REMEMBERS THE ORIGINAL CODE.",
             "YOU REMEMBER.",
             "FIND THE BIT. SURVIVE THE WAVES.",
             "END OF LINE.",
+        )
+        /**
+         * THE TWO LINES THE PILOT GETS IN THE INTRO, and why these two.
+         *
+         * The lore is eight lines of a machine reciting a theft. Read straight through it is a
+         * paragraph; the thing that makes it a STORY is that somebody in it answers back. So the
+         * pilot speaks exactly twice, and both times the system has just handed it a cue:
+         *
+         *  - the machine names the MONOPOLY CONTROL PROTOCOL, and the program whose code it was
+         *    built on says whose maze this actually is;
+         *  - the machine says "YOU REMEMBER", the camera puts a shell through a Recognizer, and the
+         *    pilot says what it remembers.
+         *
+         * The captions are the EXACT text those clips were rendered from (tools/generate_hero_voice.py),
+         * so the glass never says a word the voice did not.
+         */
+        const val PILOT_MCP = "hero_mcp"
+        const val PILOT_KILL = "hero_kill_streak"
+        val PILOT_TEXT = mapOf(
+            PILOT_MCP to "THE PROTOCOL DOESN'T OWN THIS MAZE.",
+            PILOT_KILL to "I REMEMBER EVERY CORNER OF THIS MAZE.",
         )
     }
 
@@ -196,10 +315,43 @@ class Game(val store: SettingsStore, private val host: GameHost) {
     /** The Bit's share of the same sight ramp. It does not move, so it only ever changes as you do. */
     var bitVis = 0f; private set
 
-    // title / intro
-    var introLine = -1; private set      // index of the lore line being spoken; -1 none yet; 8 = done
+    // ------------------------------------------------------------------ energy and the shield
+    var poolX = 0f; var poolZ = 0f; var poolActive = false; private set
+    var poolT = 0f; private set
+    /** The pool's share of the sight ramp, exactly as the Bit's. */
+    var poolVis = 0f; private set
+    /** 0 … 1 across [POOL_DRAW_T] while the tank is standing in the pool. */
+    var poolDraw = 0f; private set
+    /** 1 → 0 while a drained pool folds itself away — the renderer's collapse. */
+    var poolCollapse = 0f; private set
+    private var poolSipCd = 0f
+    /** Charges left on the shell, 0 … [SHIELD_MAX]. The one number the whole system is about. */
+    var shield = 0; private set
+    /** 1 → 0 after the shell eats a hit: the cyan frame pulse and the bubble's own flare. */
+    var shieldFlash = 0f; private set
+    /** Where the hit came FROM, as a unit vector, so the shell brightens on the side that took it. */
+    var shieldHitX = 0f; var shieldHitY = 0f; var shieldHitZ = 0f; private set
+
+    // ------------------------------------------------------------------ title / attract
+    /**
+     * The demo the game plays to itself — see [Attract]. It is built once when the title is entered
+     * and lives until a game starts, so its maze, its route and its cast survive the loop; only the
+     * timeline is re-armed each time round.
+     */
+    var attract: Attract? = null; private set
+    private var attractLoops = -1
+    /** Which system lore line is on the glass, -1 for none, and how long it has been there. */
+    var loreIdx = -1; private set
+    var loreAge = 0f; private set
+    var loreHold = 0f; private set
+    /** The pilot's answer: the caption, verbatim from the clip's own script. */
+    var pilotText = ""; private set
+    var pilotAge = 0f; private set
+    var pilotHold = 0f; private set
     var showTap = false; private set
-    private var introFallback = 0f
+    /** When each of the eight lore lines is spoken, and when each of the two pilot answers lands. */
+    private var loreT = FloatArray(0)
+    private var pilotT = FloatArray(2)
     private var newHigh = false
 
     // menu
@@ -306,30 +458,138 @@ class Game(val store: SettingsStore, private val host: GameHost) {
     private fun afterHero(id: String): Float = max(400, host.heroDurationMs(id)) / 1000f + 0.3f
 
     /**
-     * SHIELD BOOSTERS are a later phase; these are the hooks their three pilot lines hang on, wired
-     * to the same rate limiter as everything else so that phase has nothing to invent. Call them
-     * when the pickup lands, when a shield eats a bolt, and when the last of it goes.
+     * THE SHIELD'S THREE BEATS, and its two conversations.
+     *
+     * The draw and the collapse are EVENTS — they change what the wave is, so the machine states
+     * them and the pilot answers, on the same delayed-cue pattern as the wave announcement and the
+     * death. The middle beat is not an event, it is a hit taken, and it happens up to three times
+     * in a few seconds: a system line there would be a stuck record, so it gets sound only, and the
+     * pilot remarks on it less than half the time behind the usual global gap.
+     *
+     * The draw is the one place the pilot is allowed to jump a short gap ([gap] 3 s rather than the
+     * standing 7): crossing the arena for the pool is a deliberate act several seconds long, and a
+     * "shields holding" that arrives after the next thing has already shot at you is worthless.
      */
-    fun onShieldUp() { host.sfx(com.x3paranoids.audio.Sfx.BIT_YES, 0.8f, 0.7f); pilot("hero_shield_up", cd = 40f, chance = 0.8f) }
-    fun onShieldHit() { pilot("hero_shield_hit", cd = 25f, chance = 0.45f) }
-    fun onShieldDown() { pilot("hero_shield_down", cd = 30f, chance = 0.9f) }
+    private fun onShieldUp(topUp: Boolean) {
+        shield = SHIELD_MAX
+        host.sfx(com.x3paranoids.audio.Sfx.SHIELD_UP)
+        host.say("energy", urgent = true)
+        pilot("hero_shield_up", gap = 3f, cd = 40f, chance = if (topUp) 0.45f else 0.9f,
+            delay = after("energy"), patience = 3000L)
+    }
+
+    private fun onShieldHit() {
+        host.sfx(com.x3paranoids.audio.Sfx.SHIELD_HIT, 0.94f + rng.nextFloat() * 0.14f)
+        pilot("hero_shield_hit", gap = 8f, cd = 25f, chance = 0.45f, patience = 1500L)
+    }
+
+    private fun onShieldDown() {
+        host.sfx(com.x3paranoids.audio.Sfx.SHIELD_DOWN)
+        // The shell comes apart into the segments it was drawn from, rushing outward past the
+        // periscope — [Derez.seedShield], the same machinery a Recognizer dies on.
+        while (derezzes.size >= MAX_DEREZ) derezzes.removeAt(0)
+        derezzes += Derez(px, EYE_H - SHIELD_DROP, pz, yaw, SHIELD_R, 0f, false, shield = true).also { it.seedShield(rnd) }
+        burst(px, EYE_H, pz, 14, 0.55f, 0.95f, 1f)
+        host.say("shield_down", urgent = true)
+        pilot("hero_shield_down", gap = 0f, cd = 30f, chance = 0.9f, delay = after("shield_down"), patience = 2500L)
+    }
 
     // ------------------------------------------------------------------ boot / title
     fun boot() { enterTitle() }
 
     private fun enterTitle() {
         state = State.TITLE; stateT = 0f
-        introLine = -1; showTap = false; introFallback = 0f
         recognizers.clear(); shots.clear(); sparks.clear(); derezzes.clear(); bitActive = false
         deathSink = 0f
         clearCues()
         host.stopHero(); host.stopVoice()
-        if (store.voice) host.sayAll(INTRO) else introLine = 0
+        val plan = composeAttract()
+        attract = Attract(System.nanoTime(), plan)
+        attractLoops = 0
+        armAttract()
     }
 
-    /** From the voice thread: a lore line began. */
-    fun onVoiceLineStart(id: String) { val i = INTRO.indexOf(id); if (i >= 0 && state == State.TITLE) introLine = i }
-    fun onVoiceLineEnd(id: String) { if (id == INTRO.last() && state == State.TITLE) { introLine = INTRO.size; showTap = true } }
+    /**
+     * THE INTRO'S SCHEDULE, DERIVED FROM THE VOICE ITSELF.
+     *
+     * Every beat below is stated as "when the last one has finished speaking, plus air", never as a
+     * stopwatch reading — the clip lengths come out of the manifests through [after]. So the demo
+     * cannot drift out of time with its own narration, and re-rendering a line does not require
+     * re-timing the film. Three of the gaps are the whole point of doing it this way:
+     *
+     *  - after "THE GAME WAS STOLEN" the machine shuts up for a beat and the CAMERA MOVES. The
+     *    world starting to slide on the silence after the theft is the one edit in here that has to
+     *    be exact, and it is the only place in the intro where nothing is said at all.
+     *  - the pilot answers the MONOPOLY CONTROL PROTOCOL only once the machine has finished naming
+     *    it. Overlapped, the two voices are mud; sequenced, they are an argument.
+     *  - "YOU REMEMBER" is followed by a shell, not by another sentence.
+     */
+    private fun composeAttract(): AttractPlan {
+        fun d(i: Int) = max(400, host.voiceDurationMs(INTRO[i])) / 1000f
+        fun h(id: String) = max(400, host.heroDurationMs(id)) / 1000f
+        val t = FloatArray(8)
+        t[0] = 0.95f                                   // GREETINGS, PROGRAM — over the power-up
+        t[1] = t[0] + d(0) + 0.45f                     // a programmer wrote a game
+        t[2] = t[1] + d(1) + 0.55f                     // THE GAME WAS STOLEN
+        val flight = t[2] + d(2) + 0.30f               // ...and the camera moves, into the silence
+        t[3] = t[2] + d(2) + 1.25f                     // the thief built the Protocol on its bones
+        val p0 = t[3] + d(3) + 0.35f                   // PILOT: the Protocol doesn't own this maze
+        t[4] = p0 + h(PILOT_MCP) + 0.60f               // now the Recognizers hunt... (and one crosses,
+                                                       // on the loop's own clock — see Attract.seedPatrol)
+        t[5] = t[4] + d(4) + 0.50f                     // YOU REMEMBER.
+        val aim = t[5] + d(5) + 0.40f                  // the machine at the end turns red
+        val fire = aim + 1.25f
+        val p1 = fire + 1.55f                          // PILOT: I remember every corner of this maze
+        val bit = p1 + 0.90f
+        t[6] = p1 + h(PILOT_KILL) + 0.50f              // FIND THE BIT. SURVIVE THE WAVES.
+        val settle = t[6] + d(6) + 0.40f               // the title comes back; TAP TO PLAY
+        t[7] = settle + 0.55f                          // END OF LINE.
+        val end = t[7] + d(7) + 4.60f                  // and hold, so the invitation can be read
+        loreT = t
+        pilotT = floatArrayOf(p0, p1)
+        android.util.Log.i("X3Paranoids", "attract plan: flight=%.1f aim=%.1f fire=%.1f bit=%.1f settle=%.1f end=%.1f"
+            .format(flight, aim, fire, bit, settle, end))
+        return AttractPlan(trace = 1.85f, flight = flight, aim = aim,
+            fire = fire, bit = bit, settle = settle, end = end)
+    }
+
+    /** Lay the loop's cues out again — once when the title is entered, then once per loop. */
+    private fun armAttract() {
+        clearCues()
+        host.stopHero(); host.stopVoice()
+        loreIdx = -1; loreAge = 0f; loreHold = 0f
+        pilotText = ""; pilotAge = 0f; pilotHold = 0f
+        showTap = false
+        for (i in INTRO.indices) cue(loreT[i]) { sayLore(i) }
+        cue(pilotT[0]) { sayPilot(PILOT_MCP) }
+        cue(pilotT[1]) { sayPilot(PILOT_KILL) }
+        attract?.let { a -> cue(a.plan.settle) { showTap = true } }
+    }
+
+    private fun sayLore(i: Int) {
+        loreIdx = i; loreAge = 0f
+        loreHold = max(400, host.voiceDurationMs(INTRO[i])) / 1000f + 0.9f
+        host.say(INTRO[i], patienceMs = 4000L)
+    }
+
+    private fun sayPilot(id: String) {
+        pilotText = PILOT_TEXT[id] ?: ""; pilotAge = 0f
+        pilotHold = max(400, host.heroDurationMs(id)) / 1000f + 0.9f
+        host.hero(id, 3000L)
+    }
+
+    /**
+     * From the voice thread: a lore line actually began. The crawl is SCHEDULED, but it belongs to
+     * the clip — so if the bus made the machine wait its turn, the line on the glass waits with it.
+     */
+    fun onVoiceLineStart(id: String) {
+        if (state != State.TITLE) return
+        val i = INTRO.indexOf(id)
+        if (i < 0) return
+        loreIdx = i; loreAge = 0f
+        loreHold = max(400, host.voiceDurationMs(id)) / 1000f + 0.9f
+    }
+    fun onVoiceLineEnd(id: String) {}
 
     // ------------------------------------------------------------------ input (GL thread)
     fun tap() {
@@ -434,6 +694,12 @@ class Game(val store: SettingsStore, private val host: GameHost) {
     private fun startGame() {
         host.stopHero(); host.stopVoice()
         clearCues()
+        // THE DEMO IS DROPPED WHERE IT STANDS. A tap during the attract loop is a player who has
+        // seen enough, and the one thing they must not get is a frame of somebody else's camera in
+        // their game: the loop's world goes now, and host.recentreHead() below makes the azimuth
+        // they were sitting at when they tapped the direction they are facing.
+        attract = null; attractLoops = -1
+        loreIdx = -1; pilotText = ""; showTap = false
         mazeSeed = System.nanoTime(); maze = Maze(8, 8, mazeSeed)
         lives = 3; score = 0; wave = 0; elapsed = 0f; kills = 0; invuln = 0f; damageFlash = 0f
         vx = 0f; vz = 0f; hullYaw = 0f; hullTarget = 0f; turnBlend = 0f; newHigh = false
@@ -441,6 +707,7 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         pilotLast.clear(); pilotOnce.clear(); pilotLastAny = -99f; pilotStreak = 0; pilotKillIdx = 0
         lastKillT = -99f; lastKillSay = -99f
         hitsRecent = 0; lastHitT = -99f; bitNearSaid = false; bitChirpCd = 1.4f; bitNoCd = 0f
+        shield = 0; shieldFlash = 0f; poolActive = false; poolDraw = 0f; poolCollapse = 0f; poolVis = 0f
         store.games = store.games + 1
         placePlayer(maze.cols / 2, maze.rows / 2)
         host.recentreHead()
@@ -483,6 +750,28 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         val bc = if (bitCells.isNotEmpty()) bitCells[rng.nextInt(bitCells.size)] else far[0]
         bitX = maze.cellX(bc[0]); bitZ = maze.cellZ(bc[1]); bitActive = true; bitT = 0f
         bitNearSaid = false; bitChirpCd = 2.2f; bitNoCd = 3f
+        // THE POOL GOES AS FAR FROM THE BIT AS THE MAZE ALLOWS, and that placement is the whole
+        // reason there are two objectives. Both are already far from the player; putting the pool
+        // at the cell of maximum BFS distance FROM THE BIT means no single route sweeps them both,
+        // so every wave asks the same question — energy first and hunt the Bit shielded, or the Bit
+        // first and take the wave bare. The player's own distance only breaks ties.
+        //
+        // NOT ON WAVE ONE. Wave one is where the game teaches the base loop, and a second cyan
+        // objective in the arena the first time you are ever in it competes with FIND THE BIT for
+        // the one thing a new player has none of. From wave two the shell is a thing you have
+        // already wanted once.
+        poolActive = false; poolDraw = 0f; poolCollapse = 0f; poolT = 0f; poolVis = 0f; poolSipCd = 0f
+        if (wave >= 2) {
+            val fromBit = maze.distances(bc[0], bc[1])
+            var best: IntArray? = null; var bestScore = -1
+            for (cell in far) {
+                val db = fromBit[cell[0]][cell[1]]
+                if (db < 3) continue
+                val sc = db * 16 + dist[cell[0]][cell[1]]
+                if (sc > bestScore) { bestScore = sc; best = cell }
+            }
+            best?.let { poolX = maze.cellX(it[0]); poolZ = maze.cellZ(it[1]); poolActive = true }
+        }
         host.sfx(com.x3paranoids.audio.Sfx.WAVE)
         val waveId = if (wave <= 12) "wave_$wave" else "wave_more"
         host.say(waveId, urgent = true)
@@ -515,6 +804,11 @@ class Game(val store: SettingsStore, private val host: GameHost) {
             bitActive = false
             cue(after("wave_clear") - 0.15f) { host.sfx(com.x3paranoids.audio.Sfx.BIT_LOSE, 1f, 0.75f) }
         }
+        // An untaken pool just closes with the wave, silently. The Bit's "you never came" is a
+        // character having an opinion about you and it only works once per clear; a second lament
+        // stacked behind it would blunt the one that means something. Charges already drawn STAY —
+        // see [THE ENERGY ECONOMY].
+        poolActive = false; poolDraw = 0f
         // The pilot answers the clear; failing that, it sometimes just thinks out loud in the quiet.
         val at = after("wave_clear")
         pilot("hero_wave_clear", gap = 5f, cd = 40f, chance = 0.70f, delay = at, patience = 4000L) ||
@@ -522,8 +816,30 @@ class Game(val store: SettingsStore, private val host: GameHost) {
     }
 
 
-    private fun damagePlayer() {
+    /**
+     * [srcX]/[srcZ] is where the hit came FROM — a bolt's own position, or the Recognizer that rode
+     * you down. The hull does not care, but the SHELL does: the bubble brightens on the side that
+     * took it, which is the difference between "something hit me" and "something hit me from
+     * there". Defaulting to the tank's own position gives a hit no direction, and the shell simply
+     * flares evenly, which is the honest thing to draw when nothing knows better.
+     */
+    private fun damagePlayer(srcX: Float = px, srcZ: Float = pz, srcY: Float = EYE_H) {
         if (invuln > 0f || state != State.PLAY) return
+        // THE SHELL EATS IT FIRST, and buys only [SHIELD_IFRAME] of grace rather than the 2.6 s a
+        // real hit does. That asymmetry is the whole economy: the shield stops you dying for a
+        // mistake, it does not stop you being under fire.
+        if (shield > 0) {
+            shield--
+            invuln = SHIELD_IFRAME
+            shieldFlash = 1f
+            vx *= 0.55f; vz *= 0.55f
+            var dx = srcX - px; var dy = srcY - EYE_H; var dz = srcZ - pz
+            val dl = sqrt(dx * dx + dy * dy + dz * dz)
+            if (dl > 0.05f) { shieldHitX = dx / dl; shieldHitY = dy / dl; shieldHitZ = dz / dl }
+            else { shieldHitX = 0f; shieldHitY = 0f; shieldHitZ = 0f }
+            if (shield > 0) onShieldHit() else onShieldDown()
+            return
+        }
         lives--
         damageFlash = 1f; invuln = 2.6f
         vx *= 0.3f; vz *= 0.3f
@@ -607,20 +923,16 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         stateT += dt
         muzzle = max(0f, muzzle - dt * 9f)
         damageFlash = max(0f, damageFlash - dt * 1.6f)
+        // Faster than the damage flash and never as red: a shield hit is a thing that DIDN'T happen
+        // to you, and it must not read like one that did.
+        shieldFlash = max(0f, shieldFlash - dt * 2.6f)
+        poolCollapse = max(0f, poolCollapse - dt * 1.7f)
         runCues(dt)
         // Derez runs outside the state machine: a machine that broke apart a moment before the wave
         // cleared, or the tank's own hull leaving the seat, has to finish falling wherever it is.
         if (state != State.TITLE) updateDerez(dt)
         when (state) {
-            State.TITLE -> {
-                // voice off (or missing clips): advance the crawl on the manifest's own timing
-                if (!store.voice && introLine in 0 until INTRO.size) {
-                    introFallback += dt
-                    val d = max(600, host.voiceDurationMs(INTRO[introLine])) / 1000f + 0.25f
-                    if (introFallback >= d) { introFallback = 0f; introLine++; if (introLine >= INTRO.size) showTap = true }
-                }
-                if (stateT > 4f && !store.voice && introLine < 0) introLine = 0
-            }
+            State.TITLE -> updateAttract(dt)
             State.PLAY -> updatePlay(dt)
             State.WAVE_CLEAR -> { updateWorld(dt, false); if (stateT > 3.2f) nextWave() }
             State.DYING -> {
@@ -633,6 +945,23 @@ class Game(val store: SettingsStore, private val host: GameHost) {
             }
             State.GAME_OVER -> {}
         }
+    }
+
+    /**
+     * The attract loop runs itself; this is only the plumbing round it. The loop owns its own
+     * world and its own clock, so all the game does is hand it time, MAKE ITS NOISES — the sound
+     * belongs to the frame it happens on, not to a cue that guessed when the shell would land —
+     * and re-arm the narration when it comes round again.
+     */
+    private fun updateAttract(dt: Float) {
+        val a = attract ?: return
+        a.update(dt)
+        if (a.events.isNotEmpty()) {
+            for (e in a.events) host.sfx(e[0].toInt(), e[1], e[2])
+            a.events.clear()
+        }
+        loreAge += dt; pilotAge += dt
+        if (a.loops != attractLoops) { attractLoops = a.loops; armAttract() }
     }
 
     private fun updatePlay(dt: Float) {
@@ -649,6 +978,7 @@ class Game(val store: SettingsStore, private val host: GameHost) {
             if (bumped && speed > 3f) { host.sfx(com.x3paranoids.audio.Sfx.BUMP, 0.9f + rng.nextFloat() * 0.2f, min(1f, speed / 9f)); vx *= 0.35f; vz *= 0.35f }
         }
         updateWorld(dt, true)
+        updatePool(dt)
         if (bitActive) {
             bitT += dt
             val bitSeen = maze.lineOfSight(bitX, bitZ, px, pz)
@@ -676,10 +1006,52 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         if (recognizersLeft == 0) waveCleared()
     }
 
+    /**
+     * THE POOL, AND DRINKING FROM IT.
+     *
+     * Presence is the whole mechanic: be inside [POOL_R] of the centre and the draw fills over
+     * [POOL_DRAW_T]; be outside it and the draw bleeds back. There is no "press to collect" because
+     * there is no button free and, more to the point, because a pool you have to STAY in is the
+     * only version of this that costs anything — the arena's machines do not stop while you drink.
+     *
+     * It is forgiving in exactly one direction. Bleeding back at [POOL_DRAW_DECAY] rather than
+     * resetting means a ram that shoves you off the rim, or a wall you clipped on the way in, costs
+     * you a fraction of a second rather than the whole approach — while actually turning and
+     * leaving still throws the draw away. And the tank coasts: [MAX_SPEED] carries you across a 4.4
+     * unit pool in half a second, so a draw genuinely has to be committed to, not driven through.
+     */
+    private fun updatePool(dt: Float) {
+        if (!poolActive) { poolDraw = max(0f, poolDraw - dt * 3f); return }
+        poolT += dt
+        val seen = maze.lineOfSight(poolX, poolZ, px, pz)
+        val step = dt * VIS_RATE
+        poolVis = if (seen) min(1f, poolVis + step) else max(0f, poolVis - step)
+        poolSipCd = max(0f, poolSipCd - dt)
+        if (hypot(px - poolX, pz - poolZ) < POOL_R) {
+            poolDraw = min(1f, poolDraw + dt / POOL_DRAW_T)
+            // one climbing blip per POOL_SIP_T of dwell — it stops dead when you step out, which a
+            // single long clip started on entry could not do
+            if (poolSipCd <= 0f) {
+                poolSipCd = POOL_SIP_T
+                host.sfx(com.x3paranoids.audio.Sfx.POOL_SIP, 0.85f + 0.55f * poolDraw, 0.55f)
+            }
+            if (poolDraw >= 1f) {
+                val topUp = shield > 0
+                poolActive = false; poolDraw = 0f; poolCollapse = 1f
+                burst(poolX, 1.2f, poolZ, 26, 0.55f, 0.95f, 1f)
+                onShieldUp(topUp)
+            }
+        } else {
+            poolDraw = max(0f, poolDraw - dt * POOL_DRAW_DECAY / POOL_DRAW_T)
+        }
+    }
+
     /** Enemies, shots and sparks — also runs (frozen player) during wave-clear and death. */
     private fun updateWorld(dt: Float, hostile: Boolean) {
         val hard = store.difficulty == 1
         val speedBase = (3.0f + 0.25f * wave + (if (hard) 0.8f else 0f)).coerceAtMost(6.5f)
+        /** The tank is wearing the Protocol's energy — see [PRESS_STANDOFF]. They come and take it back. */
+        val pressed = hostile && shield > 0 && state == State.PLAY
         var nearest = 999f
         lockedOn = false
         val it = recognizers.iterator()
@@ -720,8 +1092,8 @@ class Game(val store: SettingsStore, private val host: GameHost) {
             r.alert += ((if (chasing) 1f else 0f) - r.alert) * (1f - exp(-dt / 0.45f))
             var mx = 0f; var mz = 0f
             if (chasing && los) {
-                // stand off at ~6 u, circle a little, keep facing the tank
-                val want = 6f
+                // stand off at ~6 u — or close to four and strip the shell, if there is one
+                val want = if (pressed) PRESS_STANDOFF else 6f
                 val towards = if (d > want + 1f) 1f else if (d < want - 1.5f) -0.6f else 0f
                 val nx = ddx / max(d, 0.01f); val nz = ddz / max(d, 0.01f)
                 val side = sin(time * 0.7f + r.phase)
@@ -731,7 +1103,11 @@ class Game(val store: SettingsStore, private val host: GameHost) {
                 if (hostile) {
                     r.fireCd -= dt
                     if (r.fireCd <= 0f && d < 26f && fireLos) {
-                        r.fireCd = (2.6f - 0.15f * wave - (if (hard) 0.5f else 0f)).coerceAtLeast(1.1f)
+                        // The press multiplies the SETTLED cooldown rather than the raw one, so it
+                        // is a real 30% more fire at every wave instead of being swallowed by the
+                        // floor once the wave scaling has already reached it.
+                        r.fireCd = (2.6f - 0.15f * wave - (if (hard) 0.5f else 0f)).coerceAtLeast(1.1f) *
+                            (if (pressed) PRESS_FIRE else 1f)
                         val spread = (0.10f - 0.008f * wave).coerceAtLeast(0.03f)
                         val aimX = px + (rng.nextFloat() - 0.5f) * spread * d
                         val aimZ = pz + (rng.nextFloat() - 0.5f) * spread * d
@@ -759,7 +1135,7 @@ class Game(val store: SettingsStore, private val host: GameHost) {
                     r.yaw = atan2(dx, -dz)
                 } else { r.targetC = -1 }
             }
-            val sp = speedBase * (if (chasing) 1.15f else 0.8f)
+            val sp = speedBase * (if (chasing) (if (pressed) PRESS_SPEED else 1.15f) else 0.8f)
             if (mx != 0f || mz != 0f) {
                 maze.move(r.x, r.z, mx * sp * dt, mz * sp * dt, Recognizer.RADIUS, tmp); r.x = tmp[0]; r.z = tmp[1]
             }
@@ -778,7 +1154,7 @@ class Game(val store: SettingsStore, private val host: GameHost) {
             // do it. The direction is taken fresh from where the Recognizer stands NOW, not from the
             // (ddx, ddz) measured before this frame's step, so the shove is along the line you see.
             if (hostile && d < RAM_D && state == State.PLAY) {
-                damagePlayer()
+                damagePlayer(r.x, r.z, r.y + 0.8f)
                 val bx = r.x - px; val bz = r.z - pz
                 val bl = hypot(bx, bz).coerceAtLeast(0.01f)
                 val ux = bx / bl; val uz = bz / bl
@@ -827,7 +1203,7 @@ class Game(val store: SettingsStore, private val host: GameHost) {
                     si.remove(); break
                 }
             } else if (hostile && state == State.PLAY && hypot(s.x - px, s.z - pz) < 1.15f && abs(s.y - EYE_H) < 1.6f) {
-                si.remove(); damagePlayer()
+                si.remove(); damagePlayer(s.x, s.z, s.y)
             }
         }
         // sparks
@@ -843,74 +1219,11 @@ class Game(val store: SettingsStore, private val host: GameHost) {
 
     // ------------------------------------------------------------------ derez
     /**
-     * Overload, then fracture, then the grid. See [Derez] for the shape of the sequence; this is
-     * only its physics.
-     *
-     * FRAGMENTS OBEY THE WALLS, like everything else in this game: the centre goes through
-     * [Maze.move] on a small radius, so a Recognizer that derezzes against a wall throws its pieces
-     * back off it instead of through it, and the debris of a death round a corner stays round the
-     * corner. The renderer runs its own sight test per fragment, so it is never DRAWN through one
-     * either.
-     *
-     * The landing is the part that ties the death to the room. A piece bounces once or twice with
-     * most of its energy gone, and from the first touch it is [Frag.down]: its own length rotates
-     * down into the horizontal (at constant length — it lies flat, it does not shrink), its spin
-     * bleeds off, and it slides to a stop on the floor grid it will fade into.
+     * Overload, then fracture, then the grid. The sequence is described in [Derez] and its physics
+     * lives in [updateDerezList], out at file scope — because the ATTRACT LOOP kills a Recognizer
+     * too, and the death it advertises has to be the death you get.
      */
-    private fun updateDerez(dt: Float) {
-        if (derezzes.isEmpty()) return
-        val di = derezzes.iterator()
-        while (di.hasNext()) {
-            val d = di.next()
-            d.t += dt
-            if (!d.broken) {
-                if (d.t >= d.overload) { if (d.player) d.seedPlayer(rnd) else d.seedRecognizer(rnd) }
-                continue
-            }
-            val fi = d.frags.iterator()
-            while (fi.hasNext()) {
-                val f = fi.next()
-                f.life -= dt
-                if (f.life <= 0f) { fi.remove(); continue }
-                f.vy -= FRAG_G * dt
-                // tumble: Rodrigues about the fragment's own axis
-                if (abs(f.w) > 0.01f) {
-                    val th = f.w * dt
-                    val ct = cos(th); val st = sin(th)
-                    val dot = f.ax * f.ex + f.ay * f.ey + f.az * f.ez
-                    val crx = f.ay * f.ez - f.az * f.ey
-                    val cry = f.az * f.ex - f.ax * f.ez
-                    val crz = f.ax * f.ey - f.ay * f.ex
-                    f.ex = f.ex * ct + crx * st + f.ax * dot * (1f - ct)
-                    f.ey = f.ey * ct + cry * st + f.ay * dot * (1f - ct)
-                    f.ez = f.ez * ct + crz * st + f.az * dot * (1f - ct)
-                }
-                // walls, on the same slide-and-stop the tank uses
-                val bumped = maze.move(f.cx, f.cz, f.vx * dt, f.vz * dt, 0.14f, tmp)
-                f.cx = tmp[0]; f.cz = tmp[1]
-                if (bumped) { f.vx *= -0.30f; f.vz *= -0.30f; f.w *= 1.35f }
-                f.cy += f.vy * dt
-                val low = f.cy - abs(f.ey)
-                if (low < 0.05f) {
-                    f.cy += 0.05f - low
-                    if (f.vy < 0f) { f.vy = -f.vy * 0.30f; f.vx *= 0.62f; f.vz *= 0.62f; f.w *= 0.5f }
-                    if (abs(f.vy) < 0.7f) f.vy = 0f
-                    f.down = true
-                }
-                if (f.down) {
-                    // settle flat onto the grid, at constant length
-                    val l0 = sqrt(f.ex * f.ex + f.ey * f.ey + f.ez * f.ez)
-                    f.ey *= max(0f, 1f - dt * 3.4f)
-                    val l1 = sqrt(f.ex * f.ex + f.ey * f.ey + f.ez * f.ez).coerceAtLeast(1e-4f)
-                    val k = l0 / l1
-                    f.ex *= k; f.ey *= k; f.ez *= k
-                    val fr = max(0f, 1f - dt * 1.7f)
-                    f.vx *= fr; f.vz *= fr; f.w *= max(0f, 1f - dt * 2.4f)
-                }
-            }
-            if (d.frags.isEmpty()) di.remove()
-        }
-    }
+    private fun updateDerez(dt: Float) = updateDerezList(derezzes, maze, dt, tmp, FRAG_G, rnd)
 
     /**
      * The pilot on a kill. THREE kill lines and one streak line will not survive being spoken every
@@ -962,14 +1275,34 @@ class Game(val store: SettingsStore, private val host: GameHost) {
      * And it reacts. A Recognizer within seven units of the Bit gets a NO — the Bit is frightened
      * of them, which tells you where one is AND makes the Bit a character with a stake in this.
      */
+    /**
+     * 0 across the arena … 1 on top of the Bit — THE NUMBER THE WHOLE PROXIMITY CUE RIDES ON, and
+     * the one that has to be derived from the maze rather than guessed.
+     *
+     * It used to be `1 - (d - 3) / 28`, which reaches zero at 31 units. That would be right for a
+     * small arena; this one is [Maze.CELL] × 8 = 72 units on a side and about 102 across the
+     * diagonal, and [nextWave] deliberately hides the Bit in a cell at least three BFS steps away.
+     * Measured on the glasses, the actual range to the Bit ran 35–61 units for an entire wave and
+     * `near` was PINNED AT 0.00 for every single chirp — so the interval sat at a flat ~4.8 s no
+     * matter where the player went. The Bit was not getting more excited as you closed in; it was
+     * a metronome, and the one objective the HUD states out loud ("FIND THE BIT") had no cue at all.
+     *
+     * So the far end is taken from the maze itself and the near end is where the Bit is effectively
+     * in your lap. Anything that resizes the maze re-tunes this for free.
+     */
+    private fun proximity(d: Float): Float {
+        val far = 0.75f * maze.cols * Maze.CELL      // 54 units on the standard 8×8 board
+        return ((far - d) / (far - BIT_CLOSE)).coerceIn(0f, 1f)
+    }
+
     private fun updateBitVoice(dt: Float, d: Float) {
         bitChirpCd -= dt
         bitNoCd -= dt
         if (bitChirpCd <= 0f) {
-            val near = (1f - (d - 3f) / 28f).coerceIn(0f, 1f)      // 0 across the arena … 1 on top of it
+            val near = proximity(d)
             bitChirpCd = 4.6f - 3.85f * near + rng.nextFloat() * 0.6f
             if (!host.voiceBusy()) {
-                if (near > 0.55f && rng.nextFloat() < 0.32f) host.sfx(com.x3paranoids.audio.Sfx.BIT_YES, 0.95f + 0.15f * near, 0.22f + 0.26f * near)
+                if (near > BIT_EXCITED && rng.nextFloat() < 0.32f) host.sfx(com.x3paranoids.audio.Sfx.BIT_YES, 0.95f + 0.15f * near, 0.22f + 0.26f * near)
                 else host.sfx(com.x3paranoids.audio.Sfx.BIT_CHIRP, 0.82f + 0.62f * near, 0.20f + 0.40f * near)
             }
         }

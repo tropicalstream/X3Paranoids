@@ -30,6 +30,13 @@ render incoming "Recognizers incoming." 160
 render destroyed "Recognizer destroyed." 170
 render find_bit "Find the Bit." 160
 render bit "Bit acquired. Extra life." 160
+# The energy pool. The machine reports the theft of its own power flatly, as it reports everything,
+# and stays SHORT — the pilot answers both of these (assets/voice_hero: hero_shield_up says "Energy.
+# Shields holding.", hero_shield_down says "Shield's gone."), and a two-clause system line pushed the
+# answer nearly three seconds past a moment that wants to land while you are still standing in the
+# pool. One clause each; the echo between the two voices is the point.
+render energy "Energy drawn." 160
+render shield_down "Shield collapsed." 165
 render hit "Tank hit." 175
 render lockon "Warning. Recognizer locked on." 170
 render wave_clear "Wave cleared." 160
