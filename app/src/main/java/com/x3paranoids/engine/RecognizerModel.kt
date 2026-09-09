@@ -54,6 +54,12 @@ object RecognizerModel {
     val kind: IntArray
     /** Which leg a segment hangs from: −1 the left (x < 0), +1 the right, 0 for the bar and cab. */
     val leg: IntArray
+    /**
+     * True for the four strokes of a FOOT PLATE. They flare as the leg swings — see [FOOT_SPREAD] —
+     * which is the detail that makes the clamp read as a mechanism rather than as two sticks
+     * pivoting. The owner asked for it by name.
+     */
+    val foot: BooleanArray
     val count: Int
 
     /**
@@ -71,11 +77,46 @@ object RecognizerModel {
     const val LEG_PIVOT_Y = 1.7f
     const val FOLD_ANGLE = 0.82f
 
+    /**
+     * THE FOOT PLATES FLARE AS THEY ROTATE. Each plate opens front-to-back with the fold, so the
+     * two flat feet visibly SPREAD as they swing inward and close under whatever is between them.
+     *
+     * It flares in DEPTH rather than across the machine, and that is a load-bearing choice: the
+     * fold is a rotation in the x-y plane, so widening a plate in z is the one axis that cannot
+     * push a foot corner through the floor or out past the collision radius at any fold angle. It
+     * costs nothing and it is the difference between "the legs moved" and "the clamp closed".
+     */
+    const val FOOT_SPREAD = 0.55f
+
+    /**
+     * HOW FAR THE CLAMP ACTUALLY SHUTS ON A TANK — and it is nowhere near [FOLD_ANGLE], because
+     * there is a tank in the way.
+     *
+     * A fold of 1 brings the two feet across one another beneath the cab: the clamp closed on
+     * nothing. That was fine while the sequence was watched from inside the tank, where the legs
+     * pass either side of an eye that cannot see its own hull. The moment the lens pulls back
+     * (see [com.x3paranoids.engine.Game.THE LENS]) it stops being fine, because the legs would
+     * visibly sweep straight through the tank they are supposed to be gripping.
+     *
+     * So the drop closes to here instead, and the geometry is worth stating because it is what the
+     * tank's own width was then chosen to fit ([TankModel.HALF_W] = 0.60). At this fold the leg's
+     * inner face comes to x = ±0.645 — a few centimetres off the hull's flank, gripping it — while
+     * the foot plate's inner corner swings to x = ∓0.38 at y = 0.02, which is UNDER the tank's
+     * belly. The feet do not meet each other; they meet beneath the hull and cradle it. That is
+     * both what the canon describes and the reason the machine can then lift the thing.
+     */
+    const val FOLD_GRIP = 0.30f
+    /** And how far they SPLAY on the way in: the anticipation, the gantry opening its hands. */
+    const val FOLD_SPLAY = -0.30f
+
     init {
         val s = ArrayList<Float>(); val k = ArrayList<Int>(); val l = ArrayList<Int>()
+        val ft = ArrayList<Boolean>()
 
-        fun line(x0: Float, y0: Float, z0: Float, x1: Float, y1: Float, z1: Float, kd: Int, lg: Int = 0) {
+        fun line(x0: Float, y0: Float, z0: Float, x1: Float, y1: Float, z1: Float, kd: Int, lg: Int = 0,
+                 isFoot: Boolean = false) {
             s.add(x0); s.add(y0); s.add(z0); s.add(x1); s.add(y1); s.add(z1); k.add(kd); l.add(lg)
+            ft.add(isFoot)
         }
         /** The 12 edges of an axis-aligned box in the machine's frame. */
         fun box(cx: Float, cy: Float, cz: Float, hx: Float, hy: Float, hz: Float, kd: Int, lg: Int = 0) {
@@ -107,13 +148,25 @@ object RecognizerModel {
         val fl = Recognizer.FOOT_FLARE; val fd = Recognizer.HALF_D
         for (side in intArrayOf(-1, 1)) {
             val ox = side * lg
-            line(ox - 0.3f, 0f, -0.42f, ox - fl, -0.28f, -fd, BODY, side)
-            line(ox + 0.3f, 0f, -0.42f, ox + fl, -0.28f, -fd, BODY, side)
-            line(ox - fl, -0.28f, -fd, ox + fl, -0.28f, -fd, BODY, side)
-            line(ox - fl, -0.28f, fd, ox + fl, -0.28f, fd, BODY, side)
+            line(ox - 0.3f, 0f, -0.42f, ox - fl, -0.28f, -fd, BODY, side, true)
+            line(ox + 0.3f, 0f, -0.42f, ox + fl, -0.28f, -fd, BODY, side, true)
+            line(ox - fl, -0.28f, -fd, ox + fl, -0.28f, -fd, BODY, side, true)
+            line(ox - fl, -0.28f, fd, ox + fl, -0.28f, fd, BODY, side, true)
+        }
+        // THE HINGES, and they are the reason the fold reads as a MECHANISM. Two knuckles on the
+        // underside of the bar, one over each leg, fixed to the BAR and not to the leg — so when
+        // the legs swing they visibly swing ABOUT these, in unison, rather than merely appearing at
+        // a new angle. From inside the tank nobody could ever see them; from outside they are the
+        // first thing that tells you what kind of joint this is.
+        for (side in intArrayOf(-1, 1)) {
+            val ox = side * lg
+            line(ox - 0.34f, LEG_PIVOT_Y, -0.30f, ox + 0.34f, LEG_PIVOT_Y, -0.30f, RIB)
+            line(ox - 0.34f, LEG_PIVOT_Y, 0.30f, ox + 0.34f, LEG_PIVOT_Y, 0.30f, RIB)
+            line(ox, LEG_PIVOT_Y - 0.14f, -0.30f, ox, LEG_PIVOT_Y - 0.14f, 0.30f, RIB)
         }
 
-        seg = s.toFloatArray(); kind = k.toIntArray(); leg = l.toIntArray(); count = k.size
+        seg = s.toFloatArray(); kind = k.toIntArray(); leg = l.toIntArray()
+        foot = BooleanArray(ft.size) { ft[it] }; count = k.size
     }
 
     /**
@@ -129,16 +182,20 @@ object RecognizerModel {
             return
         }
         // the left leg (side −1) swings toward +x, the right toward −x: a positive angle for the
-        // left, negative for the right, in the x-y plane about the hinge at (side·LEG_X, 1.7)
+        // left, negative for the right, in the x-y plane about the hinge at (side·LEG_X, 1.7).
+        // BOTH legs take the same |fold| from the same clock, which is what "in unison" means here:
+        // there is one number, and neither leg has a state of its own to drift with.
         val th = -side * fold * FOLD_ANGLE
         val c = cos(th); val s = sin(th)
         val px = side * Recognizer.LEG_X
+        // and a foot plate OPENS as it swings — see [FOOT_SPREAD]
+        val spread = if (foot[i]) 1f + FOOT_SPREAD * fold.coerceAtLeast(0f) else 1f
         for (e in 0 until 2) {
             val dx = seg[b + e * 3] - px
             val dy = seg[b + e * 3 + 1] - LEG_PIVOT_Y
             out[e * 3] = px + dx * c - dy * s
             out[e * 3 + 1] = LEG_PIVOT_Y + dx * s + dy * c
-            out[e * 3 + 2] = seg[b + e * 3 + 2]
+            out[e * 3 + 2] = seg[b + e * 3 + 2] * spread
         }
     }
 

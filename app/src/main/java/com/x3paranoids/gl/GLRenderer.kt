@@ -8,6 +8,7 @@ import com.x3paranoids.engine.Game
 import com.x3paranoids.engine.Maze
 import com.x3paranoids.engine.RecognizerModel
 import com.x3paranoids.engine.ShieldModel
+import com.x3paranoids.engine.TankModel
 import com.x3paranoids.engine.State
 import com.x3paranoids.head.HeadTracker
 import java.nio.ByteBuffer
@@ -60,6 +61,13 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
     private var mazeDumped: Maze? = null
 
     private var camX = 0f; private var camY = Game.EYE_H; private var camZ = 0f
+    /**
+     * WHERE THE TANK IS, as distinct from where the lens is. They were the same point for the whole
+     * life of this game and [Game.cinCamX] is the day they stopped being: the shell and the muzzle
+     * flash belong to the HULL and must stay bolted to it when the camera walks away, or a capture
+     * films a bubble and a gun flash hanging in the air five units behind the tank.
+     */
+    private var tankX = 0f; private var tankY = Game.EYE_H; private var tankZ = 0f
     private var fogFar = 62f
     /**
      * The maze the scene is being drawn IN — the arena's, or the attract loop's. Every sight test in
@@ -216,8 +224,15 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         // The tank's death carries its own judder on top of the damage shake — decaying, so the
         // world steadies as the sight fails, rather than both of them going at once. The crush's
         // judder sits on top of both: the gantry's servos coming through the hull.
-        val shake = game.damageFlash * 0.25f + game.crushShake * 0.30f +
-            (if (game.state == State.DYING) 0.16f * kotlin.math.exp(-game.stateT * 0.9f) else 0f)
+        // AND THE JUDDER STAYS IN THE HULL — see [Game.THE LENS]. Every one of these shakes is
+        // something happening to the TANK, transmitted up the periscope. A camera that has left the
+        // periscope and is standing four units away in the corridor has no business feeling any of
+        // it, and shaking a detached third-person camera on a head-worn display is exactly the kind
+        // of unrequested motion this whole sequence is arranged to avoid. It is scaled out with the
+        // pull-back, so the hull still visibly judders in the shot — you are just not riding it.
+        val hull = 1f - 0.9f * game.cinAmt
+        val shake = (game.damageFlash * 0.25f + game.crushShake * 0.30f +
+            (if (game.state == State.DYING) 0.16f * kotlin.math.exp(-game.stateT * 0.9f) else 0f)) * hull
         val sx = (rnd.nextFloat() - 0.5f) * shake; val sy = (rnd.nextFloat() - 0.5f) * shake
         // On the title the periscope belongs to the ATTRACT LOOP, which is flying its own route and
         // taking its own corners; in play it is the head plus the hull.
@@ -268,7 +283,11 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
             }
             android.util.Log.i("X3Paranoids", sb.toString())
         }
-        camX = game.px; camY = Game.EYE_H - game.deathSink; camZ = game.pz
+        // The hull, and then the lens — which is the hull plus whatever [Game.updateCinema] has
+        // animated. In every frame of ordinary play the offset is exactly zero and these are the
+        // same point, which is the property that lets the return land without a snap.
+        tankX = game.px; tankY = Game.EYE_H - game.deathSink; tankZ = game.pz
+        camX = tankX + game.cinCamX; camY = tankY + game.cinCamY; camZ = tankZ + game.cinCamZ
         fogFar = 62f
         val tint = game.wallTint()
         buildFloor(game.maze, tint)
@@ -293,6 +312,9 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         buildSparks(game.sparks)
         buildDerez(game.derezzes, game.wallTint())
         buildMuzzle(game.muzzle, game.yaw, game.pitch)
+        // THE TANK ITSELF — and only once the lens has actually left it, so the periscope block is
+        // never sitting on the near plane in first person. See [buildTank].
+        if (game.cinAmt > 0.004f) buildTank()
         // The shell last of all: it is the nearest thing in the world and it is drawn OVER
         // everything, which is exactly where a bubble wrapped round your own head belongs.
         if (game.shield > 0) buildShield(game.shield, game.shieldFlash, game.yaw, game.pitch)
@@ -782,6 +804,75 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         pts.v(recPa[0], recPa[1], recPa[2], eyeR, 0.3f + 0.7f * whiten + 0.4f * lock * pulse, 0.25f + 0.75f * whiten + 0.3f * lock * pulse, ea * fog(x, y, z))
     }
 
+    // ------------------------------------------------------------------ [THE TANK]
+    /**
+     * THE PLAYER'S OWN HULL, drawn for the first time in this game's life — see [TankModel] for why
+     * it did not exist and what its shape is argued from.
+     *
+     * IT IS ONLY EVER DRAWN WHEN THE LENS HAS LEFT IT. In first person the camera sits inside the
+     * periscope block at [Game.EYE_H], a quarter of a unit from the near plane, and drawing it there
+     * would smear the sight's own geometry across the whole frame. So it fades up with
+     * [Game.cinAmt]: invisible at the eye, solid by the time the camera is outside. That single rule
+     * is also why the return needs no special handling — the tank is gone before the lens is close
+     * enough to be inside it.
+     *
+     * COLOUR. The hull is the arena's phosphor green, a shade brighter than a wall so it reads as a
+     * MACHINE rather than as architecture, and it is deliberately the same family as the walls
+     * rather than a new colour: this is a green-phosphor cabinet and the tank has always been the
+     * thing looking at the green. The slit is the one exception — pale and hot, the counterpart of
+     * the Recognizer's red eye, so in a wide shot the two machines are visibly looking at each
+     * other and you can tell at a glance which way each one faces.
+     *
+     * DAMAGE AND THE CARRY ride the same strokes: the hull washes toward white as the tank rezzes
+     * back in on the far side of a carry ([Game.carryRez]), and it dims out under the white-out
+     * ([Game.carryFade]) rather than being cut, so the capture function takes it rather than
+     * deleting it.
+     */
+    private fun buildTank() {
+        // Up with the lens, and OUT again under the carry's white-out.
+        //
+        // THE 0.12 IS A CLEARANCE, not a taste call. The periscope block is 0.48 deep and the hull
+        // 1.2 wide, so a lens still drawing the tank while it is less than about half a unit from
+        // the eye is a lens inside its own model, with the sight's geometry crossing the 0.25 near
+        // plane and smearing over the frame. The tank is faded out by then and the last of the
+        // return is first-person in everything but name — which is also why the arrival needs no
+        // special handling: there is nothing left to arrive inside of.
+        val vis = ((game.cinAmt - 0.12f) / 0.30f).coerceIn(0f, 1f) * (1f - game.carryFade)
+        if (vis <= 0.002f) return
+        val rez = game.carryRez
+        // the tank is lifted by the clamp during a carry; the lens deliberately stays put and watches
+        val y = tankY - Game.EYE_H + game.lift
+        val hy = game.hullYaw
+        val ty = game.yaw
+        // the gun elevates with the player's own look, at a fraction of it — a periscope sweeps
+        // further than a barrel does, and a gun that mirrored a head-tracked pitch one for one
+        // would spend the shot pointing at the floor
+        val pt = game.pitch * 0.55f
+        val inv = if (game.invuln > 0f) 0.55f + 0.45f * abs(sin(game.time * 14f)) else 1f
+        val flash = game.damageFlash
+        for (i in 0 until TankModel.count) {
+            TankModel.segment(i, tankX, y, tankZ, hy, ty, pt, tankSeg)
+            var r: Float; var g: Float; var b: Float; var a: Float
+            when (TankModel.kind[i]) {
+                TankModel.TRIM -> { r = GREEN[0]; g = GREEN[1]; b = GREEN[2]; a = 0.45f }
+                TankModel.SIGHT -> { r = 0.55f; g = 1f; b = 0.72f; a = 0.95f }
+                TankModel.SLIT -> { r = 0.85f; g = 1f; b = 0.92f; a = 1.25f }
+                else -> { r = GREEN[0]; g = 1f; b = GREEN[2] * 1.1f; a = 0.9f }
+            }
+            // hit, and rezzing back in: both drain the hull toward white, which is the same grammar
+            // the machines' own overload and derez are written in
+            val w = max(flash, rez)
+            r += (1f - r) * w; g += (1f - g) * w; b += (1f - b) * w
+            wline(tankSeg[0], tankSeg[1], tankSeg[2], tankSeg[3], tankSeg[4], tankSeg[5],
+                r, g, b, a * vis * inv * (1f + 0.9f * rez))
+        }
+        // the periscope's own point light, where the camera has been sitting all game
+        TankModel.segment(TankModel.count - 1, tankX, y, tankZ, hy, ty, pt, tankSeg)
+        pts.v((tankSeg[0] + tankSeg[3]) * 0.5f, (tankSeg[1] + tankSeg[4]) * 0.5f, (tankSeg[2] + tankSeg[5]) * 0.5f,
+            0.8f, 1f, 0.9f, 1.1f * vis * fog(tankX, y + TankModel.EYE_Y, tankZ))
+    }
+    private val tankSeg = FloatArray(6)
+
     // ------------------------------------------------------------------ [DEREZ]
     /**
      * A program losing cohesion, drawn. [com.x3paranoids.engine.Derez] owns the sequence and its
@@ -959,10 +1050,10 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         // — a vertex at the periscope itself would sit on the near plane and slash across the frame
         // (the same trap the shell tail fell into; see buildShots).
         if (draw > 0.02f) {
-            var dx = x - camX; var dz = z - camZ
+            var dx = x - tankX; var dz = z - tankZ
             val dl = hypot(dx, dz).coerceAtLeast(0.01f); dx /= dl; dz /= dl
-            val ex = camX + dx * 1.3f; val ez = camZ + dz * 1.3f
-            val ey = camY - 0.35f
+            val ex = tankX + dx * 1.3f; val ez = tankZ + dz * 1.3f
+            val ey = tankY - 0.35f
             val wob = 0.10f * sin(t * 21f)
             wline(x, top, z, (x + ex) * 0.5f + wob, (top + ey) * 0.5f + 0.35f, (z + ez) * 0.5f, 1f, 1f, 1f, 0.5f + 0.5f * draw)
             wline((x + ex) * 0.5f + wob, (top + ey) * 0.5f + 0.35f, (z + ez) * 0.5f, ex, ey, ez, 1f, 1f, 1f, 0.6f + 0.4f * draw)
@@ -1078,8 +1169,8 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
             // the same brightness, the same rim curve and unmistakably CYAN.
             val ka = if (aa <= 1f) 1f else 1f / Math.pow(aa.toDouble(), NEAR_HUE.toDouble()).toFloat()
             val kb = if (ab <= 1f) 1f else 1f / Math.pow(ab.toDouble(), NEAR_HUE.toDouble()).toFloat()
-            lines.v(camX + pax, camY + pay, camZ + paz, r * ka, g, b, aa)
-            lines.v(camX + pbx, camY + pby, camZ + pbz, r * kb, g, b, ab)
+            lines.v(tankX + pax, tankY + pay, tankZ + paz, r * ka, g, b, aa)
+            lines.v(tankX + pbx, tankY + pby, tankZ + pbz, r * kb, g, b, ab)
         }
     }
 
@@ -1192,8 +1283,8 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         val cp = cos(pitch)
         val fx = sin(yaw) * cp; val fy = sin(pitch); val fz = -cos(yaw) * cp
         val rx = cos(yaw); val rz = sin(yaw)
-        val x0 = camX + fx * 0.9f + rx * 0.05f; val y0 = camY - 0.55f + fy * 0.9f; val z0 = camZ + fz * 0.9f + rz * 0.05f
-        val x1 = camX + fx * 2.6f; val y1 = camY - 0.25f + fy * 2.6f; val z1 = camZ + fz * 2.6f
+        val x0 = tankX + fx * 0.9f + rx * 0.05f; val y0 = tankY - 0.55f + fy * 0.9f; val z0 = tankZ + fz * 0.9f + rz * 0.05f
+        val x1 = tankX + fx * 2.6f; val y1 = tankY - 0.25f + fy * 2.6f; val z1 = tankZ + fz * 2.6f
         lines.v(x0, y0, z0, 1f, 0.95f, 0.5f, m); lines.v(x1, y1, z1, 1f, 0.95f, 0.5f, m * 0.6f)
     }
 
@@ -1205,7 +1296,14 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
     private var cr = 1f; private var cg = 1f; private var cb = 1f; private var ca = 1f
     /** Fades a whole screen's worth of HUD at once — the attract loop dips out on it between passes. */
     private var hudGain = 1f
+    /**
+     * 1 while the player is looking through the periscope, 0 when the lens has left it — see
+     * [buildHud]. Multiplied into the sight's own instruments only; the cabinet ignores it.
+     */
+    private var sightGain = 1f
     private fun color(r: Float, g: Float, b: Float, a: Float = 1f) { cr = r; cg = g; cb = b; ca = a * hudGain }
+    /** Colour for a stroke that belongs to the TANK SIGHT rather than to the cabinet around it. */
+    private fun sightColor(r: Float, g: Float, b: Float, a: Float = 1f) { color(r, g, b, a * sightGain) }
     private fun text(s: String, x: Float, y: Float, sc: Float) = StrokeFont.draw(corrupt(s), x, y, sc, sink)
     private fun textC(s: String, cx: Float, y: Float, sc: Float) = StrokeFont.draw(corrupt(s), cx - StrokeFont.width(s, sc) / 2f, y, sc, sink)
     private fun textR(s: String, rx: Float, y: Float, sc: Float) = StrokeFont.draw(corrupt(s), rx - StrokeFont.width(s, sc), y, sc, sink)
@@ -1419,6 +1517,22 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
             revealY = powerOnBeam(att.t)
             hudGain = 1f - ((att.t - att.plan.end) / com.x3paranoids.engine.Attract.FADE).coerceIn(0f, 1f)
         }
+        // THE CABINET IS NOT THE SIGHT, and the capture is where that distinction stops being
+        // pedantry. [buildBezel] is the MONITOR'S OWN FRAME — the bezel and the two side dials of
+        // the arcade cabinet the player is imagined to be standing at — so it stays lit through the
+        // cinematic, because nobody walked away from the cabinet. The TANK SIGHT is the periscope:
+        // the brackets, the reticle, the threat chevrons, the throttle, the WARNING band. The
+        // player is not looking through the periscope for those two seconds, so those recede with
+        // the lens and come back with it.
+        //
+        // WHAT DELIBERATELY STAYS: the score row, the objective band, the wave bar and the MINIMAP.
+        // Two reasons, and the second is the one that decided it. They are the cabinet's scoreboard
+        // rather than the tank's optics — a 1982 machine painted the score on the glass whatever the
+        // camera was doing. And during a CARRY the minimap is the only thing on screen that tells
+        // the player they are being MOVED, which turns the most disorienting event in the game into
+        // one they can watch happen and re-orient from. Removing it would have been tidier and
+        // measurably worse.
+        sightGain = 1f - game.cinAmt
         buildBezel()
         when (game.state) {
             // THE MENU GETS THE GLASS TO ITSELF. The poster is a full screen of type — a title at
@@ -1670,11 +1784,15 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         var r = GREEN[0]; var g = GREEN[1]; var b = GREEN[2]
         if (lock || caught) { r += (1f - r) * blink * 0.9f; g -= g * blink * 0.8f; b -= b * blink * 0.6f }
         val inv = if (game.invuln > 0f) 0.45f + 0.55f * abs(sin(t * 14f)) else 1f
+        // ---- the PERISCOPE's own instruments, which recede when the lens leaves it (see buildHud)
+        val gAll = hudGain
+        hudGain = gAll * sightGain
         color(r, g, b, 0.9f * inv)
         // held: the brackets are driven in and stay in, over whatever kick the landing gave them
         sightBrackets(if (caught) min(game.sightKick, -0.35f - 0.15f * blink) else game.sightKick)
         buildImpacts()
         buildStatic()
+        hudGain = gAll
         // readouts
         color(GREEN[0], GREEN[1], GREEN[2], 0.95f)
         text("RECOGNIZERS ${game.recognizersLeft}", 52f, 46f, 2.2f)
@@ -1715,9 +1833,15 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
             lock -> { color(1f, 0.35f, 0.25f, blink); textC("WARNING", 320f, 68f, 1.8f) }
             game.tracking -> { color(1f, 0.72f, 0.3f, 0.45f + 0.2f * blink); textC("TRACKING", 320f, 68f, 1.6f) }
         }
+        hudGain = gAll * sightGain
         buildThreatBearings()
         buildThrottle()
+        hudGain = gAll
         buildShieldHud()
+        // THE STRUGGLE — the one thing on the glass during a capture that the player can act on.
+        buildStruggle()
+        // and the capture function taking the picture with it
+        buildCarryWipe()
         // damage: red frame
         if (game.damageFlash > 0f) {
             color(1f, 0.2f, 0.15f, game.damageFlash * 0.85f)
@@ -2073,6 +2197,76 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
                 }
             }
         }
+    }
+
+    /**
+     * THE STRUGGLE — see [Game.THE CAPTURE]. The clamp is on the hull and the player has about a
+     * second and a half of TAPPING to break it, and this is the whole of what tells them so.
+     *
+     * IT IS DRAWN ON THE CABINET, NOT ON THE SIGHT, and that is deliberate: it is the one thing on
+     * the glass during a capture that the player can still act on, so it must not fade out with the
+     * periscope the moment the lens pulls back. It sits low and central, under the shot, where it
+     * cannot cover the thing it is asking you to watch.
+     *
+     * TWO STROKES AND A WORD. A bar that fills a fifth per tap and visibly BLEEDS BACK, so the
+     * player can see that hesitating costs them; and FIGHT, blinking hard, because a player being
+     * captured for the first time has about a fifth of a second to work out that the game wants
+     * something from them. It goes white as it fills — the same grammar the shell and the derez use
+     * for "about to give" — and the frame it completes is the frame the grip breaks.
+     */
+    private fun buildStruggle() {
+        if (!game.struggling) return
+        val k = game.struggle
+        val blink = 0.5f + 0.5f * sin(game.time * 13f)
+        val w = 116f; val y = 352f
+        // the word, and it is an instruction rather than a status: this is a verb the player owns
+        color(1f, 0.45f + 0.5f * k, 0.3f + 0.6f * k, 0.7f + 0.3f * blink)
+        textC("FIGHT", 320f, y - 14f, 2.4f)
+        // the bar: the frame is the cabinet's, the fill is theirs
+        color(0.9f, 1f, 0.9f, 0.30f)
+        rect(320f - w, y + 6f, 320f + w, y + 20f)
+        val fx = 320f - w + 2f + (2f * w - 4f) * k
+        color(0.6f + 0.4f * k, 1f, 0.7f + 0.3f * k, 0.55f + 0.45f * k)
+        for (i in 0 until 5) {
+            val yy = y + 8f + i * 2.6f
+            hl(320f - w + 2f, yy, fx, yy)
+        }
+        // and the tap ticks, so five is a countable number rather than a feeling
+        for (i in 1 until Game.CAPT_TAPS) {
+            val x = 320f - w + (2f * w) * (i / Game.CAPT_TAPS.toFloat())
+            color(0.9f, 1f, 0.9f, if (k * Game.CAPT_TAPS >= i) 0.85f else 0.28f)
+            hl(x, y + 6f, x, y + 20f)
+        }
+    }
+
+    /**
+     * THE CAPTURE FUNCTION, WHICH IS NOT EXPLAINED. The canon says a Recognizer's stomp "effects
+     * some kind of unexplained capture function", and the most honest way to draw an unexplained
+     * function is not to draw it: the machine lifts the tank, and the picture goes.
+     *
+     * It goes the way a vector monitor goes — horizontal lines sweeping in and filling the frame,
+     * top and bottom toward the middle, brightening as they close — rather than as a white fade,
+     * because this display is additive and blends in a cabinet's own grammar. It costs about sixty
+     * strokes at its peak and none at all the rest of the time, and it is over in
+     * [Game.CARRY_FADE_T]. On the far side of it the tank rezzes back in somewhere else.
+     */
+    private fun buildCarryWipe() {
+        val k = game.carryFade
+        if (k <= 0.001f) return
+        val n = (4 + 30 * k).toInt()
+        for (i in 0 until n) {
+            // lines march in from both edges toward the centre line, so the frame CLOSES
+            val u = i / n.toFloat()
+            val spread = 240f * (1f - k * 0.55f)
+            val y = 240f - spread + u * spread * 2f
+            val jitter = ((i * 2654435761L.toInt()) ushr 16 and 0xFF) / 255f
+            val a = (0.25f + 0.75f * jitter) * k * k
+            color(0.85f, 1f, 0.9f, a)
+            hl(14f, y, 626f, y)
+        }
+        // and the centre line last, the one that stays: the signal collapsing to a stripe
+        color(1f, 1f, 1f, k * k * 1.4f)
+        hl(14f, 240f, 626f, 240f)
     }
 
     /**

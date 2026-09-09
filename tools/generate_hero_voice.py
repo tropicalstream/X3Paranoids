@@ -74,6 +74,11 @@ LINES = [
     ("hero_scatter",     "They're falling back. Move."),
     ("hero_disc_cut",    "Not today."),
     ("hero_protocol",    "It knows we're here."),
+    # ---- THE CAPTURE. The machine says "Captured." flatly; these are the two beats the pilot
+    # answers it on — the grip closing, and waking up on the wrong side of the maze. There was no
+    # pilot line for either, and the capture is now the single biggest thing that happens to them.
+    ("hero_caught",      "It's got me."),
+    ("hero_dumped",      "Where the hell am I?"),
 ]
 
 

@@ -84,6 +84,12 @@ class Recognizer(var x: Float, var z: Float) {
         const val CRUSH_HOLD = 3
         /** Legs opening, lifting off (or being thrown off): the release. */
         const val CRUSH_RELEASE = 4
+        /**
+         * CLAMPED SHUT AND RISING. The struggle was lost: the machine does not put the tank down,
+         * it takes it — see [Game.beginCarry]. The one beat of this sequence the player does not
+         * get to interrupt, which is precisely why the beat before it matters.
+         */
+        const val CRUSH_CARRY = 5
     }
 
     /** The eye's world position — where a disc leaves from, and the point the lock glow sits on. */
@@ -200,6 +206,71 @@ class Recognizer(var x: Float, var z: Float) {
     var ghostC = 0
     var ghostR = 0
     var ghostSweep = -1
+
+    // ------------------------------------------------------------------ [THE HUNT]
+    /**
+     * WHICH WAY ROUND IT PROWLS. The standoff's lateral push used to be `sin(time·0.7 + phase)` —
+     * an oscillation that reverses every four and a half seconds and passes through zero on the
+     * way. Held as a SIGN instead, and flipped deliberately, the machine circles you at a real
+     * angular rate and never once stands still while doing it. See [Game.ORBIT_SPEED].
+     */
+    var orbit = if (Random.nextBoolean()) 1 else -1
+    var orbitCd = 0f
+    /**
+     * THE CAB IS NEVER STILL. A slow sweep the head rides whenever it is not bringing itself onto
+     * the tank for a throw, so the machine reads as LOOKING from any range and any angle — the one
+     * thing the silhouette could not previously say. Phase and rate are per-machine so a pack does
+     * not sweep in chorus.
+     */
+    var scanPhase = Random.nextFloat() * 6.28f
+    var scanRate = 0.75f + Random.nextFloat() * 0.5f
+    /** The heading the sweep is measured about: where the machine is actually going. */
+    var faceBase = 0f
+    /** Seconds left of a JUNCTION PEER — stopped at a crossing, sweeping its eye down each corridor. */
+    var peer = 0f
+    var peerCd = 4f
+    /** The cell it was in last frame, so ARRIVING somewhere is an event rather than a state. */
+    var lastCell = -1
+    /**
+     * WHERE IT LAST HAD YOU — the search anchor. A machine that lost the tank used to be handed the
+     * tank's CURRENT cell on every frame, which is not a search, it is a homing beam wearing a BFS.
+     * It now walks to where you actually were, and when it gets there it has to look.
+     */
+    var lastX = 0f
+    var lastZ = 0f
+    var lastT = -99f
+    /** True on the previous frame's sight test, so LOSING you is an event and re-tasks it at once. */
+    var hadLos = false
+    /** Which quarter of the maze this machine sweeps when it has nothing better — see [Game.pickPatrol]. */
+    var sector = Random.nextInt(4)
+    /**
+     * THE WATCHDOG. Seconds this machine has been commanded essentially nowhere while not
+     * deliberately peering. Past [Game.IDLE_MAX] it is re-tasked and its orbit reversed, because
+     * the one thing an antagonist may never do is hang in the player's view with nothing happening
+     * — whatever the reason, including reasons nobody has thought of yet.
+     */
+    var idleT = 0f
+
+    // ------------------------------------------------------------------ the capture
+    /** Where the carry is taking the tank, in cells, and how far through it is. */
+    var carryC = -1
+    var carryR = -1
+
+    // ------------------------------------------------------------------ diagnosis
+    /** Seconds since this machine last emitted an [Game.AI_TRACE] line. */
+    var dbgT = 0f
+    /** Ground actually covered since that line — the number that tells idling from patrolling. */
+    var dbgMove = 0f
+    /** Yaw actually swept since that line — the number that tells looking from staring. */
+    var dbgYaw = 0f
+    /** A stable name for this machine in the log, assigned at the spawn. */
+    var dbgId = 0
+    /** Seconds this machine has been commanded essentially nowhere, uninterrupted. */
+    var dbgStall = 0f
+    /** The longest such run so far, and the longest run with the head also still. */
+    var dbgStallMax = 0f
+    var dbgStare = 0f
+    var dbgStareMax = 0f
 }
 
 class Shot(var x: Float, var y: Float, var z: Float, var vx: Float, var vy: Float, var vz: Float, val friendly: Boolean) {
@@ -362,6 +433,96 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         const val PATROL_NEAR = 4
         /** How often a lost machine sweeps the player's district rather than anywhere at all. */
         const val PATROL_HUNT_BIAS = 0.72f
+
+        // ------------------------------------------------------------------ [THE HUNT]
+        /**
+         * A RECOGNIZER MUST READ AS HUNTING YOU EVEN WHEN IT HAS NOT FOUND YOU.
+         *
+         * The owner watched one bob in a corridor and said it was not engaging. The telemetry says
+         * exactly why, and it is not any of the things it looked like. Measured on the glasses over
+         * 630 samples: the BFS never once returned a null step, nothing was ever wedged (no sample
+         * anywhere had a commanded direction and no ground covered), and no stagger outlived its
+         * clock. What the log actually caught was ONE MACHINE HOLDING A RANGE OF 6.4 UNITS FOR
+         * TWENTY-FIVE AND A HALF SECONDS — the distance never moving by more than a fifth of a unit
+         * across fifty-one consecutive samples — while its own x coordinate sat at 34.9 and its z
+         * slid 38.5 → 42.5 → 38.5, over and over.
+         *
+         * THE STANDOFF RING WAS A FIXED POINT. `towards` was a three-way step — close if further
+         * than want+1, back off if nearer than want−1.5, and EXACTLY ZERO in the two-and-a-half
+         * unit band between — so a machine that arrived at six units was pinned there, permanently,
+         * with no radial term at all. The only motion left was `sin(time·0.7 + phase)` at half
+         * weight: a lateral shuffle that peaks at 0.5 of the machine's speed, averages 0.36, and
+         * passes exactly through zero twice every nine seconds. Forty-five percent of all chase
+         * time was spent in that band, drifting sideways at 1.1 units a second — which at six units
+         * of range is ten degrees of parallax a second, and from inside the tank that is not motion
+         * at all. THE BOB — 0.6 units peak to peak at 2.1 rad/s — WAS LITERALLY THE FASTEST-MOVING
+         * PART OF THE MACHINE. The owner's sentence is the log's own reading of itself.
+         *
+         * Five things answer it, and none of them touches the facing telegraph or the fire gate:
+         *
+         *  THE RING BREATHES. [RING_SWING] — the standoff distance is no longer a number, it is a
+         *  slow oscillation, so the radial term is essentially never zero and the machine is always
+         *  visibly pressing in or easing back. A range can no longer pin.
+         *
+         *  IT PROWLS. [ORBIT_SPEED] — the lateral push is a held SIGN at full weight rather than a
+         *  sine through zero, so it circles you at about thirty degrees of parallax a second and
+         *  never has a frame with nothing commanded.
+         *
+         *  THE HEAD SWEEPS. [SCAN_AMP], always, except inside [AIM_LEAD] where today's rule takes
+         *  over exactly as written. The eye slit is the brightest thing on the model, so its
+         *  attention is legible clear across the arena.
+         *
+         *  IT SEARCHES SOMEWHERE. [pickPatrol] — the last place it SAW you, the last place it HEARD
+         *  you ([NOISE_R]: the cannon is loud), the quarter of the maze it holds, or the pool and
+         *  the Bit. A pack quarters the arena instead of queueing down one corridor.
+         *
+         *  IT STOPS AT JUNCTIONS AND LOOKS. [PEER_T] — a stop is only inert if nothing happens in
+         *  it, and a machine halted at a crossing sweeping its eye down each corridor is the most
+         *  explicitly hunting thing in this game.
+         */
+        /** How far the standoff range breathes either side of its centre, units. */
+        const val RING_SWING = 1.6f
+        /** How fast it breathes — a period of about eleven seconds, so it is a prowl, not a jitter. */
+        const val RING_RATE = 0.57f
+        /** Over how many units of range error the radial term saturates. Small: it always commits. */
+        const val RING_BAND = 1.1f
+        /** The lateral push while circling, as a fraction of the machine's speed. Held, never zero. */
+        const val ORBIT_SPEED = 0.80f
+        /** How often it reconsiders which way round it is circling. */
+        const val ORBIT_FLIP_CD = 5f
+        /** How far either side of its heading a cab sweeps on the march, radians. */
+        const val SCAN_AMP = 0.60f
+        /** And at a junction, where it is deliberately looking rather than glancing. */
+        const val PEER_AMP = 1.30f
+        /**
+         * THE SWEEP MAY NOT SETTLE ON THE TANK. Whenever the shot line is open the swept cab target
+         * is pushed out to this many radians off the bearing to the tank — comfortably outside
+         * [FIRE_ARC]'s 0.175 — so a scan can NEVER satisfy [Recognizer.facing]. Every lock in this
+         * game remains the deliberate swing inside [AIM_LEAD] that TRACKING announces; what the
+         * player sees added is the head passing NEAR them and sliding off, repeatedly, which is
+         * worse to watch and entirely fair.
+         */
+        const val SCAN_GUARD = 0.34f
+        /** How long a junction peer holds a machine still while its head sweeps. */
+        const val PEER_T = 1.2f
+        const val PEER_CD = 6.5f
+        const val PEER_CHANCE = 0.55f
+        /** Seconds a sighting is worth walking to. Past this the lead is cold and it quarters instead. */
+        const val MEMORY_T = 14f
+        /** The cannon is loud. A shot is a search anchor for this long, out to [NOISE_R]. */
+        const val NOISE_T = 6f
+        const val NOISE_R = 38f
+        /**
+         * ESCALATION. Seconds into a wave at which the hunt is at full pressure: the district bias
+         * saturates and a share of picks go to the tank's own cell rather than its neighbourhood.
+         * A player who parks is CONVERGED ON; one who keeps moving and breaking contact still gets
+         * the loose search the first half-minute is made of.
+         */
+        const val ESCALATE_T = 50f
+        /** How often an idle machine goes and stands over the thing you need instead. */
+        const val GUARD_CHANCE = 0.22f
+        /** The longest a machine may be commanded nowhere before the watchdog re-tasks it. */
+        const val IDLE_MAX = 0.9f
         /**
          * A PLAYER SHELL CAN CUT A DISC OUT OF THE AIR. This is the radius of that meeting, and it
          * is the only new verb in this game — the answer to a rim chevron that could otherwise only
@@ -410,44 +571,38 @@ class Game(val store: SettingsStore, private val host: GameHost) {
          * beneath the bar until the feet meet, closing on whatever is between them. Here that is
          * the tank, and you are inside it, so the whole sequence is watched from the seat.
          *
-         * Five beats on the machine's own clock — see [updateCrush]:
+         * IT IS A CAPTURE, NOT A KILL — see [THE CAPTURE] for the outcome and what it costs, and
+         * [THE LENS] for the camera that leaves the periscope to show you it happening.
+         *
+         * Six beats on the machine's own clock — see [updateCrush]:
          *  LUNGE   [CRUSH_LUNGE_T]  it rises to [CRUSH_RISE_Y] and slides to directly over the hull
          *                           while the legs SPLAY a little: the anticipation, the hands opening.
+         *                           The lens starts back on this beat, so the rise is SEEN.
          *  DROP    [CRUSH_DROP_T]   it falls — accelerating — to [CRUSH_LAND_Y], and the legs swing
          *                           shut on a cubic so the clamp SNAPS closed at the bottom of the drop.
          *  LAND                     the hard beat: the slam, the sight kicked inward, static in the
-         *                           periscope — and the OUTCOME, which depends on the shell (below).
-         *  HOLD    [CRUSH_HOLD_T]   clamped, juddering, the servos straining. You can still look —
-         *                           that is the point — and you can still shoot it.
-         *  RELEASE [CRUSH_RELEASE_T] the legs open and it lifts off and backs away, or the shell
-         *                           THROWS it open and away; either way it then reels for
-         *                           [STAGGER_T] and may not capture again for [CRUSH_CD].
-         *
-         * THE SHELL. A crush against a shielded tank costs [CRUSH_CHARGES] = 2 of the shell's three
-         * bands. Not one: a bolt costs one, and the heaviest thing a Recognizer can do to you must
-         * cost more than a bolt or the crush is a bump with a longer animation. Not three: the
-         * machines already PRESS a shielded tank — closer standoff, faster chase — so a shell that
-         * popped on any touch would be a shell that only stops bolts, and the pool would stop being
-         * worth crossing for. Two means a full shell survives exactly one capture with a single
-         * band left, and a shell already touched does not. The tank is untouchable for a beat
-         * longer than a bolt buys ([SHIELD_IFRAME] + [CRUSH_GRACE]) so the thrown machine's
-         * companions cannot land the next one while you are still finding the pad.
-         *
-         * BARE, it is a life, with the full derez if it was the last — and the machine holds its
-         * clamp through the death rather than letting go: the periscope sinks between its legs.
+         *                           periscope — and the window opens.
+         *  HOLD                     clamped, juddering, the servos straining. With a shell, it
+         *                           strains for [CRUSH_HOLD_SHELL_T] and then blows the machine off.
+         *                           Bare, it is [CAPT_STRUGGLE_T] of TAPPING to break the grip.
+         *  RELEASE [CRUSH_RELEASE_T] the legs open and it lifts off and backs away, or the shell or
+         *                           the struggle THROWS it open and away; either way it then reels
+         *                           for [STAGGER_T] and may not capture again for [CRUSH_CD].
+         *  CARRY                    or, if the struggle was lost, the legs stay SHUT and it takes
+         *                           you — [THE CARRY].
          */
         const val CRUSH_LUNGE_T = 0.40f
         const val CRUSH_DROP_T = 0.30f
-        const val CRUSH_HOLD_T = 0.65f
         /** The strain before a shell discharges — long enough to wonder whether it will hold. */
         const val CRUSH_HOLD_SHELL_T = 0.50f
         const val CRUSH_RELEASE_T = 0.55f
         const val CRUSH_RISE_Y = 2.55f
         /** Where the axle sits when landed: the bar at ~2.15, over the periscope; the legs closing at eye height. */
         const val CRUSH_LAND_Y = 0.12f
-        const val CRUSH_CHARGES = 2
         const val CRUSH_GRACE = 0.55f
         const val CRUSH_CD = 3.5f
+        /** How far past straight the legs snap when a shell or a struggle throws the machine off. */
+        const val FOLD_FLUNG = -0.42f
         const val STAGGER_T = 1.4f
         /** How fast the gantry slides over the tank during the lunge, units a second. */
         const val CRUSH_CLOSE_SPEED = 9f
@@ -455,13 +610,20 @@ class Game(val store: SettingsStore, private val host: GameHost) {
          * WHERE THE GANTRY LANDS, and why it is not dead over the periscope. Measured on the glasses:
          * a machine centred exactly on the eye puts its legs 1.35 units to either SIDE of the
          * camera — ninety degrees off the view axis — and the whole fold happens out of frame while
-         * the sight fills with the bar's strokes crossing overhead. The periscope sits at the back
-         * of the hull; the machine comes down over the FRONT of it, [CRUSH_STAND] short of the eye
-         * along its own approach line, so from the seat the two legs enter from both edges of the
-         * sight and swing shut in the centre of it, at knee height, with the bar across the top.
-         * That is the film's image, seen from inside.
+         * the sight fills with the bar's strokes crossing overhead.
+         *
+         * IT USED TO LAND 1.9 UNITS SHORT OF THE EYE, and that was right for exactly as long as this
+         * was a game nobody could watch from outside. From the seat, a gantry straddling the ground
+         * just ahead of the periscope puts a leg at each edge of the sight and the bar across the
+         * top: the film's image, and it cost nothing that the machine was not actually over the
+         * hull, because nobody could see the hull. The first pull-back on the glasses showed what it
+         * really looked like — a Recognizer standing politely NEXT TO the tank with its legs closing
+         * on an empty patch of floor a metre and a half away, while the tank sat outside its span
+         * entirely. So it lands ON the hull now: the axle over the tank's own centre, the bar over
+         * the periscope, the legs down either flank. From the seat that is the same image one step
+         * closer; from outside it is the difference between a capture and a near miss.
          */
-        const val CRUSH_STAND = 1.9f
+        const val CRUSH_STAND = 0f
         /**
          * After the eye first finds you, the disc waits this long: the lock bar and WARNING always
          * precede the first throw. It was 0.45 s, which is under the time it takes to saccade to a
@@ -527,6 +689,122 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         /** How far a released machine backs off over the release, and how far a thrown one is flung. */
         const val CRUSH_BACK_OFF = 3.6f
         const val CRUSH_THROW = 5.5f
+
+        // ------------------------------------------------------------------ [THE CAPTURE]
+        /**
+         * THE STOMP IS A CAPTURE, NOT A KILL — and it still has to cost, or the antagonist has no
+         * teeth and the player thinks "oh good, only a capture".
+         *
+         * The canon is explicit (Tron Wiki, Recognizer): a Recognizer captures fugitive programs
+         * and vehicles by rotating its legs in together and stomping from above, and this "does not
+         * harm the program" — it effects "some kind of unexplained capture function". So the tank is
+         * not crushed. It is TAKEN. Three costs are stacked so that a capture is never free and
+         * never merely annoying, and so that the player's own hands decide which of them lands:
+         *
+         *  1. THE SHELL GOES, ALL OF IT. The old crush spent two of three charges; a capture now
+         *     strips the shell entirely and throws the machine off. That is the whole of what a
+         *     shell does here — it is a GET OUT OF ONE CAPTURE FREE card, spent in full — and it
+         *     turns the pools into the thing you scramble for, because the shell is now the
+         *     difference between being captured and being taken.
+         *
+         *  2. THE STRUGGLE. Bare-hulled, the clamp closes and you have [CAPT_STRUGGLE_T] to TAP
+         *     your way out — the verb this game already uses for cutting a disc out of the air.
+         *     [CAPT_TAPS] taps break the grip; the meter bleeds back at [CAPT_DECAY] so it is a
+         *     burst of panic and not a slow grind. Break out and you drop where you stand, shaken,
+         *     with the machine flung off and reeling. This is the beat that keeps the capture fair:
+         *     the player is never a spectator at their own capture.
+         *
+         *  3. THE CARRY, which is where the real cost lands. Fail the struggle and the legs stay
+         *     shut, the machine RISES with the tank between them, and the arena goes white — the
+         *     capture function the canon declines to explain, and this does not explain it either.
+         *     You wake up [CARRY_MIN_D] units away with a life gone, no shell, no bearings, and
+         *     whatever approach you had set up now on the wrong side of the maze. The maze is the
+         *     punishment; being moved is worse than being hit, because a hit at least leaves you
+         *     where you knew where you were.
+         *
+         * AND ON THE LAST LIFE IT DOES NOT PUT YOU DOWN. See [taken]. A capture that can never end
+         * the game leaves the game with no ending, so the failure branch is terminal: with one life
+         * left, a lost struggle means the machine lifts the tank and walks off with it, the sight
+         * fails, and that is GAME OVER. It is not a derez — nothing explodes — which makes it a
+         * distinctly worse ending than the one the discs give you, and the correct one for this
+         * antagonist. The discs still end the game the old way; the Recognizers now end it their
+         * own way, and their way is the canon's.
+         */
+        /** Taps that break the clamp. Five: a real burst, reachable in the window, not a mash. */
+        const val CAPT_TAPS = 5
+        /** How long the grip holds a bare hull before the outcome is decided. */
+        const val CAPT_STRUGGLE_T = 1.55f
+        /** How fast the struggle bleeds back, in taps per second — you cannot bank it. */
+        const val CAPT_DECAY = 1.30f
+        /** How high the machine lifts the tank before the arena whites out. */
+        const val CARRY_RISE_Y = 4.4f
+        const val CARRY_RISE_T = 0.60f
+        /** The white-out itself — the unexplained capture function, and it stays unexplained. */
+        const val CARRY_FADE_T = 0.42f
+        /** And how long the tank takes to re-rez where it wakes up. */
+        const val CARRY_REZ_T = 0.45f
+        /** How far across the arena you wake up. Far enough to have lost the thread of the fight. */
+        const val CARRY_MIN_D = 26f
+
+        // ------------------------------------------------------------------ [THE LENS]
+        /**
+         * THE CAMERA LEAVES THE PERISCOPE — and moving a camera the player did not move is the
+         * classic way to make somebody ill on a head-worn display, so every choice here is a
+         * comfort choice first and a cinematography choice second.
+         *
+         *  THE HEAD STAYS COUPLED. The look direction is [yaw] and [pitch], unchanged, for every
+         *  frame of the shot. The player's head still aims the view; only the camera's POSITION is
+         *  animated. Nothing ever takes their gaze somewhere they did not point it.
+         *
+         *  THE CAMERA GOES TO A FIXED WORLD POINT AND STAYS THERE. The offset direction is frozen
+         *  at the grab — straight back along the captor's own approach line, so the machine is
+         *  always beyond the tank from the lens and the shot is staged correctly however the head
+         *  is pointed. Deriving it from the live view direction instead would have swung the camera
+         *  bodily around the tank every time the player turned their head, which is a large lateral
+         *  translation nobody asked for. This way head rotation rotates the view and translates
+         *  nothing.
+         *
+         *  IT EASES ON A SMOOTHSTEP, both ways. `t·t·(3−2t)` has zero derivative at both ends, so
+         *  the move starts from rest and arrives at rest — no jerk leaving the eye, no snap coming
+         *  home. Because it is a clock rather than a spring, a captor killed mid-shot simply runs
+         *  the clock backwards and the lens walks home on the same curve.
+         *
+         *  IT NEVER ROLLS. The up vector is untouched, always (0,1,0).
+         *
+         *  IT IS SHORT, AND SHORTER THE SECOND TIME. This fires on every capture, so the first one
+         *  gets the full step out and every one after gets [CIN_BACK_TIGHT] — a smaller, quicker
+         *  look that a player who has seen it a dozen times is not fighting.
+         *
+         *  AND THE JUDDER STAYS IN THE HULL. The crush shake is the tank's servos coming through
+         *  the tank's own frame; a detached camera four units away has no business shaking with it,
+         *  and shaking a third-person camera is nauseating. It is scaled out with the pull-back.
+         */
+        const val CIN_BACK = 6.0f
+        /**
+         * How high, and it is lower than it first looked right. At 2.15 up over 6 back the tank
+         * sits 20 degrees below a level view axis, which is two thirds of the way down the lower
+         * half of a 60-degree frame — measured on the glasses, the hull was clipped by the bottom
+         * bezel unless the player thought to look down. 1.55 puts it at 14 degrees and the whole
+         * capture inside the frame with the head level, while still looking DOWN on the scene.
+         *
+         * MEASURED AGAIN AT 1.55 and brought down again to here. The whole composition — the
+         * machine's cab at the top, the clamp and the tank at the bottom — spans about 3.2 units of
+         * height, and with the lens at eye + 1.55 the view axis passes clean OVER the top of it, so
+         * every part of the shot sits in the lower half of the frame and the hull ends up in the
+         * score row. At eye + 0.95 the axis runs through the cross-bar: the cab is a few degrees
+         * above it, the tank a dozen below, and the shot is centred on the thing the shot is about.
+         */
+        const val CIN_UP = 0.95f
+        const val CIN_BACK_TIGHT = 4.5f
+        const val CIN_UP_TIGHT = 0.75f
+        /** A few degrees off the player's own axis, so the shot has some obliqueness. See [beginCrush]. */
+        const val CIN_QUARTER = 0.15f
+        const val CIN_OUT_T = 0.42f
+        const val CIN_IN_T = 0.52f
+        /** The lens is a body too: it slides along walls rather than reversing through them. */
+        const val CIN_CAM_R = 0.5f
+        /** How long the lens holds outside after the tank is carried off, before the sight fails. */
+        const val CIN_TAKEN_T = 1.6f
         /**
          * THE CHARGE — when a Recognizer decides to capture rather than shoot. A machine that only
          * ever stood off at six units would crush you only when you drove into it, and a set piece
@@ -557,6 +835,15 @@ class Game(val store: SettingsStore, private val host: GameHost) {
          * doorways de-rezzes and re-rezzes instead of flickering.
          */
         const val VIS_RATE = 9f
+        /**
+         * DIAGNOSIS. Dump every machine's mode, target, path step, commanded direction, GROUND
+         * ACTUALLY COVERED and YAW ACTUALLY SWEPT, twice a second. It is left in the source
+         * because "the Recognizer was doing nothing" is a report that will be made again, and the
+         * answer to it is a log rather than a guess. Off in the build the owner plays.
+         */
+        const val AI_TRACE = false
+        /** DIAGNOSIS ONLY, never shipped: the hull cannot be hurt, so a machine can be watched. */
+        const val DIAG_IMMORTAL = false
         /** How many derezzes may be coming apart at once. Four × 60 segments is the whole budget. */
         const val MAX_DEREZ = 4
         /** Gravity on a falling fragment — heavier than real, so debris settles inside its own life. */
@@ -904,6 +1191,18 @@ class Game(val store: SettingsStore, private val host: GameHost) {
      * machines release on the same frame no matter how their cooldowns line up.
      */
     private var lastThrowT = -99f
+    /**
+     * THE LAST LOUD THING THE TANK DID, and when. The cannon is by a distance the loudest thing on
+     * the grid, and firing it tells every machine within [NOISE_R] roughly where you are — which is
+     * how a search gets a lead without the machines being handed your live position. It is also the
+     * fairest pressure valve in the game: a player who keeps shooting keeps being found, and a
+     * player who goes quiet and moves genuinely breaks contact.
+     */
+    private var noiseX = 0f
+    private var noiseZ = 0f
+    private var noiseT = -99f
+    /** Seconds this wave has run — what [ESCALATE_T] measures. Not [stateT], which a death resets. */
+    private var waveT = 0f
     var bonusText = ""; private set
     /**
      * Seconds left on the FIND THE BIT prompt. The objective band is the one imperative sentence on
@@ -933,6 +1232,54 @@ class Game(val store: SettingsStore, private val host: GameHost) {
     var crusher: Recognizer? = null; private set
     /** Periscope judder from the crush — the lunge, the landing, the strain — on top of the damage shake. */
     var crushShake = 0f; private set
+
+    // ------------------------------------------------------------------ [THE CAPTURE], live
+    /**
+     * THE STRUGGLE METER, 0 … 1 — see [THE CAPTURE]. Filled a tap at a time while the clamp is on a
+     * bare hull, bleeding back at [CAPT_DECAY]; at 1 the grip breaks on that very frame rather than
+     * at the end of the window, because a break-out you have already earned should not make you sit
+     * and wait for it.
+     */
+    var struggle = 0f; private set
+    /** True only while the tap actually fights — what puts FIGHT on the glass, and takes it off. */
+    var struggling = false; private set
+    /** How many captures this player has watched. The first gets the full lens move; the rest don't. */
+    private var captures = 0
+    /** How high the machine has lifted the tank. Drawn; the lens deliberately does NOT follow it. */
+    var lift = 0f; private set
+    /** The white-out across the carry: the capture function, undescribed. 0 … 1. */
+    var carryFade = 0f; private set
+    /** The tank re-rezzing where it woke up, 1 → 0. */
+    var carryRez = 0f; private set
+    /**
+     * THE TANK WAS TAKEN AND NOT PUT BACK — the terminal capture, on the last life. It suppresses
+     * the hull's derez (nothing exploded; it was carried off) and holds the lens outside to watch
+     * the machine leave with it. See [THE CAPTURE].
+     */
+    var taken = false; private set
+
+    // ------------------------------------------------------------------ [THE LENS], live
+    /** The raw 0 … 1 clock of the pull-back; [cinAmt] is this smoothstepped. */
+    private var cinPhase = 0f
+    /** True while a sequence owns the lens. Cleared by [releasePlayer], so every exit clears it. */
+    private var cinHold = false
+    /** Seconds the lens has held outside after a terminal capture. */
+    private var cinTakenT = 0f
+    /** The frozen pull-back direction, away from the captor, fixed at the grab. */
+    private var cinUx = 0f
+    private var cinUz = -1f
+    private var cinBack = CIN_BACK
+    private var cinUp = CIN_UP
+    /** 0 at the eye, 1 fully outside — smoothstepped, so it leaves and arrives at rest. */
+    var cinAmt = 0f; private set
+    /** The lens's offset from the tank, already clipped by the maze. The renderer just adds it. */
+    var cinCamX = 0f; private set
+    var cinCamY = 0f; private set
+    var cinCamZ = 0f; private set
+    private val camTmp = FloatArray(2)
+    /** Where the carry sets the tank down — chosen at the lift, applied on the far side of the fade. */
+    private var dropX = 0f
+    private var dropZ = 0f
     /**
      * The sight's brackets KICKED: positive is a punch outward (something landed on the glass),
      * negative is the clamp closing in. Decays fast; the renderer displaces the brackets by it.
@@ -1258,6 +1605,11 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         recognizers.clear(); shots.clear(); sparks.clear(); derezzes.clear(); bitActive = false
         deathSink = 0f
         releasePlayer(); impacts.clear(); crushShake = 0f; sightKick = 0f; staticT = 0f
+        // and the capture's own state, so nothing from the last run is still on the glass
+        taken = false; carryFade = 0f; carryRez = 0f; lift = 0f
+        struggle = 0f; struggling = false
+        cinHold = false; cinPhase = 0f; cinAmt = 0f; cinTakenT = 0f
+        cinCamX = 0f; cinCamY = 0f; cinCamZ = 0f
         poolActive = false; poolMaze = null
         clearCues()
         host.stopHero(); host.stopVoice()
@@ -1370,10 +1722,30 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         if (menuOpen) { menuActivate(); return }
         when (state) {
             State.TITLE -> startGame()
-            State.PLAY -> fire()
+            // THE CLAMP TAKES THE TAP. While a machine has the hull, the one verb this game owns is
+            // pointed at getting out of it rather than at the cannon — see [THE CAPTURE]. Firing a
+            // shell from between a Recognizer's own legs was never a shot anybody could make (the
+            // muzzle is 1.2 units ahead of an eye the machine is standing on), so nothing is lost
+            // and a beat the player used to sit through becomes the beat they play.
+            State.PLAY -> when {
+                struggling -> struggleTap()
+                // ...and it does not fire out of a hull that is four units off the floor between a
+                // machine's feet. Firing DURING the lunge and the drop stays: a shell that kills the
+                // captor mid-sequence is the escape the last review praised, and it still works.
+                crusher?.crush == Recognizer.CRUSH_CARRY -> {}
+                else -> fire()
+            }
             State.GAME_OVER -> if (stateT > 1.2f) enterTitle()
             else -> {}
         }
+    }
+
+    /** One pull against the clamp. Five of them inside [CAPT_STRUGGLE_T] and the grip breaks. */
+    private fun struggleTap() {
+        struggle = min(1f, struggle + 1f / CAPT_TAPS)
+        crushShake = max(crushShake, 0.30f)
+        sightKick = max(sightKick, 0.22f)
+        host.sfx(com.x3paranoids.audio.Sfx.CRUSH_GRIND, 0.55f, 1.25f + 0.35f * struggle)
     }
 
     fun doubleTap() {
@@ -1463,6 +1835,8 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         // the shell leaves the barrel below and ahead of the periscope, so it reads as the cabinet's beam
         shots += Shot(px + dx * 1.2f, EYE_H - 0.45f + dy * 1.2f, pz + dz * 1.2f, dx * SHELL_SPEED, dy * SHELL_SPEED, dz * SHELL_SPEED, true)
         host.sfx(com.x3paranoids.audio.Sfx.FIRE, 0.95f + rng.nextFloat() * 0.1f)
+        // AND IT IS HEARD — see [noiseT]. Every machine in the district now has somewhere to go.
+        noiseX = px; noiseZ = pz; noiseT = time
     }
 
     // ------------------------------------------------------------------ menu
@@ -1518,6 +1892,9 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         mazeSeed = System.nanoTime(); maze = Maze(8, 8, mazeSeed)
         regionCells = null; regionC = -1; regionR = -1
         lives = 3; score = 0; wave = 0; elapsed = 0f; kills = 0; invuln = 0f; damageFlash = 0f
+        // A NEW GAME HAS NOT SEEN THE CAPTURE. The full lens move is for the first one of a run;
+        // this is what makes "the first time" mean the first time rather than the first time ever.
+        captures = 0
         vx = 0f; vz = 0f; hullYaw = 0f; hullTarget = 0f; turnBlend = 0f; newHigh = false
         driveDir = 0; driveT = 0f; driveLogT = 0f; bumpCd = 0f
         derezzes.clear(); deathSink = 0f
@@ -1527,6 +1904,11 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         shield = 0; shieldFlash = 0f; poolActive = false; poolDraw = 0f; poolCollapse = 0f; poolVis = 0f
         poolLevel = 0f; poolMaze = null; poolFullHint = false; poolPending = false
         releasePlayer(); impacts.clear(); crushShake = 0f; sightKick = 0f; staticT = 0f
+        // and the capture's own state, so nothing from the last run is still on the glass
+        taken = false; carryFade = 0f; carryRez = 0f; lift = 0f
+        struggle = 0f; struggling = false
+        cinHold = false; cinPhase = 0f; cinAmt = 0f; cinTakenT = 0f
+        cinCamX = 0f; cinCamY = 0f; cinCamZ = 0f
         lockedOn = false; tracking = false; imminent = false
         bitHint = 0f; cardT = CARD_T; protocolIdx = 0; totalKills = 0; scatterFlash = 0f
         pendingScatter = false; bitHushed = false; bitRelief = 0
@@ -1573,7 +1955,8 @@ class Game(val store: SettingsStore, private val host: GameHost) {
 
     private fun nextWave() {
         wave++
-        state = State.PLAY; stateT = 0f
+        state = State.PLAY; stateT = 0f; waveT = 0f
+        noiseT = -99f
         shots.clear(); recognizers.clear()
         // a machine that was holding you when the wave rolled over (it cannot: the crusher is the
         // last thing alive, and a dead crusher releases) — belt and braces, the clamp opens
@@ -1611,6 +1994,7 @@ class Game(val store: SettingsStore, private val host: GameHost) {
             var sz = maze.cellZ(cell[1]) + (rng.nextFloat() - 0.5f) * 2f
             if (maze.inWall(sx, sz, Recognizer.RADIUS)) { sx = maze.cellX(cell[0]); sz = maze.cellZ(cell[1]) }
             val rec = Recognizer(sx, sz)
+            rec.dbgId = i
             rec.hp = if (wave >= armourWave) 2 else 1
             // THE OPENING SPREAD, pushed out from 2–4 s to 3–5. The first half-minute of a wave is
             // where the player finds out where the machines are; a wave whose first discs are in
@@ -1804,6 +2188,7 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         // [force] is the crush landing: a capture only ever BEGINS on a tank with no grace left,
         // and nothing else can touch a held tank, so this is belt and braces — the landing beat
         // must never be a beat on which nothing happened.
+        if (DIAG_IMMORTAL) return
         if ((invuln > 0f && !force) || state != State.PLAY) return
         // THE SHELL EATS IT FIRST, and buys only [SHIELD_IFRAME] of grace rather than the 2.6 s a
         // real hit does. That asymmetry is the whole economy: the shield stops you dying for a
@@ -2033,6 +2418,9 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         crushShake *= exp(-dt / 0.18f)
         if (crushShake < 0.005f) crushShake = 0f
         staticT = max(0f, staticT - dt)
+        // the tank rezzing back in on the far side of a carry, and the wipe letting go of the frame
+        carryRez = max(0f, carryRez - dt / CARRY_REZ_T)
+        if (crusher?.crush != Recognizer.CRUSH_CARRY) carryFade = max(0f, carryFade - dt / CARRY_FADE_T)
         if (impacts.isNotEmpty()) {
             val ii = impacts.iterator()
             while (ii.hasNext()) { val im = ii.next(); im.age += dt; if (im.age > Impact.LIFE) ii.remove() }
@@ -2050,11 +2438,39 @@ class Game(val store: SettingsStore, private val host: GameHost) {
                 // The periscope sinks as the hull goes: an eased 1.15 units over about two seconds.
                 // Slow and monotonic on purpose — this is a head-worn display, and the one thing a
                 // death must not do is throw the horizon around.
-                deathSink = 1.15f * (1f - exp(-stateT * 1.3f))
+                // ...unless it was TAKEN, in which case there is no hull here to sink: it went up,
+                // between the feet, and the lens is outside watching it go. See [THE CAPTURE].
+                if (!taken) deathSink = 1.15f * (1f - exp(-stateT * 1.3f))
                 if (stateT > DYING_T) gameOver()
             }
             State.GAME_OVER -> {}
         }
+        updateCinema(dt)
+    }
+
+    /**
+     * THE LENS — the whole of [THE LENS], applied, once a frame, in every state. It runs outside the
+     * state machine on purpose: a tank captured on its last life goes to DYING with the camera still
+     * outside, and the shot has to finish rather than being cut off by the state that ended it.
+     */
+    private fun updateCinema(dt: Float) {
+        // A TERMINAL CAPTURE HOLDS THE SHOT before letting the sight fail — this is the ending, and
+        // the ending is the machine walking away with you.
+        if (taken) { cinTakenT += dt; if (cinTakenT > CIN_TAKEN_T) cinHold = false }
+        val want = if (cinHold) 1f else 0f
+        // A CLOCK, NOT A SPRING. Smoothstep has zero derivative at both ends, so the lens leaves
+        // from rest and arrives at rest — and running the clock backwards is the entire handling of
+        // "the captor died mid-shot": no cut, no snap, the same curve in reverse.
+        cinPhase = (cinPhase + (if (want > cinPhase) dt / CIN_OUT_T else -dt / CIN_IN_T)).coerceIn(0f, 1f)
+        cinAmt = cinPhase * cinPhase * (3f - 2f * cinPhase)
+        if (cinAmt <= 0.0004f) { cinAmt = 0f; cinCamX = 0f; cinCamY = 0f; cinCamZ = 0f; return }
+        // Straight back along the frozen approach line, and CLIPPED BY THE MAZE: the lens is a body
+        // like everything else in here and slides along a wall rather than reversing through it. A
+        // corridor that will not give six units simply gives a tighter shot.
+        val back = cinBack * cinAmt
+        maze.move(px, pz, cinUx * back, cinUz * back, CIN_CAM_R, camTmp)
+        cinCamX = camTmp[0] - px; cinCamZ = camTmp[1] - pz
+        cinCamY = cinUp * cinAmt
     }
 
     /**
@@ -2102,6 +2518,7 @@ class Game(val store: SettingsStore, private val host: GameHost) {
 
     private fun updatePlay(dt: Float) {
         elapsed += dt
+        waveT += dt
         maybeQuiet()
         fireCd = max(0f, fireCd - dt)
         invuln = max(0f, invuln - dt)
@@ -2287,6 +2704,8 @@ class Game(val store: SettingsStore, private val host: GameHost) {
             r.hitFlash = max(0f, r.hitFlash - dt * 6f)
             r.crushCd = max(0f, r.crushCd - dt)
             r.stagger = max(0f, r.stagger - dt)
+            val sx0 = r.x; val sz0 = r.z; val syaw0 = r.yaw
+            var dbgMode = "?"; var dbgStep = "-"
             val bobY = 1.6f + 0.3f * sin(time * 2.1f + r.phase)
             val ddx = px - r.x; val ddz = pz - r.z
             val d = hypot(ddx, ddz)
@@ -2304,7 +2723,12 @@ class Game(val store: SettingsStore, private val host: GameHost) {
             val visStep = dt * VIS_RATE
             r.vis = if (seen) min(1f, r.vis + visStep) else max(0f, r.vis - visStep)
             val los = d < 34f && maze.lineOfSight(r.x, r.z, px, pz)
-            if (los) r.seenT = time
+            // THE SEARCH ANCHOR — see [Recognizer.lastX]. While it has you it remembers WHERE, and
+            // the frame the line breaks it is re-tasked at once, so it walks to the place it lost
+            // you rather than finishing whatever errand it was already on.
+            if (los) { r.seenT = time; r.lastX = px; r.lastZ = pz; r.lastT = time }
+            if (r.hadLos && !los) r.targetC = -1
+            r.hadLos = los
             // SEEING YOU AND HAVING THE SHOT ARE TWO DIFFERENT TESTS. Sight is measured axle to
             // axle, so a Recognizer whose body is still mostly behind a corner has a centre that
             // can already see round it — and a disc thrown from there leaves the eye inside the
@@ -2325,6 +2749,7 @@ class Game(val store: SettingsStore, private val host: GameHost) {
                 r.facing = false; r.aimErr = 0f
                 r.lock = max(0f, r.lock - dt * 4f)
                 updateCrush(r, dt)
+                aiTrace(r, dt, "CRUSH" + r.crush, "-", d, 0f, 0f, sx0, sz0, syaw0)
                 continue
             }
             // Off the clamp the hover eases back to its bob (a thrown machine comes down out of
@@ -2334,6 +2759,7 @@ class Game(val store: SettingsStore, private val host: GameHost) {
             var mx = 0f; var mz = 0f
             var canFire = false
             if (chasing && los) {
+                dbgMode = "CHASE"
                 // stand off at ~6 u — or close to four and strip the shell, if there is one. A
                 // machine REELING from a release does neither: it drifts back and wanders.
                 val reeling = r.stagger > 0f
@@ -2350,12 +2776,23 @@ class Game(val store: SettingsStore, private val host: GameHost) {
                 r.noLineT = if (fireLos) 0f else r.noLineT + dt
                 val closing = r.noLineT > 0.8f && !reeling
                 val charging = r.charge > 0f || closing
-                val want = if (pressed) PRESS_STANDOFF else 6f
-                val towards = if (reeling) -0.45f else if (charging) 1f else if (d > want + 1f) 1f else if (d < want - 1.5f) -0.6f else 0f
+                // THE RING BREATHES AND THE MACHINE PROWLS ROUND IT — see [THE HUNT]. The old
+                // three-way step left a two-and-a-half unit band with NO radial term, which is the
+                // fixed point the telemetry caught a machine sitting in for twenty-five seconds.
+                // The wanted range is now an oscillation, and the error against it is a continuous
+                // term that saturates inside [RING_BAND] — so the machine is always committed to
+                // closing or to easing back, and the range can never pin.
+                val want = (if (pressed) PRESS_STANDOFF else 6f) + RING_SWING * sin(time * RING_RATE + r.phase)
+                val towards = if (reeling) -0.45f else if (charging) 1f
+                    else ((d - want) / RING_BAND).coerceIn(-0.85f, 1f)
                 val nx = ddx / max(d, 0.01f); val nz = ddz / max(d, 0.01f)
-                val side = if (reeling || charging) 0f else sin(time * 0.7f + r.phase)
-                mx = nx * towards + (-nz) * side * 0.5f
-                mz = nz * towards + nx * side * 0.5f
+                // and the circling is a HELD SIGN at full weight, flipped on a clock — never a
+                // sine through zero. See [Recognizer.orbit].
+                r.orbitCd -= dt
+                if (r.orbitCd <= 0f) { r.orbitCd = ORBIT_FLIP_CD * (0.7f + rng.nextFloat() * 0.6f); if (rng.nextFloat() < 0.5f) r.orbit = -r.orbit }
+                val side = if (reeling || charging) 0f else r.orbit * ORBIT_SPEED
+                mx = nx * towards + (-nz) * side
+                mz = nz * towards + nx * side
                 // WEDGED ON A CORNER — see [Recognizer.stuckT]: walk the maze toward you instead
                 r.reroute = max(0f, r.reroute - dt)
                 if (r.reroute > 0f && towards > 0f) {
@@ -2405,17 +2842,24 @@ class Game(val store: SettingsStore, private val host: GameHost) {
                 // where the feet are pointed. It is the same machine, doing the same things, at a
                 // moment when somebody is looking at it — and it costs the AI nothing, because
                 // [AIM_LEAD] is more than three times the swing a half-turn needs.
+                //
+                // AND BETWEEN THROWS THE HEAD IS SWEEPING, NOT STARING — see [SCAN_AMP]. It rides
+                // its own heading as it always did, plus a slow sweep either side of it, clamped
+                // by [SCAN_GUARD] so it can never wander onto the tank and satisfy [FIRE_ARC] by
+                // accident. What that clamp buys is the read the silhouette never had: from any
+                // range, the eye slit visibly SEARCHING, passing near you and sliding off.
                 val toTank = atan2(ddx, -ddz)
                 val aiming = fireLos && !reeling && r.fireCd <= AIM_LEAD
                 var target = toTank
                 var turnRate = TURN_HUNT
                 if (!aiming) {
+                    if (mx != 0f || mz != 0f) r.faceBase = atan2(mx, -mz)
                     if (reeling) {
                         target = toTank + 0.9f * sin(time * 5.3f + r.reel) * (r.stagger / STAGGER_T)
                         turnRate = TURN_HUNT * 0.4f
-                    } else if (mx != 0f || mz != 0f) {
-                        target = atan2(mx, -mz); turnRate = TURN_PATROL
-                    } else target = r.yaw
+                    } else {
+                        target = scanTarget(r, r.faceBase, toTank, fireLos); turnRate = TURN_PATROL
+                    }
                 }
                 turnToward(r, target, turnRate, dt)
                 // measured to the TANK whatever the cab was aiming at, so [FIRE_ARC] and the servo
@@ -2505,16 +2949,33 @@ class Game(val store: SettingsStore, private val host: GameHost) {
             } else {
                 // patrol the corridors by cell; a chaser that lost sight paths to the tank's last cell
                 r.aimErr = 0f; r.facing = false
+                dbgMode = if (r.peer > 0f) "PEER" else if (chasing) "SEEK" else "PATROL"
                 val c = maze.colOf(r.x); val rr = maze.rowOf(r.z)
-                if (chasing) { r.targetC = maze.colOf(px); r.targetR = maze.rowOf(pz) }
+                // ARRIVING SOMEWHERE IS AN EVENT. A machine that has just walked into a crossing
+                // stops and looks down each corridor — see [PEER_T]. The cab sweeps hard while it
+                // does, which is what makes the stop the opposite of inert: it is the clearest
+                // statement in the game that the thing is LOOKING FOR YOU and has not found you.
+                val cellId = c * 64 + rr
+                r.peerCd = max(0f, r.peerCd - dt)
+                if (cellId != r.lastCell) {
+                    r.lastCell = cellId
+                    if (r.peerCd <= 0f && exits(c, rr) >= 3 && rng.nextFloat() < PEER_CHANCE) {
+                        r.peer = PEER_T; r.peerCd = PEER_CD
+                    }
+                }
+                if (r.peer > 0f) r.peer = max(0f, r.peer - dt)
+                // THE TARGET IS ITS OWN LEAD, never the tank's live cell — see [pickPatrol].
                 if (r.targetC < 0 || (c == r.targetC && rr == r.targetR)) pickPatrol(r)
                 val step = maze.stepToward(c, rr, r.targetC, r.targetR)
+                dbgStep = if (step == null) "NULL@%d,%d>%d,%d".format(c, rr, r.targetC, r.targetR)
+                          else "%d,%d>%d,%d/%d,%d".format(c, rr, step[0], step[1], r.targetC, r.targetR)
                 if (step != null) {
                     val tx = maze.cellX(step[0]); val tz = maze.cellZ(step[1])
                     val dx = tx - r.x; val dz = tz - r.z; val l = hypot(dx, dz).coerceAtLeast(0.01f)
-                    mx = dx / l; mz = dz / l
-                    turnToward(r, atan2(dx, -dz), TURN_PATROL, dt)
+                    r.faceBase = atan2(dx, -dz)
+                    if (r.peer <= 0f) { mx = dx / l; mz = dz / l }
                 } else { r.targetC = -1 }
+                turnToward(r, scanTarget(r, r.faceBase, atan2(ddx, -ddz), fireLos), TURN_PATROL, dt)
             }
             // the lock sting re-arms once the shot line is lost, not merely when the eye drifts
             // off you for a frame — a machine tracking a dodging tank does not sting on every arc
@@ -2532,6 +2993,20 @@ class Game(val store: SettingsStore, private val host: GameHost) {
                     if (r.stuckT > 0.45f) { r.stuckT = 0f; r.reroute = 2f; android.util.Log.i("X3Paranoids", "REROUTE d=%.1f".format(d)) }
                 } else r.stuckT = 0f
             }
+            // THE WATCHDOG — see [Recognizer.idleT]. Whatever the reason, and including reasons
+            // nobody has thought of yet, a machine commanded nowhere for [IDLE_MAX] while it is not
+            // deliberately peering is re-tasked and turned round. It is the backstop under all of
+            // the above, and it is here because the failure this whole pass exists to answer went
+            // unnoticed for two rounds of review.
+            if (r.peer <= 0f && hypot(mx, mz) < 0.05f) {
+                r.idleT += dt
+                if (r.idleT > IDLE_MAX) {
+                    r.idleT = 0f; r.targetC = -1; r.orbit = -r.orbit
+                    r.orbitCd = ORBIT_FLIP_CD
+                    android.util.Log.i("X3Paranoids", "IDLE watchdog d=%.1f mode=%s".format(d, dbgMode))
+                }
+            } else r.idleT = 0f
+            aiTrace(r, dt, dbgMode, dbgStep, d, mx, mz, sx0, sz0, syaw0)
             // CONTACT. A Recognizer that touches the tank CAPTURES it — see [THE CRUSH] — unless
             // the tank is inside a grace window, another machine already has it, or this one is
             // still recovering from its last capture. Those cases fall back to the old separating
@@ -2601,6 +3076,30 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         }
     }
 
+    /**
+     * DIAGNOSIS — see [AI_TRACE]. Twice a second per machine: what it thinks it is doing, where it
+     * is pathing, what it was told to do, HOW FAR IT ACTUALLY WENT and HOW FAR ITS HEAD ACTUALLY
+     * TURNED. Those last two settle "it floated in place": commanded motion with no ground covered
+     * is a wedge, no commanded motion at all is a null path or a state that never cleared, and a
+     * yaw sweep of zero across seconds is the difference between a machine hunting and a prop.
+     */
+    private fun aiTrace(r: Recognizer, dt: Float, mode: String, step: String, d: Float,
+                        mx: Float, mz: Float, sx0: Float, sz0: Float, syaw0: Float) {
+        if (!AI_TRACE) return
+        r.dbgMove += hypot(r.x - sx0, r.z - sz0)
+        r.dbgYaw += angTo(syaw0, r.yaw)
+        if (hypot(mx, mz) < 0.05f) { r.dbgStall += dt; r.dbgStallMax = max(r.dbgStallMax, r.dbgStall) } else r.dbgStall = 0f
+        if (angTo(syaw0, r.yaw) < 0.0015f) { r.dbgStare += dt; r.dbgStareMax = max(r.dbgStareMax, r.dbgStare) } else r.dbgStare = 0f
+        r.dbgT += dt
+        if (r.dbgT < 0.5f) return
+        android.util.Log.i("X3Paranoids", ("AI#%d %s d=%.1f p=(%.1f,%.1f) mv=%.2f sweep=%.1fdeg/%.2fs " +
+            "cmd=(%.2f,%.2f) stall=%.1f/%.1f stare=%.1f/%.1f step=%s los=%b fLos=%b chg=%.1f stag=%.1f rer=%.1f stuck=%.2f fcd=%.2f y=%.2f").format(
+            r.dbgId, mode, d, r.x, r.z, r.dbgMove, r.dbgYaw * 57.2958f, r.dbgT, mx, mz,
+            r.dbgStall, r.dbgStallMax, r.dbgStare, r.dbgStareMax, step,
+            r.hasLos, r.facing, r.charge, r.stagger, r.reroute, r.stuckT, r.fireCd, r.y))
+        r.dbgT = 0f; r.dbgMove = 0f; r.dbgYaw = 0f
+    }
+
     // ------------------------------------------------------------------ the Recognizer's craft
     /**
      * Swing the cab toward [target] at up to [rate] radians a second, easing over the last
@@ -2623,13 +3122,98 @@ class Game(val store: SettingsStore, private val host: GameHost) {
      * rooms really has broken it.
      */
     private fun pickPatrol(r: Recognizer) {
-        val near = playerRegion()
-        if (near != null && near.isNotEmpty() && rng.nextFloat() < PATROL_HUNT_BIAS) {
-            val cell = near[rng.nextInt(near.size)]
-            r.targetC = cell[0]; r.targetR = cell[1]
-            return
+        // 1. A FRESH LEAD, and it is the MACHINE'S OWN lead rather than the tank's live position:
+        //    where it last saw you, or where it last heard the cannon, whichever is newer. It walks
+        //    there, and when it arrives the lead is spent and it has to look.
+        val heardT = if (hypot(noiseX - r.x, noiseZ - r.z) < NOISE_R) noiseT else -99f
+        val leadT = max(r.lastT, heardT)
+        if (time - leadT < MEMORY_T) {
+            val lx = if (heardT > r.lastT) noiseX else r.lastX
+            val lz = if (heardT > r.lastT) noiseZ else r.lastZ
+            val c = maze.colOf(lx); val rr = maze.rowOf(lz)
+            if (c != maze.colOf(r.x) || rr != maze.rowOf(r.z)) { r.targetC = c; r.targetR = rr; return }
+            r.lastT = -99f        // standing on it already: spent, and the quartering starts here
         }
-        r.targetC = rng.nextInt(maze.cols); r.targetR = rng.nextInt(maze.rows)
+        // 2. THE PRESSURE — see [ESCALATE_T]. The bias toward the tank's district climbs across a
+        //    wave, and at full pressure a share of picks go to the tank's actual cell. A player who
+        //    parks and waits is converged on, which is the only honest answer to a passive player.
+        val press = (waveT / ESCALATE_T).coerceIn(0f, 1f)
+        if (press >= 1f && rng.nextFloat() < 0.35f) {
+            r.targetC = maze.colOf(px); r.targetR = maze.rowOf(pz); return
+        }
+        // 3. GUARD THE THING YOU NEED. A machine standing over the pool or the Bit is a far more
+        //    interesting object than one hovering in a corridor, and it asks the player a question
+        //    rather than putting a wall in front of them.
+        if (rng.nextFloat() < GUARD_CHANCE) {
+            var gx = -1f; var gz = 0f
+            if (poolActive && (!bitActive || rng.nextBoolean())) { gx = poolX; gz = poolZ }
+            else if (bitActive) { gx = bitX; gz = bitZ }
+            if (gx >= 0f) { r.targetC = maze.colOf(gx); r.targetR = maze.rowOf(gz); return }
+        }
+        // 4. THE DISTRICT — a cell within [PATROL_NEAR] BFS steps of the tank: a machine sweeping
+        //    the area you are in rather than one homing on you. AND NOT A CELL SOMEBODY ELSE IS
+        //    ALREADY WALKING TO, which is the whole of the loose coordination a pack needs: they
+        //    cover ground instead of queueing down one corridor.
+        val near = playerRegion()
+        if (near != null && near.isNotEmpty() && rng.nextFloat() < PATROL_HUNT_BIAS + (1f - PATROL_HUNT_BIAS) * press) {
+            for (t in 0 until 6) {
+                val cell = near[rng.nextInt(near.size)]
+                if (t == 5 || !claimed(r, cell[0], cell[1])) { r.targetC = cell[0]; r.targetR = cell[1]; return }
+            }
+        }
+        // 5. QUARTER THE MAZE. Each machine holds a sector and moves on to the next every time it
+        //    finishes a sweep, so a pack that has genuinely lost you fans out across the arena
+        //    rather than three of them re-walking the same room.
+        r.sector = (r.sector + 1) and 3
+        val hc = (maze.cols + 1) / 2; val hr = (maze.rows + 1) / 2
+        val c0 = if (r.sector and 1 == 0) 0 else hc
+        val r0 = if (r.sector and 2 == 0) 0 else hr
+        for (t in 0 until 8) {
+            val c = c0 + rng.nextInt(min(hc, maze.cols - c0))
+            val rr = r0 + rng.nextInt(min(hr, maze.rows - r0))
+            if (t == 7 || !claimed(r, c, rr)) { r.targetC = c; r.targetR = rr; return }
+        }
+    }
+
+    /** Is another living machine already walking to this cell, or to the one next door? */
+    private fun claimed(self: Recognizer, c: Int, rr: Int): Boolean {
+        for (o in recognizers) {
+            if (o === self || o.hp <= 0 || o.targetC < 0) continue
+            if (abs(o.targetC - c) + abs(o.targetR - rr) <= 1) return true
+        }
+        return false
+    }
+
+    /** How many ways out of this cell — three or more is a junction, and worth stopping to look down. */
+    private fun exits(c: Int, r: Int): Int {
+        var n = 0
+        if (maze.passable(c, r, 1, 0)) n++
+        if (maze.passable(c, r, -1, 0)) n++
+        if (maze.passable(c, r, 0, 1)) n++
+        if (maze.passable(c, r, 0, -1)) n++
+        return n
+    }
+
+    /**
+     * THE CAB'S TARGET WHILE IT IS NOT AIMING: a sweep about [base], clamped so it can never come
+     * within [SCAN_GUARD] of the tank while the shot line is open.
+     *
+     * That clamp is the entire reason this is safe to add. [Recognizer.facing] is measured against
+     * [FIRE_ARC] = 0.175 rad, and a cab target held 0.34 rad off the bearing cannot satisfy it at
+     * rest — so a sweep can never become a lock, and every throw in this game remains the
+     * deliberate swing inside [AIM_LEAD] that TRACKING announces.
+     */
+    private fun scanTarget(r: Recognizer, base: Float, toTank: Float, guard: Boolean): Float {
+        val amp = if (r.peer > 0f) PEER_AMP else SCAN_AMP
+        val rate = if (r.peer > 0f) r.scanRate * 1.9f else r.scanRate
+        var t = base + amp * sin(time * rate + r.scanPhase)
+        if (guard) {
+            var dd = t - toTank
+            while (dd > PI.toFloat()) dd -= 2f * PI.toFloat()
+            while (dd < -PI.toFloat()) dd += 2f * PI.toFloat()
+            if (abs(dd) < SCAN_GUARD) t = toTank + (if (dd >= 0f) SCAN_GUARD else -SCAN_GUARD)
+        }
+        return t
     }
 
     /**
@@ -2806,6 +3390,33 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         if (ul < 0.05f) { ux = -sin(r.yaw); uz = cos(r.yaw) } else { ux /= ul; uz /= ul }
         r.crushUx = ux; r.crushUz = uz
         caught = true; crusher = r
+        // THE LENS COMES OUT — see [THE LENS]. The direction is frozen HERE, away from the machine
+        // along the line it came down, so for the whole shot the camera is a fixed point in the
+        // world with the captor beyond the tank from it, and the player's head is free.
+        cinHold = true
+        // WHERE THE LENS GOES: STRAIGHT BACK ALONG THE PLAYER'S OWN LINE OF SIGHT, frozen here.
+        //
+        // Two things had to be true at once and only this satisfies both. THE SUBJECT MUST BE IN
+        // FRAME: the view direction stays head-coupled all through the shot, so the only pull-back
+        // that is guaranteed to leave the tank centred is one straight back along where the player
+        // is already looking — and at the grab they are looking at the machine that is charging
+        // them, so the machine lands beyond the tank from the lens without anybody having to
+        // arrange it. AND THE CAMERA MUST NOT SWING: taking this from the LIVE view direction would
+        // walk the lens bodily around the tank every time the player turned their head, six units
+        // of unrequested lateral translation on a head-worn display. Frozen, it is a fixed point in
+        // the world for the whole shot; turning the head rotates the view and moves nothing.
+        //
+        // Staging it off the TANK's heading instead — a rear quarter of the hull — was tried on the
+        // glasses and is what put the whole capture into the bottom-right corner of the frame: it
+        // frames the tank beautifully and has no idea where the player is looking. [CIN_QUARTER] is
+        // all that survives of it, a few degrees of obliqueness so the shot is not perfectly axial.
+        val a = yaw + CIN_QUARTER
+        cinUx = -sin(a); cinUz = cos(a)
+        val full = captures == 0
+        cinBack = if (full) CIN_BACK else CIN_BACK_TIGHT
+        cinUp = if (full) CIN_UP else CIN_UP_TIGHT
+        captures++
+        struggle = 0f; struggling = false; lift = 0f; carryFade = 0f
         driveEnd("caught"); vx = 0f; vz = 0f
         crushShake = max(crushShake, 0.18f); sightKick = -0.3f
         host.sfx(com.x3paranoids.audio.Sfx.CRUSH_ARM)
@@ -2813,7 +3424,23 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         android.util.Log.i("X3Paranoids", "CRUSH begin r=(%.1f,%.1f) p=(%.1f,%.1f) shield=%d lives=%d".format(r.x, r.z, px, pz, shield, lives))
     }
 
-    /** Slide the gantry to its landing point over the hull's nose — see [CRUSH_STAND] — through the walls' own collision. */
+    /**
+     * THE GANTRY SQUARES UP TO THE TANK. Its legs hang at local x = ±[Recognizer.LEG_X], so the
+     * cross-bar has to come down ACROSS the hull's beam or the legs close on the tank's nose and
+     * tail — where a 2.6-unit-long tank does not fit inside a 2.1-unit gap, and the clamp would
+     * simply pass through it. Turning the machine onto the hull's own heading puts the 1.2-wide
+     * beam between them with room to grip.
+     *
+     * It turns to [hullYaw] + 180°, not to [hullYaw], and the extra half-turn is what puts the CAB
+     * ON THE CAMERA'S SIDE. The bar is symmetric about local x, so both headings straddle the tank
+     * identically; only one of them has the eye slit — the brightest thing on the machine, and the
+     * thing that says it is looking at you — pointed back down the lens. See [THE LENS].
+     */
+    private fun squareUp(r: Recognizer, dt: Float) {
+        turnToward(r, hullYaw + PI.toFloat(), TURN_HUNT * 2.2f, dt)
+    }
+
+    /** Slide the gantry to its landing point over the hull — see [CRUSH_STAND] — through the walls' own collision. */
     private fun converge(r: Recognizer, dt: Float) {
         val tx = px - r.crushUx * CRUSH_STAND; val tz = pz - r.crushUz * CRUSH_STAND
         val dx = tx - r.x; val dz = tz - r.z
@@ -2836,7 +3463,8 @@ class Game(val store: SettingsStore, private val host: GameHost) {
                 val u = (r.crushT / CRUSH_LUNGE_T).coerceIn(0f, 1f)
                 val e = 1f - (1f - u) * (1f - u)
                 r.y = r.crushY0 + (CRUSH_RISE_Y - r.crushY0) * e
-                r.fold = -0.18f * e
+                r.fold = RecognizerModel.FOLD_SPLAY * e
+                squareUp(r, dt)
                 converge(r, dt)
                 crushShake = max(crushShake, 0.10f)
                 if (u >= 1f) { r.crush = Recognizer.CRUSH_DROP; r.crushT = 0f }
@@ -2844,28 +3472,70 @@ class Game(val store: SettingsStore, private val host: GameHost) {
             Recognizer.CRUSH_DROP -> {
                 val u = (r.crushT / CRUSH_DROP_T).coerceIn(0f, 1f)
                 r.y = CRUSH_RISE_Y + (CRUSH_LAND_Y - CRUSH_RISE_Y) * u * u
-                r.fold = -0.18f + 1.18f * u * u * u
+                r.fold = RecognizerModel.FOLD_SPLAY +
+                    (RecognizerModel.FOLD_GRIP - RecognizerModel.FOLD_SPLAY) * u * u * u
+                squareUp(r, dt)
                 converge(r, dt)
-                if (u >= 1f) { r.y = CRUSH_LAND_Y; r.fold = 1f; land(r) }
+                if (u >= 1f) { r.y = CRUSH_LAND_Y; r.fold = RecognizerModel.FOLD_GRIP; land(r) }
             }
             Recognizer.CRUSH_HOLD -> {
-                r.fold = 1f
+                // gripping the hull, with a servo tremor in it — the clamp is under load
+                r.fold = RecognizerModel.FOLD_GRIP + 0.012f * sin(r.crushT * 47f)
                 r.y = CRUSH_LAND_Y + 0.03f * sin(r.crushT * 61f)
                 crushShake = max(crushShake, if (state == State.DYING) 0.08f else 0.24f)
                 // a shell under the clamp STRAINS: it flickers hard, lit from above, for the hold
                 if (shield > 0) { shieldFlash = max(shieldFlash, 0.55f + 0.45f * abs(sin(r.crushT * 31f))); shieldHitX = 0f; shieldHitY = 1f; shieldHitZ = 0f }
-                if (state != State.DYING && r.crushT >= r.holdT) open(r)
+                // THE STRUGGLE — see [THE CAPTURE]. It bleeds back, so it is a burst of panic and
+                // not a meter you fill at your leisure; and it resolves the INSTANT it is full,
+                // because a break-out the player has already earned should not make them wait for a
+                // clock to run out before they get it.
+                if (struggling) {
+                    // TESTED BEFORE IT IS DECAYED, and that order is the whole of it. Decaying
+                    // first means the fifth tap's 1.0 is knocked to 0.9958 by the very next frame's
+                    // bleed before anything looks at it, so `struggle >= 1f` is never once true and
+                    // the escape is unreachable — the meter fills, the player watches it fill, and
+                    // they are carried off anyway. Caught on the glasses by tapping straight
+                    // through a full window and still being taken.
+                    if (struggle >= 1f) {
+                        android.util.Log.i("X3Paranoids", "CAPTURE broken at t=%.2f".format(r.crushT))
+                        open(r); return
+                    }
+                    struggle = max(0f, struggle - CAPT_DECAY / CAPT_TAPS * dt)
+                }
+                if (state != State.DYING && r.crushT >= r.holdT) {
+                    // Bare-hulled and still held when the window closes: it does not let go.
+                    if (struggling) beginCarry(r) else open(r)
+                }
+            }
+            // ------------------------------------------------------------------ [THE CARRY]
+            // Legs shut, rising, the tank between them — and then the arena goes white. The canon
+            // calls the capture function "unexplained"; this does not explain it either, which is
+            // both the honest reading and the reason the beat is over in under a second and a half.
+            Recognizer.CRUSH_CARRY -> {
+                val u = (r.crushT / CARRY_RISE_T).coerceIn(0f, 1f)
+                val e = u * u * (3f - 2f * u)
+                // and it keeps its grip all the way up — the fold does not relax on the lift
+                r.fold = RecognizerModel.FOLD_GRIP
+                r.y = CRUSH_LAND_Y + (CARRY_RISE_Y - CRUSH_LAND_Y) * e
+                // the hull goes up WITH it — held between the feet, exactly where the clamp left it
+                lift = (r.y - CRUSH_LAND_Y) * 0.92f
+                crushShake = max(crushShake, 0.16f * (1f - u))
+                if (r.crushT > CARRY_RISE_T) {
+                    carryFade = ((r.crushT - CARRY_RISE_T) / CARRY_FADE_T).coerceIn(0f, 1f)
+                }
+                if (r.crushT >= CARRY_RISE_T + CARRY_FADE_T) endCarry(r)
             }
             Recognizer.CRUSH_RELEASE -> {
                 val u = (r.crushT / CRUSH_RELEASE_T).coerceIn(0f, 1f)
                 val eo = 1f - (1f - u) * (1f - u)
                 if (r.thrown) {
                     // flung: the legs snap open past straight, it is thrown up and away
-                    r.fold = 1f - 1.35f * min(1f, u * 1.7f)
+                    r.fold = RecognizerModel.FOLD_GRIP -
+                        (RecognizerModel.FOLD_GRIP - FOLD_FLUNG) * min(1f, u * 1.7f)
                     r.y = CRUSH_LAND_Y + (2.9f - CRUSH_LAND_Y) * eo
                 } else {
                     // let go: the legs open, then it lifts off
-                    r.fold = 1f - eo
+                    r.fold = RecognizerModel.FOLD_GRIP * (1f - eo)
                     r.y = CRUSH_LAND_Y + (1.6f - CRUSH_LAND_Y) * u * u
                 }
                 // and backs away from the hull, wall-clipped, over the whole release
@@ -2901,41 +3571,68 @@ class Game(val store: SettingsStore, private val host: GameHost) {
             host.sfx(com.x3paranoids.audio.Sfx.SHIELD_HIT, 0.72f, 0.9f)
             android.util.Log.i("X3Paranoids", "CRUSH landed on shell=%d".format(shield))
         } else {
-            r.holdT = CRUSH_HOLD_T
+            // NO LIFE IS LOST HERE ANY MORE. The landing used to be the whole event — the legs shut
+            // and a life was gone before the player had done anything about it. It is now the start
+            // of the one beat they can play: the clamp is on, and [CAPT_STRUGGLE_T] of tapping
+            // decides whether this costs a shell's worth of dignity or a life and your bearings.
+            // See [THE CAPTURE].
+            r.holdT = CAPT_STRUGGLE_T
+            struggle = 0f; struggling = true
             staticT = 0.30f
             burst(px, EYE_H + 0.4f, pz, 10, 1f, 0.4f, 0.3f)
-            android.util.Log.i("X3Paranoids", "CRUSH landed on hull lives=%d".format(lives))
-            damagePlayer(r.x, r.z, r.y + 2.2f, force = true)
-            // THE GRACE HAS TO OUTLAST THE CLAMP. A capture spends the first 1.2 s of the 2.6 s
-            // untouchable window HELD — the hull cannot move, so that part of it is not mercy, it
-            // is a countdown running while you sit still. The window is extended by exactly the
-            // hold and the release, so what the player actually gets is the full 2.6 s from the
-            // moment the legs let go — which, with [scatter] landing on the same beat, is a
-            // genuine escape rather than a longer look at the thing that is about to finish you.
-            if (state == State.PLAY) invuln = max(invuln, r.holdT + CRUSH_RELEASE_T * 0.5f + 2.6f)
+            android.util.Log.i("X3Paranoids", "CAPTURE landed on hull lives=%d — struggle window open".format(lives))
+            // THE PILOT REACTS TO BEING HELD, over the machine's own flat "Captured."
+            pilot("hero_caught", gap = 0f, cd = 8f, delay = after("captured"), patience = 1200L)
         }
     }
 
     /**
-     * THE CLAMP OPENS. If it was straining on a shell, the shell DISCHARGES: it spends
-     * [CRUSH_CHARGES] and throws the machine off, open and reeling; if that was the last of it,
-     * the shell derezzes outward past the periscope on the same frame. Otherwise the machine
-     * simply lets go and lifts off. Either way the tank is released now — as the legs start to
-     * open, not when they finish — so the player has the whole release to get clear on.
+     * THE CLAMP OPENS, and there are three ways to reach it.
+     *
+     * THE SHELL DISCHARGES: it spends its WHOLE remaining charge and throws the machine off, open
+     * and reeling, and derezzes outward past the periscope on the same frame. A shell buys you out
+     * of exactly one capture, entirely — see [THE CAPTURE].
+     *
+     * THE STRUGGLE WAS WON: the tank shoved it off. Same throw, and a real window on the far side.
+     *
+     * Or nothing was holding it in the first place — a wave rolling over, a captor derezzed — and
+     * the machine simply lets go and lifts off.
+     *
+     * Either way the tank is released now — as the legs start to open, not when they finish — so
+     * the player has the whole release to get clear on. The fourth way out of a HOLD is not through
+     * here at all: it is [beginCarry], and it does not open anything.
      */
     private fun open(r: Recognizer) {
         r.crush = Recognizer.CRUSH_RELEASE; r.crushT = 0f
+        struggling = false
         if (shield > 0) {
+            // THE SHELL IS THE AUTOMATIC BREAK-OUT, AND IT COSTS ALL OF IT — see [THE CAPTURE]. It
+            // used to spend two of three charges; a capture now takes the whole shell and throws
+            // the machine off. One clean rule the player can hold in their head — a shell buys you
+            // out of exactly one capture — and it makes the pools the thing worth crossing a maze
+            // for, because the shell is now what stands between being captured and being TAKEN.
             r.thrown = true
-            val taken = min(shield, CRUSH_CHARGES)
-            shield -= taken
+            val spent = shield
+            shield = 0
             shieldFlash = 1f; shieldHitX = 0f; shieldHitY = 1f; shieldHitZ = 0f
             invuln = SHIELD_IFRAME + CRUSH_GRACE
             burst(px, EYE_H + 0.6f, pz, 18, 0.55f, 0.95f, 1f)
             host.sfx(com.x3paranoids.audio.Sfx.CRUSH_OPEN, 1.15f, 1f)
-            if (shield > 0) onShieldHit() else onShieldDown()
+            onShieldDown()
             sightKick = 0.8f
-            android.util.Log.i("X3Paranoids", "CRUSH shell discharged: took %d, shield=%d".format(taken, shield))
+            android.util.Log.i("X3Paranoids", "CAPTURE broken by the shell: spent %d charges".format(spent))
+        } else if (struggle >= 1f) {
+            // FOUGHT OFF. The machine is thrown, not merely opened — the tank shoved it off — and
+            // the player gets a real window on the far side of it rather than a courtesy frame.
+            r.thrown = true
+            struggle = 0f
+            invuln = max(invuln, CRUSH_RELEASE_T + CRUSH_GRACE + 1.6f)
+            burst(px, EYE_H + 0.5f, pz, 14, 0.6f, 1f, 0.6f)
+            host.sfx(com.x3paranoids.audio.Sfx.CRUSH_OPEN, 1.15f, 1.1f)
+            sightKick = 0.8f
+            host.say("hit")
+            pilot("hero_disc_cut", gap = 0f, cd = 10f, delay = after("hit"), patience = 1800L)
+            android.util.Log.i("X3Paranoids", "CAPTURE fought off lives=%d".format(lives))
         } else {
             r.thrown = false
             host.sfx(com.x3paranoids.audio.Sfx.CRUSH_OPEN)
@@ -2947,8 +3644,137 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         if (pendingScatter && state == State.PLAY) scatter()
     }
 
-    /** The hull is free. Idempotent; the crusher's own clock carries on without it. */
+    // ------------------------------------------------------------------ [THE CARRY]
+    /**
+     * THE STRUGGLE WAS LOST AND THE MACHINE DOES NOT PUT YOU DOWN — the third and heaviest of the
+     * capture's costs, and the one the whole design is arranged to make the player feel they earned.
+     *
+     * A life goes here. It goes without a derez, because nothing was destroyed: the tank is picked
+     * up and carried, which is what the canon says these things do, and the sight losing the arena
+     * to a white-out is the "unexplained capture function" declining to be explained. What the
+     * player actually loses is not the life — it is the MAZE. They wake up [CARRY_MIN_D] units away
+     * with no shell, no bearings, and every plan they had pointing the wrong way.
+     *
+     * AND ON THE LAST LIFE IT IS THE ENDING. See [taken] and [THE CAPTURE].
+     */
+    private fun beginCarry(r: Recognizer) {
+        r.crush = Recognizer.CRUSH_CARRY; r.crushT = 0f
+        struggling = false; struggle = 0f
+        lives--
+        damageFlash = 1f
+        hitsRecent = if (time - lastHitT < 20f) hitsRecent + 1 else 1
+        lastHitT = time
+        host.sfx(com.x3paranoids.audio.Sfx.CRUSH_GRIND, 1f, 0.72f)
+        host.sfx(com.x3paranoids.audio.Sfx.HIT, 0.8f, 0.85f)
+        if (lives <= 0) {
+            // THE TERMINAL CAPTURE. Not a derez — it is carried off, and the lens stays outside to
+            // watch it go. Everything the ordinary death clears, this clears too: a pilot line
+            // queued four seconds ago has no business landing on the ending.
+            taken = true; cinTakenT = 0f
+            state = State.DYING; stateT = 0f; deathSink = 0f
+            clearCues()
+            host.stopHero()
+            pilotText = ""; pilotAge = 0f; pilotHold = 0f
+            protocolText = ""; protocolAge = 0f; protocolHold = 0f
+            host.say("end_of_line", urgent = true)
+            pilot("hero_derez", gap = 0f, cd = 0f, delay = after("end_of_line"), patience = 3000L)
+            android.util.Log.i("X3Paranoids", "CAPTURE terminal — the tank was taken")
+        } else {
+            pickDrop()
+            host.say("captured", urgent = true)
+            android.util.Log.i("X3Paranoids", "CAPTURE carried off lives=%d to (%.1f,%.1f)".format(lives, dropX, dropZ))
+        }
+    }
+
+    /**
+     * WHERE YOU WAKE UP. Far enough to have genuinely lost the thread — and not standing inside a
+     * wall, not on top of a machine, and not in the corner it happens to be cheapest to pick. The
+     * furthest of a handful of candidates wins, so the drop is reliably across the arena rather
+     * than occasionally next door.
+     */
+    private fun pickDrop() {
+        var bx = px; var bz = pz; var best = -1f
+        for (t in 0 until 40) {
+            val c = rng.nextInt(maze.cols); val rr = rng.nextInt(maze.rows)
+            val x = maze.cellX(c); val z = maze.cellZ(rr)
+            if (maze.inWall(x, z, PLAYER_R)) continue
+            val d = hypot(x - px, z - pz)
+            if (d < CARRY_MIN_D) continue
+            // and not into somebody's lap: waking up already inside a machine's reach is not a
+            // relocation, it is a second capture with the player still blinking
+            var clear = true
+            for (o in recognizers) if (o.hp > 0 && hypot(o.x - x, o.z - z) < 9f) { clear = false; break }
+            if (!clear) continue
+            if (d > best) { best = d; bx = x; bz = z }
+        }
+        // nowhere far enough (a small arena, or a very unlucky roll): the furthest cell will do
+        if (best < 0f) {
+            for (c in 0 until maze.cols) for (rr in 0 until maze.rows) {
+                val x = maze.cellX(c); val z = maze.cellZ(rr)
+                if (maze.inWall(x, z, PLAYER_R)) continue
+                val d = hypot(x - px, z - pz)
+                if (d > best) { best = d; bx = x; bz = z }
+            }
+        }
+        dropX = bx; dropZ = bz
+    }
+
+    /**
+     * THE OTHER SIDE OF THE WHITE-OUT. The hull is set down where [pickDrop] chose, facing a fresh
+     * heading, and re-rezzes over [CARRY_REZ_T]. The machine that took it opens its legs and goes
+     * back on its rounds a long way away, staggered and on its capture cooldown like any other
+     * release — it does not get to follow you down.
+     */
+    private fun endCarry(r: Recognizer) {
+        r.crush = Recognizer.CRUSH_NONE; r.crushT = 0f
+        r.fold = 0f; r.y = 1.6f
+        r.stagger = STAGGER_T; r.crushCd = CRUSH_CD
+        r.seenT = -99f; r.targetC = -1; r.reroute = 0f; r.charge = 0f
+        lift = 0f
+        if (!taken) {
+            px = dropX; pz = dropZ
+            vx = 0f; vz = 0f
+            hullYaw = 0f; hullTarget = 0f; turnBlend = 0f
+            carryRez = 1f
+            carryFade = 0f
+            staticT = 0.35f
+            sightKick = 0.5f
+            burst(px, EYE_H, pz, 16, 0.5f, 1f, 0.7f)
+            host.sfx(com.x3paranoids.audio.Sfx.SPAWN, 0.9f, 1.1f)
+            // AND THE ARENA FALLS BACK ROUND THE NEW POSITION — the same window a life always
+            // bought, spent where the player now actually is rather than where they were taken from.
+            invuln = max(invuln, 2.6f)
+            // THE PILOT'S LINE IS RAISED FIRST, and deliberately ahead of [scatter]'s own. Both
+            // want the same beat: the scatter says "THEY'RE FALLING BACK. MOVE." at +0.85 s, which
+            // is the right line for a death and the wrong one for waking up somewhere else. On this
+            // beat the specific thing has happened, so the specific line takes the bus and the
+            // general one is starved behind it rather than the two racing on queue order.
+            pilot("hero_dumped", gap = 0f, cd = 12f, patience = 2200L)
+            scatter()
+        } else {
+            // Taken for good: nothing is set down, and the machine leaves with it.
+            carryFade = 1f
+        }
+        releasePlayer()
+        // ...and releasePlayer brings the lens home, which is right for every exit but this one.
+        // The ending IS the wide shot of the machine walking off with the tank, so the terminal
+        // capture takes the lens straight back and holds it for [CIN_TAKEN_T] — see [updateCinema].
+        if (taken) cinHold = true
+    }
+
+    /**
+     * The hull is free. Idempotent; the crusher's own clock carries on without it.
+     *
+     * IT IS ALSO THE ONE PLACE THE LENS COMES HOME FROM. Every exit from a capture funnels through
+     * here — the shell discharging, the struggle won, the window closing, the captor derezzed
+     * mid-shot, a wave rolling over the top of it — so clearing [cinHold] here means there is no
+     * path out of the sequence that leaves the camera stranded outside the tank. The one deliberate
+     * exception is the terminal capture, which never releases anything because there is nothing
+     * left to release; [updateCinema] brings that one home on its own clock.
+     */
     private fun releasePlayer() {
+        cinHold = false
+        struggling = false; struggle = 0f; lift = 0f
         if (!caught && crusher == null) return
         caught = false; crusher = null
     }
