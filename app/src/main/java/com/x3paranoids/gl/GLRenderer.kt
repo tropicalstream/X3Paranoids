@@ -307,7 +307,7 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
         if (game.poolActive && game.poolVis > 0.001f) {
             buildPool(game.poolX, game.poolZ, game.poolT, game.poolVis, game.poolDraw, game.poolLevel)
         }
-        if (game.poolCollapse > 0f) buildPoolCollapse(game.poolX, game.poolZ, game.poolCollapse)
+        if (game.poolCollapse > 0f) buildPoolCollapse(game.poolOutX, game.poolOutZ, game.poolCollapse)
         buildShots(game.shots)
         buildSparks(game.sparks)
         buildDerez(game.derezzes, game.wallTint())
@@ -1706,6 +1706,12 @@ class GLRenderer(private val game: Game, private val head: HeadTracker, private 
             color(0.55f, 0.75f, 0.7f, 0.55f * bigTap)
             textC("HEAD LOOKS   SWIPE OR HOLD TO DRIVE", 320f, 338f, 1.6f)
             textC("LEFT/RIGHT TURNS 90   TAP FIRES", 320f, 356f, 1.6f)
+            // WHERE THE SETTINGS WENT. They used to be a double-tap from anywhere, which is exactly
+            // why they had to move: in a firefight two fast shots ARE a double-tap, and the game
+            // could pause itself mid-fight. Now the menu only opens here and on the game-over card,
+            // so the one screen that can still reach it has to say so — a control nobody can find
+            // is the same as a control that is not there.
+            textC("DOUBLE-TAP FOR SETTINGS", 320f, 374f, 1.6f)
         }
 
         // ---- the records, in the corners they keep in every other screen of this game

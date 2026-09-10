@@ -990,6 +990,17 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         /** What a full draw is worth, wave-scaled: half a Recognizer, a fifth of the Bit. */
         const val POOL_SCORE = 50
         /**
+         * HOW FAR THE WELL MOVES, in BFS cells from where the tank is standing when it drinks.
+         *
+         * Four is the same floor the wave's own spawns and the Bit use, and it is the number that
+         * makes the relocation mean something: a well that came back three cells away would be a
+         * cooldown with extra steps, since the drive back is shorter than the refill. At four or
+         * more the shell is a JOURNEY every time — which is the point of moving it at all. If the
+         * maze is so small or so open that nothing qualifies, the well stays where it is rather
+         * than teleporting into the tank's lap.
+         */
+        const val POOL_MOVE_MIN = 4
+        /**
          * THE MACHINES PRESS A SHIELDED TANK. Standing off six units is what a Recognizer does to
          * something it can kill from there; a program carrying the Protocol's own energy gets
          * closed on and stripped. So while [shield] is up they hold four units instead of six, fire
@@ -1325,6 +1336,15 @@ class Game(val store: SettingsStore, private val host: GameHost) {
     var poolDraw = 0f; private set
     /** 1 → 0 while a drained pool folds itself away — the renderer's collapse. */
     var poolCollapse = 0f; private set
+    /**
+     * WHERE THE COLLAPSE IS PLAYING, which is no longer where the pool IS.
+     *
+     * The well now moves the moment it is drunk ([relocatePool]), and the fold-away animation
+     * belongs to the place it was drained at. Drawing it at [poolX] would fire the collapse rings
+     * around the NEW well the instant it appeared — the one frame in the whole sequence that has to
+     * read as "this one is spent", played over the one thing that is not.
+     */
+    var poolOutX = 0f; var poolOutZ = 0f; private set
     /** 0 drained … 1 standing. The column's height, and whether a draw is possible at all. */
     var poolLevel = 0f; private set
     /** The tank is in the pool and there is nothing to restore — the HUD says so rather than staying mute. */
@@ -1772,9 +1792,23 @@ class Game(val store: SettingsStore, private val host: GameHost) {
         host.sfx(com.x3paranoids.audio.Sfx.CRUSH_GRIND, 0.55f, 1.25f + 0.35f * struggle)
     }
 
+    /**
+     * SETTINGS ARE OFF THE ARENA ONLY — the owner's ruling, and the reason is the pad, not the menu.
+     *
+     * A tap fires. A double-tap opened the settings. In a firefight the player is tapping as fast
+     * as they can, and two of those taps inside the pad's own double-tap window are indistinguishable
+     * from the gesture that means "pause" — so the game could stop dead in the middle of a fight
+     * because somebody shot twice quickly. No amount of arbitration fixes that: the two gestures are
+     * the same gesture, told apart only by an interval the player is not thinking about.
+     *
+     * So the menu is simply not on offer while a game is live. On the title and the game-over card
+     * there is nothing to fire at, a double-tap is unambiguous, and everything the menu holds —
+     * music, volume, voice, difficulty, the head look, QUIT — is a between-runs decision anyway.
+     * [canQuit] already drew this exact line for the QUIT row; the whole menu now sits behind it.
+     */
     fun doubleTap() {
-        if (state == State.TITLE || state == State.GAME_OVER) { if (menuOpen) closeMenu() else openMenu(); return }
-        if (menuOpen) closeMenu() else openMenu()
+        if (menuOpen) { closeMenu(); return }
+        if (canQuit) openMenu() else host.sfx(com.x3paranoids.audio.Sfx.BUMP, 0.7f, 0.35f)
     }
 
     fun tripleTap() {
@@ -2706,6 +2740,7 @@ class Game(val store: SettingsStore, private val host: GameHost) {
                 // folds away, and starts the long climb back. The place stays.
                 val topUp = shield > 0
                 poolDraw = 0f; poolCollapse = 1f; poolLevel = 0f
+                poolOutX = poolX; poolOutZ = poolZ
                 burst(poolX, 1.2f, poolZ, 26, 0.55f, 0.95f, 1f)
                 onShieldUp(topUp)
                 // AND IT PAYS. The pool was scored at ZERO by design so that it and the Bit pulled
@@ -2721,10 +2756,60 @@ class Game(val store: SettingsStore, private val host: GameHost) {
                 host.sfx(com.x3paranoids.audio.Sfx.POOL_TAKE)
                 android.util.Log.i("X3Paranoids", "POOL drawn: shield=%d (topUp=%b) +%d refill in %.0fs".format(
                     shield, topUp, (POOL_SCORE * wave * scoreMul).toInt(), POOL_REFILL_T))
+                relocatePool()
             }
         } else {
             poolDraw = max(0f, poolDraw - dt * POOL_DRAW_DECAY / POOL_DRAW_T)
         }
+    }
+
+    /**
+     * THE WELL MOVES WHEN IT IS DRUNK — the owner's ruling, and it changes what the energy economy
+     * asks of the player.
+     *
+     * It used to stay put for the life of the maze, on the reasoning that a fixed place is a place
+     * you LEARN. That is true, and it is exactly the problem: once learned, a well that never moves
+     * turns the shell into a timer. You drink, you go and do something for the refill, you come
+     * back down a corridor you have already cleared and already know, and you drink again. The
+     * decision — energy first, or the Bit first — is made once per maze and never again.
+     *
+     * A well that surfaces somewhere new asks it fresh every time, and it asks it at the one moment
+     * the answer is hardest: you have just spent [POOL_DRAW_T] standing still at a known point with
+     * every machine in the arena walking a BFS path to you, and the reward for surviving that is a
+     * new place to find. It also stops the minimap's energy bearing from being a landmark and makes
+     * it a live instrument again.
+     *
+     * IT IS RANDOM AMONG CELLS THAT ARE ACTUALLY FAR, not the single furthest. Always taking the
+     * maximum would make the well predictable in the other direction — the far corner from wherever
+     * you drank — and the whole point is that you cannot know. The Bit is avoided so the two
+     * objectives keep pulling in different directions, and the cell just drained is excluded so a
+     * relocation is never a no-op the player cannot tell from a bug.
+     */
+    private fun relocatePool() {
+        val fromPlayer = maze.distances(maze.colOf(px), maze.rowOf(pz))
+        val fromBit = if (bitActive) maze.distances(maze.colOf(bitX), maze.rowOf(bitZ)) else null
+        val oldC = maze.colOf(poolX); val oldR = maze.rowOf(poolZ)
+        val cand = ArrayList<IntArray>()
+        for (c in 0 until maze.cols) for (r in 0 until maze.rows) {
+            if (c == oldC && r == oldR) continue
+            if (fromPlayer[c][r] < POOL_MOVE_MIN) continue
+            if (fromBit != null && fromBit[c][r] < 3) continue
+            cand += intArrayOf(c, r)
+        }
+        // A maze that offers nothing far enough keeps its well rather than dropping it next door.
+        if (cand.isEmpty()) {
+            android.util.Log.i("X3Paranoids", "POOL stays at (%.1f,%.1f): no cell %d+ cells away".format(poolX, poolZ, POOL_MOVE_MIN))
+            return
+        }
+        val cell = cand[rng.nextInt(cand.size)]
+        poolX = maze.cellX(cell[0]); poolZ = maze.cellZ(cell[1])
+        // It surfaces EMPTY and climbs on its own clock exactly as before, so moving it costs the
+        // player nothing but the search; and it fades in ([poolVis]) rather than snapping into
+        // existence at a spot the sight may already be pointing at.
+        poolT = 0f; poolVis = 0f
+        host.say("energy_pool")
+        android.util.Log.i("X3Paranoids", "POOL surfaced at (%.1f,%.1f) cell %d,%d — %d cells from the tank, %d candidates".format(
+            poolX, poolZ, cell[0], cell[1], fromPlayer[cell[0]][cell[1]], cand.size))
     }
 
     /** Enemies, shots and sparks — also runs (frozen player) during wave-clear and death. */

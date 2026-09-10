@@ -34,8 +34,12 @@ Kotlin + OpenGL ES 3, zero dependencies, zero permissions, no network. Package `
   the whole thing from outside. Break the clamp by tapping fast enough, or it carries the tank off
   and drops it elsewhere in the maze, a life down. On your last life, a capture ends the game
   outright — the tank is taken, not destroyed.
-- **Energy pools** are fixed points in the maze that slowly refill; drawing from one restores your
-  three-charge energy shell to full. The shell absorbs a capture attempt too, at a cost.
+- **Energy pools** slowly refill, and drawing from one restores your three-charge energy shell to
+  full — then **the well surfaces somewhere else**, at least four cells away and away from the Bit.
+  A well that stayed put turned the shell into a timer: drink, kill time, walk back down a corridor
+  you already know. Moving it asks "energy or the Bit?" fresh every time, at the moment the answer
+  is hardest — you have just stood still for a second at a known point with every machine walking a
+  path to you. The shell absorbs a capture attempt too, at a cost.
 - **The Bit** hides somewhere in the maze every wave (*FIND THE BIT*): touching it is +500 and an
   extra life (max 5). It chatters yes/no while you look for it, and the minimap gives it a distance
   bearing once you're close.
@@ -55,13 +59,18 @@ Kotlin + OpenGL ES 3, zero dependencies, zero permissions, no network. Package `
 | Swipe up / down, flick | dash forward / backward | move the selection |
 | Swipe up / down, hold | cruise forward / backward until released | — |
 | Swipe left / right | quarter-turn the hull 90° | adjust the selected value |
-| Double-tap | open / close settings (pauses) | close |
+| Double-tap | — (settings are off the arena; see below) | close |
 | Triple-tap | re-centre the head | — |
 
 There is no long-press (the glasses reserve it for the system shade). The left temple pad is the
 system volume pad and is ignored.
 
-## Settings (double-tap)
+## Settings (double-tap — on the title or the game-over card only)
+
+The menu is **not** available while a run is live. A tap fires, so in a firefight two fast shots are
+indistinguishable from the double-tap that means "pause" — the game could stop dead because you shot
+twice quickly. Everything the menu holds is a between-runs decision anyway.
+
 
 Music · Volume · Voice · Head Look (off = left/right swipes turn the hull instead) · Turn (Normal /
 Reversed — the pad's horizontal sign is a matter of taste) · Difficulty (Easy / Normal / Hard) ·
